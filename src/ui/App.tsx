@@ -1,7 +1,17 @@
 import { useCallback, useState, type FormEvent } from 'react';
 import { useMesh } from './useMesh';
 import { MeshGraph } from './MeshGraph';
-import { AnswerPanel, DevPanel, NodePanel, PeerConnect, ResultsList, WireLog } from './Panels';
+import {
+  AnswerPanel,
+  DevPanel,
+  LibraryPanel,
+  LlmButton,
+  PeerConnect,
+  PeersPanel,
+  ResultsList,
+  StoragePanel,
+  WireLog,
+} from './Panels';
 import type { TransportKind } from '../transport/Transport';
 
 const EXAMPLES = [
@@ -13,7 +23,8 @@ const EXAMPLES = [
 
 export function App() {
   const [transportKind, setTransportKind] = useState<TransportKind>('broadcast');
-  const { state, search, loadShard, loadLlm, setDev } = useMesh(transportKind);
+  const { state, search, addFiles, addSample, forgetDocument, setBudget, loadLlm, setDev } =
+    useMesh(transportKind);
   const [input, setInput] = useState('');
 
   const onSubmit = useCallback(
@@ -30,8 +41,11 @@ export function App() {
   );
 
   const online = state.peers.length;
-  const reachable = state.peers.reduce((s, p) => s + p.docCount, 0) + state.index.chunks;
+  // What the mesh can *find*, which is the union of every catalog rather than a
+  // sum of disjoint shards — peers largely know the same passages now.
+  const reachable = Math.max(state.index.known, ...state.peers.map((p) => p.known), 0);
   const ready = state.index.phase === 'ready';
+  const empty = ready && state.index.known === 0;
 
   return (
     <div className="shell">
@@ -74,14 +88,14 @@ export function App() {
           <div className="map-head">
             <h1 className="map-title">Query floods out. Answers route back.</h1>
             <p className="map-sub">
-              No internet, no server. Each node holds one shard of the corpus and
-              searches it locally; the mesh assembles the rest.
+              No internet, no server. Upload a document and it replicates itself
+              across the mesh — metadata everywhere, full text where it fits.
             </p>
           </div>
 
           <MeshGraph
             identity={state.identity}
-            selfShard={state.index.shardId === null ? '?' : String(state.index.shardId)}
+            selfStored={state.index.stored}
             peers={state.peers}
             routes={state.routes}
             activity={state.activity}
@@ -93,6 +107,7 @@ export function App() {
             <li><i style={{ background: 'var(--wire-query)' }} />query</li>
             <li><i style={{ background: 'var(--wire-result)' }} />result</li>
             <li><i style={{ background: 'var(--wire-doc)' }} />passage</li>
+            <li><i style={{ background: 'var(--wire-announce)' }} />announce</li>
             <li><i style={{ background: 'var(--wire-drop)' }} />dropped</li>
           </ul>
 
@@ -115,11 +130,16 @@ export function App() {
                 id="q"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder={ready ? 'how do I treat a burn' : 'load a shard first'}
+                placeholder={
+                  empty ? 'upload a document first' : ready ? 'how do I treat a burn' : 'starting…'
+                }
                 autoComplete="off"
-                disabled={!ready}
+                disabled={!ready || empty}
               />
-              <button className="btn btn-primary" disabled={!ready || state.searching || !input.trim()}>
+              <button
+                className="btn btn-primary"
+                disabled={!ready || empty || state.searching || !input.trim()}
+              >
                 {state.searching ? 'Searching…' : 'Search'}
               </button>
             </div>
@@ -133,7 +153,7 @@ export function App() {
                     setInput(ex);
                     void search(ex);
                   }}
-                  disabled={!ready || state.searching}
+                  disabled={!ready || empty || state.searching}
                 >
                   {ex}
                 </button>
@@ -143,7 +163,15 @@ export function App() {
 
           <AnswerPanel state={state} />
           <ResultsList state={state} />
-          <NodePanel state={state} onLoadShard={loadShard} onLoadLlm={loadLlm} />
+          <LibraryPanel
+            state={state}
+            onAddFiles={(files) => void addFiles(files)}
+            onAddSample={(sample) => void addSample(sample)}
+            onForget={(docKey) => void forgetDocument(docKey)}
+          />
+          <StoragePanel state={state} onSetBudget={(b) => void setBudget(b)} />
+          <LlmButton state={state} onLoadLlm={loadLlm} />
+          <PeersPanel state={state} />
           <PeerConnect state={state} />
           <DevPanel state={state} onChange={patchDev} />
           <WireLog state={state} />

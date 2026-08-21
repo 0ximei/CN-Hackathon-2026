@@ -4,10 +4,14 @@ import {
   DEFAULT_TTL,
   PROTO_VERSION,
   PacketType,
+  decodeAnnounce,
+  decodeCatalogReq,
   decodeDocRes,
   decodeHello,
   decodeQuery,
   decodeResult,
+  encodeAnnounce,
+  encodeCatalogReq,
   encodeDocRes,
   encodeHello,
   encodePacket,
@@ -15,6 +19,7 @@ import {
   encodeResult,
   decodePacket,
   hopsTravelled,
+  type MetaEntry,
 } from './packet';
 import { FRAME_HEADER_BYTES, Reassembler, fragment } from './framing';
 import { Router } from './router';
@@ -52,7 +57,14 @@ describe('packet codec', () => {
   });
 
   it('round-trips HELLO, QUERY, RESULT and DOC_RES payloads', () => {
-    const hello = { shardId: 3, docCount: 412, caps: 0b11, name: 'Karo' };
+    const hello = {
+      caps: 0b11,
+      known: 412,
+      stored: 130,
+      documents: 6,
+      freeKb: 4096,
+      name: 'Karo',
+    };
     expect(decodeHello(encodeHello(hello))).toEqual(hello);
 
     const vec = new Int8Array(EMBED_DIM).map((_, i) => ((i * 7) % 255) - 127);
@@ -67,13 +79,17 @@ describe('packet codec', () => {
       encodeResult({
         queryId: 77,
         hopCount: 2,
-        shardId: 1,
-        hits: [{ docId: 900, score: 0.75, title: 'Burns', snippet: 'Cool under water.' }],
+        hits: [
+          { docId: 900, score: 0.75, holderId: 4242, title: 'Burns', snippet: 'Cool under water.' },
+        ],
       }),
     );
     expect(res.hopCount).toBe(2);
     expect(res.hits[0].title).toBe('Burns');
     expect(res.hits[0].score).toBeCloseTo(0.75, 4);
+    // The holder is what tells the asker where to fetch the body from, which
+    // is frequently not the node that answered.
+    expect(res.hits[0].holderId).toBe(4242);
 
     const doc = {
       docId: 900,
@@ -91,12 +107,162 @@ describe('packet codec', () => {
       encodeResult({
         queryId: 1,
         hopCount: 0,
-        shardId: 0,
-        hits: [{ docId: 1, score: 1, title: long, snippet: long }],
+        hits: [{ docId: 1, score: 1, holderId: 0, title: long, snippet: long }],
       }),
     );
     expect(res.hits[0].title.length).toBe(80);
     expect(res.hits[0].snippet.length).toBe(200);
+  });
+});
+
+describe('metadata gossip', () => {
+  const entry = (docId: number): MetaEntry => ({
+    docId,
+    seq: docId % 7,
+    version: 1,
+    section: 'Thermal burns',
+    snippet: 'Cool the burn under running water for twenty minutes.',
+    bytes: 1480,
+    originId: 0xdeadbeef,
+    scale: 0.0079,
+    vec: new Int8Array(EMBED_DIM).map((_, i) => ((i * 13) % 255) - 127),
+    holders: [111, 222, 333],
+    hits: 9,
+  });
+
+  it('round-trips an ANNOUNCE with several chunks', () => {
+    const payload = {
+      docKey: 0xabcd1234,
+      title: 'Burns and Poisoning',
+      source: 'burns.md',
+      docBytes: 40_000,
+      chunkCount: 24,
+      docOriginId: 0xdeadbeef,
+      createdAtSec: 1_780_000_000,
+      entries: [entry(1001), entry(1002), entry(1003)],
+    };
+
+    const out = decodeAnnounce(encodeAnnounce(payload));
+    expect(out.docKey).toBe(payload.docKey);
+    expect(out.title).toBe(payload.title);
+    expect(out.chunkCount).toBe(24);
+    // u32 seconds, not milliseconds — Date.now() does not fit.
+    expect(out.createdAtSec).toBe(1_780_000_000);
+    expect(out.entries).toHaveLength(3);
+
+    const [first] = out.entries;
+    expect(first.docId).toBe(1001);
+    expect(first.holders).toEqual([111, 222, 333]);
+    expect(first.hits).toBe(9);
+    expect(first.bytes).toBe(1480);
+    expect(first.scale).toBeCloseTo(0.0079, 6);
+    expect([...first.vec]).toEqual([...entry(1001).vec]);
+  });
+
+  it('survives a docId above 2^31 and a node id above 2^31', () => {
+    // Both are unsigned 32-bit hashes in practice.
+    const big = entry(4_140_640_039);
+    big.holders = [3_006_766_343];
+    const out = decodeAnnounce(
+      encodeAnnounce({
+        docKey: 4_294_967_295,
+        title: 't',
+        source: 's',
+        docBytes: 1,
+        chunkCount: 1,
+        docOriginId: 3_147_357_347,
+        createdAtSec: 1,
+        entries: [big],
+      }),
+    );
+    expect(out.docKey).toBe(4_294_967_295);
+    expect(out.docOriginId).toBe(3_147_357_347);
+    expect(out.entries[0].docId).toBe(4_140_640_039);
+    expect(out.entries[0].holders).toEqual([3_006_766_343]);
+  });
+
+  it('keeps a metadata entry to a fixed budget regardless of body size', () => {
+    // Metadata cost does not scale with the passage it describes: 384 bytes of
+    // embedding plus a capped snippet and heading. That fixed size is what
+    // makes wide replication affordable for long documents, so it is worth
+    // failing a build over rather than letting it drift upward unnoticed.
+    const build = (snippetLen: number) => {
+      const e = entry(1);
+      e.snippet = 'x'.repeat(snippetLen);
+      return encodeAnnounce({
+        docKey: 1,
+        title: 'Burns and Poisoning',
+        source: 'burns.md',
+        docBytes: 1,
+        chunkCount: 1,
+        docOriginId: 1,
+        createdAtSec: 1,
+        entries: [e],
+      }).length;
+    };
+
+    expect(build(200)).toBeLessThan(800);
+    // A passage ten times longer costs the same to describe.
+    expect(build(4000)).toBe(build(200));
+  });
+
+  it('fragments an ANNOUNCE across a BLE MTU and puts it back together', () => {
+    const packet = encodePacket({
+      ver: PROTO_VERSION,
+      type: PacketType.ANNOUNCE,
+      ttl: DEFAULT_TTL,
+      flags: DEFAULT_TTL,
+      msgId: 9,
+      srcId: 7,
+      dstId: BROADCAST,
+      payload: encodeAnnounce({
+        docKey: 5,
+        title: 'Disaster Response',
+        source: 'disaster.md',
+        docBytes: 9000,
+        chunkCount: 4,
+        docOriginId: 7,
+        createdAtSec: 1_780_000_000,
+        entries: [entry(1), entry(2), entry(3), entry(4)],
+      }),
+    });
+
+    const mtu = 185;
+    const frames = fragment(packet, mtu);
+    expect(frames.length).toBeGreaterThan(10);
+    for (const f of frames) expect(f.length).toBeLessThanOrEqual(mtu);
+
+    const re = new Reassembler();
+    let out: Uint8Array | null = null;
+    for (const f of frames) out = re.push(f) ?? out;
+    expect([...out!]).toEqual([...packet]);
+
+    const decoded = decodeAnnounce(decodePacket(out!)!.payload);
+    expect(decoded.entries).toHaveLength(4);
+    expect([...decoded.entries[3].vec]).toEqual([...entry(4).vec]);
+  });
+
+  it('round-trips a catalog request', () => {
+    const req = { sinceSec: 1_780_000_000, max: 400 };
+    expect(decodeCatalogReq(encodeCatalogReq(req))).toEqual(req);
+  });
+
+  it('caps the holder list so one entry cannot inflate a packet', () => {
+    const many = entry(1);
+    many.holders = Array.from({ length: 40 }, (_, i) => i + 1);
+    const out = decodeAnnounce(
+      encodeAnnounce({
+        docKey: 1,
+        title: 't',
+        source: 's',
+        docBytes: 1,
+        chunkCount: 1,
+        docOriginId: 1,
+        createdAtSec: 1,
+        entries: [many],
+      }),
+    );
+    expect(out.entries[0].holders).toHaveLength(8);
   });
 });
 
@@ -239,7 +405,8 @@ function line(nodes: Node[]) {
   for (let i = 0; i < nodes.length - 1; i++) nodes[i].transport.link(nodes[i + 1].transport);
 }
 
-const HELLO = () => encodeHello({ shardId: 0, docCount: 0, caps: 0, name: 'n' });
+const HELLO = () =>
+  encodeHello({ caps: 0, known: 0, stored: 0, documents: 0, freeKb: 0, name: 'n' });
 
 describe('router', () => {
   it('floods a broadcast to every node in a line', () => {

@@ -1,47 +1,43 @@
 {
-  "builtAt": "2026-08-21T17:32:40.404Z",
-  "shardCount": 3,
-  "totalChunks": 34,
+  "builtAt": "2026-08-21T18:28:11.272Z",
   "documents": 6,
-  "shards": [
+  "totalWords": 4125,
+  "samples": [
     {
-      "id": 0,
-      "chunks": 12,
-      "words": 1493,
-      "topics": [
-        "Severe external bleeding",
-        "Recognising wound infection",
-        "Child and infant CPR",
-        "Stroke — the FAST check",
-        "Frostbite",
-        "Snake bite"
-      ]
+      "file": "01-bleeding-and-wounds.md",
+      "title": "Bleeding and Wounds",
+      "bytes": 3210,
+      "words": 500
     },
     {
-      "id": 1,
-      "chunks": 11,
-      "words": 1393,
-      "topics": [
-        "Embedded objects in a wound",
-        "Amputation and severed parts",
-        "Choking",
-        "Hypothermia",
-        "Heat exhaustion and heat stroke",
-        "Fractures and splinting"
-      ]
+      "file": "02-breathing-and-cardiac.md",
+      "title": "Breathing and Cardiac Emergencies",
+      "bytes": 4008,
+      "words": 650
     },
     {
-      "id": 2,
-      "chunks": 11,
-      "words": 1279,
-      "topics": [
-        "Cleaning and dressing a minor wound",
-        "Adult CPR",
-        "Suspected heart attack",
-        "Hypothermia",
-        "Dehydration and oral rehydration",
-        "Spinal injury"
-      ]
+      "file": "03-environmental.md",
+      "title": "Environmental Emergencies",
+      "bytes": 4657,
+      "words": 749
+    },
+    {
+      "file": "04-trauma-and-collapse.md",
+      "title": "Trauma and Sudden Collapse",
+      "bytes": 4614,
+      "words": 729
+    },
+    {
+      "file": "05-burns-and-poisoning.md",
+      "title": "Burns and Poisoning",
+      "bytes": 4038,
+      "words": 648
+    },
+    {
+      "file": "06-disaster-and-survival.md",
+      "title": "Disaster Response and Survival",
+      "bytes": 5243,
+      "words": 849
     }
   ]
 }

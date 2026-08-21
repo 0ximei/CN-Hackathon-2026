@@ -1,40 +1,54 @@
 /**
  * MeshNode — the orchestrator.
  *
- * Owns the transport, the router, the store-and-forward queue and this node's
- * shard, and implements the actual application protocol on top of them:
+ * Owns the transport, the router, the store-and-forward queue, this node's
+ * catalog and its replicator, and implements the application protocol on top:
  *
  *   search(text)
  *     -> embed locally
- *     -> search own shard immediately (results appear before the network does)
+ *     -> search the local catalog immediately
  *     -> flood QUERY carrying a 388-byte int8 embedding
- *     -> peers search their own shards and unicast RESULT back along the
- *        route the query taught them
- *     -> collect for a fixed window, merge, dedupe, rerank
- *     -> pull full passage text on demand with DOC_REQ
+ *     -> peers search their own catalogs and unicast RESULT back along the
+ *        route the query taught them, each naming a node that holds the body
+ *     -> collect for a window, merge, dedupe, rerank
+ *     -> pull full text on demand with DOC_REQ, from a *holder* rather than
+ *        necessarily from whoever answered
+ *
+ * The last point is the structural change from a sharded design. A node can
+ * answer "this passage is relevant" from metadata it holds without holding the
+ * passage itself, so the node that finds something and the node that can serve
+ * it are frequently different machines.
  */
 
 import {
   BROADCAST,
+  PACKET_TYPE_NAME,
   PacketType,
+  decodeAnnounce,
+  decodeCatalogReq,
   decodeDocReq,
   decodeDocRes,
   decodeHello,
   decodeQuery,
   decodeResult,
+  encodeAnnounce,
+  encodeCatalogReq,
   encodeDocReq,
   encodeDocRes,
   encodeHello,
   encodeQuery,
   encodeResult,
+  type AnnouncePayload,
   type Packet,
 } from './packet';
 import { Router, type DropReason, type RouteEntry } from './router';
 import { StoreForward } from './storeForward';
 import type { Transport } from '../transport/Transport';
 import type { Identity } from '../lib/ids';
-import { shardStore } from '../search/shard';
+import { catalog } from '../search/catalog';
+import { db } from '../search/db';
 import { embedder } from '../search/embedder';
+import { Replicator, type ReplicationStats } from '../replication/Replicator';
 import { dequantize, fromWireScore, quantize, toWireScore } from '../search/vector';
 
 const HELLO_INTERVAL_MS = 3000;
@@ -53,14 +67,23 @@ const COLLECT_WINDOW_MS = 5000;
 const EARLY_EXIT_GRACE_MS = 250;
 const HITS_PER_NODE = 4;
 
+/** Entries a joining node will accept in one anti-entropy burst. */
+const CATALOG_SYNC_MAX = 400;
+
 export interface PeerState {
   nodeId: number;
   name: string;
-  shardId: number;
-  docCount: number;
+  /** Chunks this peer has metadata for — what it can search. */
+  known: number;
+  /** Chunks this peer holds the body of — what it can serve. */
+  stored: number;
+  documents: number;
+  freeBytes: number;
   hasLlm: boolean;
   hops: number;
   lastSeen: number;
+  /** Locally observed, 0..1. Refreshed from the replicator each pass. */
+  reliability: number;
 }
 
 export interface MeshHit {
@@ -72,11 +95,15 @@ export interface MeshHit {
   snippet: string;
   /** Full passage, present once DOC_RES has come back (always set for local). */
   text?: string;
+  /** Node that answered — it knows about this passage. */
   fromNodeId: number;
   fromNodeName: string;
+  /** Node that can serve the body. Often not the one that answered. */
+  holderId: number;
   hops: number;
-  shardId: number;
   local: boolean;
+  /** True when this node holds the body itself. */
+  storedHere: boolean;
 }
 
 export interface QueryState {
@@ -91,12 +118,13 @@ export interface QueryState {
 
 export interface ActivityEvent {
   at: number;
-  kind: 'sent' | 'forwarded' | 'received' | 'dropped';
+  kind: 'sent' | 'forwarded' | 'received' | 'dropped' | 'replicated' | 'evicted';
   type: string;
   srcId: number;
   dstId: number;
   peer: string;
   reason?: DropReason;
+  detail?: string;
 }
 
 export interface MeshEvents {
@@ -105,6 +133,8 @@ export interface MeshEvents {
   query(state: QueryState): void;
   routes(routes: Map<number, RouteEntry>): void;
   outbox(queued: number): void;
+  replication(stats: ReplicationStats): void;
+  catalog(): void;
 }
 
 export class MeshNode {
@@ -112,16 +142,21 @@ export class MeshNode {
   readonly router: Router;
   readonly transport: Transport;
   readonly storeForward: StoreForward;
+  readonly replicator: Replicator;
 
   private peersById = new Map<number, PeerState>();
   private queries = new Map<number, QueryState>();
-  private docWaiters = new Map<number, (hit: MeshHit) => void>();
+  /** Multiple callers can wait on the same body; each gets its own resolver. */
+  private docWaiters = new Map<number, ((text: string | null) => void)[]>();
+  private syncedPeers = new Set<number>();
   private helloTimer: number | null = null;
   private peerTimer: number | null = null;
   private queryCounter = 1;
+  private freeBytes = 0;
 
   /** Set by the dev panel; feeds the router's simulated link loss. */
   packetLoss = 0;
+  hasLlm = false;
 
   private listeners: { [K in keyof MeshEvents]: Set<MeshEvents[K]> } = {
     peers: new Set(),
@@ -129,6 +164,8 @@ export class MeshNode {
     query: new Set(),
     routes: new Set(),
     outbox: new Set(),
+    replication: new Set(),
+    catalog: new Set(),
   };
 
   constructor(identity: Identity, transport: Transport) {
@@ -146,6 +183,34 @@ export class MeshNode {
     });
 
     this.storeForward = new StoreForward(this.router, (queued) => this.emit('outbox', queued));
+
+    this.replicator = new Replicator({
+      selfId: identity.id,
+      catalog,
+      livePeers: () =>
+        [...this.peersById.values()].map((p) => ({
+          nodeId: p.nodeId,
+          freeBytes: p.freeBytes,
+        })),
+      announce: (payload, dstId) => this.sendAnnounce(payload, dstId),
+      fetchBody: (docId, from) => this.requestDoc(docId, from, 6000),
+      onStats: (s) => {
+        this.emit('replication', s);
+        void this.refreshReliability();
+      },
+      onEvent: (e) =>
+        this.emit('activity', {
+          at: Date.now(),
+          kind: e.kind === 'pull' ? 'replicated' : 'evicted',
+          type: e.kind === 'pull' ? 'BODY' : 'EVICT',
+          srcId: identity.id,
+          dstId: 0,
+          peer: e.title,
+          detail: e.detail,
+        }),
+    });
+
+    catalog.onChange = () => this.emit('catalog');
 
     this.router.on('deliver', (pkt, fromPeer) => this.handle(pkt, fromPeer));
     this.router.on('sent', (pkt, to) => this.trace('sent', pkt, String(to)));
@@ -169,12 +234,19 @@ export class MeshNode {
     this.peerTimer = setInterval(() => this.reapPeers(), HELLO_INTERVAL_MS) as unknown as number;
   }
 
+  /** Starts replication. Separate from start() because it needs a live catalog. */
+  startReplication() {
+    this.replicator.start();
+  }
+
   stop() {
     if (this.helloTimer !== null) clearInterval(this.helloTimer);
     if (this.peerTimer !== null) clearInterval(this.peerTimer);
+    this.replicator.stop();
     this.storeForward.stop();
     this.router.stop();
     this.transport.stop();
+    catalog.onChange = undefined;
   }
 
   on<K extends keyof MeshEvents>(event: K, cb: MeshEvents[K]): () => void {
@@ -190,7 +262,7 @@ export class MeshNode {
     this.emit('activity', {
       at: Date.now(),
       kind,
-      type: PACKET_NAMES[pkt.type] ?? String(pkt.type),
+      type: PACKET_TYPE_NAME[pkt.type] ?? String(pkt.type),
       srcId: pkt.srcId,
       dstId: pkt.dstId,
       peer,
@@ -205,13 +277,19 @@ export class MeshNode {
   /* ---------------- beacons ---------------- */
 
   private sendHello() {
-    const caps = (shardStore.ready ? 0b10 : 0) | (this.hasLlm ? 0b01 : 0);
+    const caps = (catalog.ready ? 0b10 : 0) | (this.hasLlm ? 0b01 : 0);
+    // Cached rather than awaited: HELLO fires on a timer and a storage estimate
+    // is slow enough that awaiting it here would skew the beacon interval.
+    void catalog.usage().then((u) => (this.freeBytes = u.freeBytes));
+
     this.router.send(
       PacketType.HELLO,
       encodeHello({
-        shardId: shardStore.shardId ?? 255,
-        docCount: shardStore.chunkCount,
         caps,
+        known: catalog.knownCount,
+        stored: catalog.storedCount,
+        documents: catalog.status.documents,
+        freeKb: Math.floor(this.freeBytes / 1024),
         name: this.identity.name,
       }),
       BROADCAST,
@@ -221,14 +299,26 @@ export class MeshNode {
     );
   }
 
-  hasLlm = false;
-
   private reapPeers() {
     const cutoff = Date.now() - PEER_TIMEOUT_MS;
     let changed = false;
     for (const [id, peer] of this.peersById) {
       if (peer.lastSeen < cutoff) {
         this.peersById.delete(id);
+        this.syncedPeers.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) this.emit('peers', this.peers());
+  }
+
+  private async refreshReliability() {
+    const rows = await this.replicator.peerReliability();
+    let changed = false;
+    for (const r of rows) {
+      const peer = this.peersById.get(r.nodeId);
+      if (peer && Math.abs(peer.reliability - r.reliability) > 0.005) {
+        peer.reliability = r.reliability;
         changed = true;
       }
     }
@@ -248,9 +338,14 @@ export class MeshNode {
       case PacketType.RESULT:
         return this.onResult(pkt);
       case PacketType.DOC_REQ:
-        return this.onDocReq(pkt);
+        return void this.onDocReq(pkt);
       case PacketType.DOC_RES:
         return this.onDocRes(pkt);
+      case PacketType.ANNOUNCE:
+      case PacketType.CATALOG_RES:
+        return void this.onAnnounce(pkt);
+      case PacketType.CATALOG_REQ:
+        return void this.onCatalogReq(pkt);
     }
   }
 
@@ -258,53 +353,91 @@ export class MeshNode {
     const hello = decodeHello(pkt.payload);
     const hops = this.router.getRoutes().get(pkt.srcId)?.hops ?? 1;
     const existing = this.peersById.get(pkt.srcId);
+    const freeBytes = hello.freeKb * 1024;
 
     this.peersById.set(pkt.srcId, {
       nodeId: pkt.srcId,
       name: hello.name,
-      shardId: hello.shardId,
-      docCount: hello.docCount,
+      known: hello.known,
+      stored: hello.stored,
+      documents: hello.documents,
+      freeBytes,
       hasLlm: (hello.caps & 0b01) !== 0,
       hops,
       lastSeen: Date.now(),
+      reliability: existing?.reliability ?? 0.5,
     });
+
+    void this.replicator.noteHello(pkt.srcId, freeBytes);
 
     if (!existing) {
       this.emit('peers', this.peers());
       // A peer we could not reach may now be reachable — retry held answers.
       void this.storeForward.flush(pkt.srcId);
-    } else if (existing.docCount !== hello.docCount || existing.hops !== hops) {
+      // ...and we have never synced catalogs with it.
+      if (!this.syncedPeers.has(pkt.srcId)) {
+        this.syncedPeers.add(pkt.srcId);
+        this.router.send(
+          PacketType.CATALOG_REQ,
+          encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
+          pkt.srcId,
+        );
+      }
+    } else if (
+      existing.known !== hello.known ||
+      existing.stored !== hello.stored ||
+      existing.hops !== hops
+    ) {
       this.emit('peers', this.peers());
     }
   }
 
-  /** A peer asked the mesh a question. Search our own shard and reply. */
+  /** A peer asked the mesh a question. Search our catalog and reply. */
   private onQuery(pkt: Packet) {
-    if (!shardStore.ready) return;
+    if (!catalog.ready) return;
 
     const q = decodeQuery(pkt.payload);
     // The vector arrives quantized; dequantizing re-normalizes it so the
     // cosine scores are directly comparable with the asker's own.
     const vec = dequantize(q.vec, q.scale);
 
-    const hits = shardStore.searchLocal(vec, Math.min(q.topK, HITS_PER_NODE), q.text);
+    const hits = catalog.searchLocal(vec, Math.min(q.topK, HITS_PER_NODE), q.text);
     if (!hits.length) return;
 
-    this.router.send(
-      PacketType.RESULT,
-      encodeResult({
-        queryId: q.queryId,
-        hopCount: this.router.getRoutes().get(pkt.srcId)?.hops ?? 1,
-        shardId: shardStore.shardId ?? 255,
-        hits: hits.map((h) => ({
-          docId: h.docId,
-          score: toWireScore(h.score),
-          title: h.chunk.title,
-          snippet: `${h.chunk.section}: ${h.chunk.text}`.slice(0, 200),
-        })),
-      }),
-      pkt.srcId,
-    );
+    // Answering counts as an access: a chunk that keeps winning searches is
+    // what "popular" means here, and popularity buys replicas.
+    void this.replicator.recordHit(hits.map((h) => h.docId));
+
+    void (async () => {
+      const holders = await this.holdersFor(hits.map((h) => h.docId));
+      this.router.send(
+        PacketType.RESULT,
+        encodeResult({
+          queryId: q.queryId,
+          hopCount: this.router.getRoutes().get(pkt.srcId)?.hops ?? 1,
+          hits: hits.map((h) => ({
+            docId: h.docId,
+            score: toWireScore(h.score),
+            holderId: h.hasBody ? this.identity.id : (holders.get(h.docId) ?? 0),
+            title: h.meta.title,
+            snippet: `${h.meta.section}: ${h.meta.snippet}`.slice(0, 200),
+          })),
+        }),
+        pkt.srcId,
+      );
+    })();
+  }
+
+  /** Picks one live holder per chunk, preferring ourselves. */
+  private async holdersFor(docIds: number[]): Promise<Map<number, number>> {
+    const out = new Map<number, number>();
+    const live = new Set([this.identity.id, ...this.peersById.keys()]);
+    const rows = await db().holders.toArray();
+    for (const r of rows) {
+      if (!docIds.includes(r.docId) || !live.has(r.nodeId)) continue;
+      if (!out.has(r.docId) || r.nodeId === this.identity.id) out.set(r.docId, r.nodeId);
+    }
+    return out;
   }
 
   private onResult(pkt: Packet) {
@@ -317,7 +450,12 @@ export class MeshNode {
 
     for (const hit of res.hits) {
       const existing = state.hits.find((h) => h.docId === hit.docId);
-      if (existing) continue; // the same passage cannot live on two shards
+      if (existing) {
+        // The same passage legitimately lives on several nodes now. Keep the
+        // first answer but remember a holder if this one named a better route.
+        if (!existing.holderId && hit.holderId) existing.holderId = hit.holderId;
+        continue;
+      }
       const [section, ...rest] = hit.snippet.split(': ');
       state.hits.push({
         docId: hit.docId,
@@ -327,9 +465,10 @@ export class MeshNode {
         snippet: rest.length ? rest.join(': ') : hit.snippet,
         fromNodeId: pkt.srcId,
         fromNodeName: name,
+        holderId: hit.holderId || pkt.srcId,
         hops: res.hopCount,
-        shardId: res.shardId,
         local: false,
+        storedHere: catalog.holdsBody(hit.docId),
       });
     }
 
@@ -338,18 +477,21 @@ export class MeshNode {
     this.emit('query', { ...state, hits: [...state.hits] });
   }
 
-  private onDocReq(pkt: Packet) {
+  private async onDocReq(pkt: Packet) {
     const { docId } = decodeDocReq(pkt.payload);
-    const chunk = shardStore.getChunk(docId);
-    if (!chunk) return;
+    const meta = catalog.getMeta(docId);
+    const text = await catalog.getBody(docId);
+    // Answer even when we do not have the body: an empty text tells the asker
+    // to stop waiting and try another holder, where silence would cost it the
+    // full timeout before it learned anything.
     this.router.send(
       PacketType.DOC_RES,
       encodeDocRes({
         docId,
-        title: chunk.title,
-        section: chunk.section,
-        text: chunk.text,
-        source: chunk.source,
+        title: meta?.title ?? '',
+        section: meta?.section ?? '',
+        text: text ?? '',
+        source: '',
       }),
       pkt.srcId,
     );
@@ -357,23 +499,59 @@ export class MeshNode {
 
   private onDocRes(pkt: Packet) {
     const doc = decodeDocRes(pkt.payload);
-    const waiter = this.docWaiters.get(doc.docId);
-    if (!waiter) return;
-    this.docWaiters.delete(doc.docId);
+    void this.replicator.noteResponse(pkt.srcId);
 
+    const waiters = this.docWaiters.get(doc.docId);
+    if (waiters) {
+      this.docWaiters.delete(doc.docId);
+      for (const w of waiters) w(doc.text || null);
+    }
+
+    if (!doc.text) return;
     for (const state of this.queries.values()) {
       const hit = state.hits.find((h) => h.docId === doc.docId);
       if (hit) {
         hit.text = doc.text;
-        hit.section = doc.section;
-        waiter(hit);
+        if (doc.section) hit.section = doc.section;
         this.emit('query', { ...state, hits: [...state.hits] });
-        return;
       }
     }
   }
 
+  private async onAnnounce(pkt: Packet) {
+    const payload = decodeAnnounce(pkt.payload);
+    const added = await this.replicator.onAnnounce(payload, pkt.srcId);
+    if (added) this.emit('catalog');
+  }
+
+  private async onCatalogReq(pkt: Packet) {
+    const req = decodeCatalogReq(pkt.payload);
+    await this.replicator.serveCatalogRequest(req.sinceSec, pkt.srcId, req.max);
+  }
+
+  private sendAnnounce(payload: AnnouncePayload, dstId?: number) {
+    this.router.send(
+      dstId ? PacketType.CATALOG_RES : PacketType.ANNOUNCE,
+      encodeAnnounce(payload),
+      dstId ?? BROADCAST,
+    );
+  }
+
   /* ---------------- outbound application logic ---------------- */
+
+  /** Ingests a document here and gossips its metadata to the mesh. */
+  async upload(
+    filename: string,
+    text: string,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<{ title: string; chunks: number }> {
+    const { doc } = await catalog.upload(filename, text, this.identity.id, onProgress);
+    await this.replicator.announceDocument(doc.docKey);
+    // Replicate immediately rather than waiting for the next timer tick, so an
+    // upload visibly spreads instead of sitting on one node for six seconds.
+    void this.replicator.reconcile();
+    return { title: doc.title, chunks: doc.chunkCount };
+  }
 
   /**
    * Runs a search across the mesh. Resolves when the collection window closes;
@@ -392,23 +570,27 @@ export class MeshNode {
 
     const vec = await embedder.embedOne(text);
 
-    // Our own shard answers instantly — no radio involved.
-    if (shardStore.ready) {
-      for (const hit of shardStore.searchLocal(vec, topK, text)) {
+    // Our own catalog answers instantly — no radio involved.
+    if (catalog.ready) {
+      const local = catalog.searchLocal(vec, topK, text);
+      const holders = await this.holdersFor(local.map((h) => h.docId));
+      for (const hit of local) {
         state.hits.push({
           docId: hit.docId,
           score: hit.score,
-          title: hit.chunk.title,
-          section: hit.chunk.section,
-          snippet: hit.chunk.text.slice(0, 200),
-          text: hit.chunk.text,
+          title: hit.meta.title,
+          section: hit.meta.section,
+          snippet: hit.meta.snippet,
+          text: hit.hasBody ? await catalog.getBody(hit.docId) : undefined,
           fromNodeId: this.identity.id,
           fromNodeName: this.identity.name,
+          holderId: hit.hasBody ? this.identity.id : (holders.get(hit.docId) ?? 0),
           hops: 0,
-          shardId: hit.chunk.shardId,
           local: true,
+          storedHere: hit.hasBody,
         });
       }
+      void this.replicator.recordHit(local.map((h) => h.docId));
       state.respondedNodeIds.push(this.identity.id);
       this.emit('query', { ...state, hits: [...state.hits] });
     }
@@ -460,30 +642,60 @@ export class MeshNode {
     });
   }
 
-  /** Fetches the full passage behind a remote hit. Local hits already have it. */
+  /**
+   * Fetches the full passage behind a hit.
+   *
+   * Goes to the named holder rather than to whoever answered, and falls back to
+   * the answering node if the holder is silent — which happens when a holder
+   * was evicted between announcing and being asked.
+   */
   async fetchFullText(hit: MeshHit, timeoutMs = 4000): Promise<string> {
     if (hit.text) return hit.text;
+    if (catalog.holdsBody(hit.docId)) {
+      const local = await catalog.getBody(hit.docId);
+      if (local) return local;
+    }
+
+    const targets = [hit.holderId, hit.fromNodeId].filter(
+      (id, i, arr) => id && id !== this.identity.id && arr.indexOf(id) === i,
+    );
+    for (const target of targets) {
+      const text = await this.requestDoc(hit.docId, target, timeoutMs);
+      if (text) return text;
+    }
+    return hit.snippet; // degrade to the snippet rather than blocking
+  }
+
+  /**
+   * Asks one specific node for one body.
+   *
+   * Also the replicator's pull primitive, which is why it resolves null rather
+   * than throwing: a failed pull is ordinary, and it feeds the peer's
+   * reliability score instead of being an error.
+   */
+  private requestDoc(docId: number, fromNodeId: number, timeoutMs: number): Promise<string | null> {
+    void this.replicator.noteRequest(fromNodeId);
     return new Promise((resolve) => {
+      const settle = (text: string | null) => {
+        clearTimeout(timer);
+        resolve(text);
+      };
+
       const timer = setTimeout(() => {
-        this.docWaiters.delete(hit.docId);
-        resolve(hit.snippet); // degrade to the snippet rather than blocking
+        const list = this.docWaiters.get(docId);
+        if (list) {
+          const rest = list.filter((w) => w !== settle);
+          if (rest.length) this.docWaiters.set(docId, rest);
+          else this.docWaiters.delete(docId);
+        }
+        resolve(null);
       }, timeoutMs);
 
-      this.docWaiters.set(hit.docId, (filled) => {
-        clearTimeout(timer);
-        resolve(filled.text ?? hit.snippet);
-      });
+      const existing = this.docWaiters.get(docId);
+      if (existing) existing.push(settle);
+      else this.docWaiters.set(docId, [settle]);
 
-      this.router.send(PacketType.DOC_REQ, encodeDocReq(hit.docId), hit.fromNodeId);
+      this.router.send(PacketType.DOC_REQ, encodeDocReq(docId), fromNodeId);
     });
   }
 }
-
-const PACKET_NAMES: Record<number, string> = {
-  0: 'HELLO',
-  1: 'QUERY',
-  2: 'RESULT',
-  3: 'DOC_REQ',
-  4: 'DOC_RES',
-  5: 'ACK',
-};

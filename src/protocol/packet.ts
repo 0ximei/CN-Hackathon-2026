@@ -16,7 +16,7 @@
  * forwarded via the router's backward-learned next-hop table.
  */
 
-export const PROTO_VERSION = 1;
+export const PROTO_VERSION = 2;
 export const HEADER_BYTES = 16;
 export const BROADCAST = 0;
 export const DEFAULT_TTL = 4;
@@ -28,6 +28,11 @@ export const PacketType = {
   DOC_REQ: 3,
   DOC_RES: 4,
   ACK: 5,
+  /** Metadata gossip — the cheap tier spreading outward from an upload. */
+  ANNOUNCE: 6,
+  /** Anti-entropy: "what have I missed?" */
+  CATALOG_REQ: 7,
+  CATALOG_RES: 8,
 } as const;
 export type PacketType = (typeof PacketType)[keyof typeof PacketType];
 
@@ -38,6 +43,9 @@ export const PACKET_TYPE_NAME: Record<number, string> = {
   3: 'DOC_REQ',
   4: 'DOC_RES',
   5: 'ACK',
+  6: 'ANNOUNCE',
+  7: 'CATALOG_REQ',
+  8: 'CATALOG_RES',
 };
 
 export interface Packet {
@@ -190,20 +198,45 @@ class Reader {
 /* ---- HELLO: periodic beacon; also the store-and-forward flush trigger ---- */
 
 export interface HelloPayload {
-  shardId: number;
-  docCount: number;
-  /** bit0 = has LLM, bit1 = index ready */
+  /** bit0 = has LLM, bit1 = catalog ready */
   caps: number;
+  /** Chunks this node has metadata for — what it can search. */
+  known: number;
+  /** Chunks this node holds the body of — what it can serve. */
+  stored: number;
+  documents: number;
+  /**
+   * Free storage in KiB.
+   *
+   * Self-reported, and that is fine: capacity is the one signal a node is the
+   * only authority on. Reliability deliberately is *not* here — a peer's claim
+   * about its own uptime is worth nothing, so every node measures that itself.
+   */
+  freeKb: number;
   name: string;
 }
 
 export function encodeHello(h: HelloPayload): Uint8Array {
-  return new Writer().u8(h.shardId).u32(h.docCount).u8(h.caps).str(h.name, 32).finish();
+  return new Writer()
+    .u8(h.caps)
+    .u32(h.known)
+    .u32(h.stored)
+    .u16(h.documents)
+    .u32(h.freeKb)
+    .str(h.name, 32)
+    .finish();
 }
 
 export function decodeHello(b: Uint8Array): HelloPayload {
   const r = new Reader(b);
-  return { shardId: r.u8(), docCount: r.u32(), caps: r.u8(), name: r.str() };
+  return {
+    caps: r.u8(),
+    known: r.u32(),
+    stored: r.u32(),
+    documents: r.u16(),
+    freeKb: r.u32(),
+    name: r.str(),
+  };
 }
 
 /* ---- QUERY: int8-quantized embedding, ~395 bytes for a 384-dim model ---- */
@@ -253,20 +286,29 @@ export interface Hit {
   score: number;
   title: string;
   snippet: string;
+  /**
+   * A node believed to hold the body, or 0 if the answerer knows of none.
+   *
+   * The answering node is often *not* the one to fetch from: it may know a
+   * passage is relevant from metadata alone. Naming a holder here saves the
+   * asker a round trip that would otherwise end in "I know of it, ask someone
+   * else".
+   */
+  holderId: number;
 }
 
 export interface ResultPayload {
   queryId: number;
   hopCount: number;
-  shardId: number;
   hits: Hit[];
 }
 
 export function encodeResult(res: ResultPayload): Uint8Array {
-  const w = new Writer().u32(res.queryId).u8(res.hopCount).u8(res.shardId).u8(res.hits.length);
+  const w = new Writer().u32(res.queryId).u8(res.hopCount).u8(res.hits.length);
   for (const h of res.hits) {
     w.u32(h.docId)
       .u16(Math.max(0, Math.min(65535, Math.round(h.score * 65535))))
+      .u32(h.holderId)
       .str(h.title, 80)
       .str(h.snippet, 200);
   }
@@ -277,13 +319,18 @@ export function decodeResult(b: Uint8Array): ResultPayload {
   const r = new Reader(b);
   const queryId = r.u32();
   const hopCount = r.u8();
-  const shardId = r.u8();
   const n = r.u8();
   const hits: Hit[] = [];
   for (let i = 0; i < n; i++) {
-    hits.push({ docId: r.u32(), score: r.u16() / 65535, title: r.str(), snippet: r.str() });
+    hits.push({
+      docId: r.u32(),
+      score: r.u16() / 65535,
+      holderId: r.u32(),
+      title: r.str(),
+      snippet: r.str(),
+    });
   }
-  return { queryId, hopCount, shardId, hits };
+  return { queryId, hopCount, hits };
 }
 
 /* ---- DOC_REQ / DOC_RES: lazy full-text fetch, keeps RESULT packets small ---- */
@@ -300,6 +347,7 @@ export interface DocResPayload {
   docId: number;
   title: string;
   section: string;
+  /** Empty when the responder turned out not to hold the body after all. */
   text: string;
   source: string;
 }
@@ -317,4 +365,148 @@ export function encodeDocRes(d: DocResPayload): Uint8Array {
 export function decodeDocRes(b: Uint8Array): DocResPayload {
   const r = new Reader(b);
   return { docId: r.u32(), title: r.str(), section: r.str(), text: r.str(), source: r.str() };
+}
+
+/* ---- ANNOUNCE / CATALOG_RES: metadata gossip, the cheap tier ---- */
+
+/**
+ * One chunk's metadata on the wire.
+ *
+ * ~660 bytes, of which 384 is the embedding. That is roughly a quarter of a
+ * typical body, which is the entire economic argument for the split: this can
+ * be sent to everyone, the body cannot.
+ *
+ * `title` and `source` live on the enclosing document rather than being
+ * repeated per chunk — a 30-chunk document would otherwise carry its title
+ * thirty times.
+ */
+export interface MetaEntry {
+  docId: number;
+  seq: number;
+  version: number;
+  section: string;
+  snippet: string;
+  /** Body size in bytes, so a receiver can budget before pulling it. */
+  bytes: number;
+  originId: number;
+  scale: number;
+  vec: Int8Array;
+  /** Nodes the announcer believes hold the body. */
+  holders: number[];
+  /** The announcer's own access count for this chunk (a G-counter share). */
+  hits: number;
+}
+
+export interface AnnouncePayload {
+  docKey: number;
+  title: string;
+  source: string;
+  /** Total body bytes across the whole document. */
+  docBytes: number;
+  chunkCount: number;
+  docOriginId: number;
+  /** Seconds since epoch — milliseconds do not fit in u32. */
+  createdAtSec: number;
+  entries: MetaEntry[];
+}
+
+/** Holders listed per chunk. Bounded so one entry cannot inflate a packet. */
+const MAX_HOLDERS = 8;
+
+export function encodeAnnounce(a: AnnouncePayload): Uint8Array {
+  const w = new Writer()
+    .u32(a.docKey)
+    .str(a.title, 120)
+    .str(a.source, 120)
+    .u32(a.docBytes)
+    .u16(a.chunkCount)
+    .u32(a.docOriginId)
+    .u32(a.createdAtSec)
+    .u8(a.entries.length);
+
+  for (const e of a.entries) {
+    const holders = e.holders.slice(0, MAX_HOLDERS);
+    w.u32(e.docId)
+      .u16(e.seq)
+      .u16(e.version)
+      .u16(Math.min(65535, e.bytes))
+      .u32(e.originId)
+      .u32(e.hits)
+      .str(e.section, 100)
+      .str(e.snippet, 200)
+      .f32(e.scale)
+      .u16(e.vec.length)
+      .bytes(new Uint8Array(e.vec.buffer, e.vec.byteOffset, e.vec.byteLength))
+      .u8(holders.length);
+    for (const h of holders) w.u32(h);
+  }
+  return w.finish();
+}
+
+export function decodeAnnounce(b: Uint8Array): AnnouncePayload {
+  const r = new Reader(b);
+  const docKey = r.u32();
+  const title = r.str();
+  const source = r.str();
+  const docBytes = r.u32();
+  const chunkCount = r.u16();
+  const docOriginId = r.u32();
+  const createdAtSec = r.u32();
+  const n = r.u8();
+
+  const entries: MetaEntry[] = [];
+  for (let i = 0; i < n; i++) {
+    const docId = r.u32();
+    const seq = r.u16();
+    const version = r.u16();
+    const bytes = r.u16();
+    const originId = r.u32();
+    const hits = r.u32();
+    const section = r.str();
+    const snippet = r.str();
+    const scale = r.f32();
+    const dim = r.u16();
+    const raw = r.bytes(dim);
+    const holderCount = r.u8();
+    const holders: number[] = [];
+    for (let h = 0; h < holderCount; h++) holders.push(r.u32());
+    entries.push({
+      docId,
+      seq,
+      version,
+      section,
+      snippet,
+      bytes,
+      originId,
+      scale,
+      vec: new Int8Array(raw.buffer, raw.byteOffset, dim),
+      holders,
+      hits,
+    });
+  }
+  return { docKey, title, source, docBytes, chunkCount, docOriginId, createdAtSec, entries };
+}
+
+/* ---- CATALOG_REQ: anti-entropy for a node that just joined ---- */
+
+export interface CatalogReqPayload {
+  /**
+   * Only send metadata updated after this (seconds since epoch).
+   *
+   * A joining node sends 0 and gets everything; a node that has been away
+   * sends its high-water mark, so re-syncing costs a delta rather than a full
+   * catalog transfer every time a link flaps.
+   */
+  sinceSec: number;
+  /** Cap on entries the requester wants back, so a reply stays bounded. */
+  max: number;
+}
+
+export function encodeCatalogReq(c: CatalogReqPayload): Uint8Array {
+  return new Writer().u32(c.sinceSec).u16(c.max).finish();
+}
+
+export function decodeCatalogReq(b: Uint8Array): CatalogReqPayload {
+  const r = new Reader(b);
+  return { sinceSec: r.u32(), max: r.u16() };
 }

@@ -28,6 +28,7 @@
   --wire-result: oklch(76% 0.13 220);
   --wire-doc: oklch(78% 0.14 75);
   --wire-drop: oklch(64% 0.17 25);
+  --wire-announce: oklch(72% 0.12 300);
 
   /* ---- type · 2+1, mono carries the machine-data role ---- */
   --font-display: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;

@@ -51,14 +51,15 @@ interface Flight {
 interface Props {
   identity: Identity;
   /** This node's own shard number, or '?' before indexing completes. */
-  selfShard: string;
+  /** Passages whose body this node stores — the new "what do you carry". */
+  selfStored: number;
   peers: PeerState[];
   routes: Map<number, RouteEntry>;
   activity: ActivityEvent[];
   respondedNodeIds: number[];
 }
 
-export function MeshGraph({ identity, selfShard, peers, routes, activity, respondedNodeIds }: Props) {
+export function MeshGraph({ identity, selfStored, peers, routes, activity, respondedNodeIds }: Props) {
   const layout = useMemo(() => computeLayout(identity.id, peers, routes), [identity.id, peers, routes]);
 
   const flights = useRef<Flight[]>([]);
@@ -184,13 +185,13 @@ export function MeshGraph({ identity, selfShard, peers, routes, activity, respon
                 className={`mesh-dot${responded.has(nodeId) ? ' is-responded' : ''}`}
               />
               <text x={p.x} y={p.y + 3.5} className="mesh-shard">
-                {peer && peer.shardId !== 255 ? peer.shardId : '?'}
+                {peer ? peer.stored : '?'}
               </text>
               <text x={p.x} y={p.y + 31} className="mesh-label">
                 {peer?.name ?? `#${nodeId.toString(16).slice(0, 4)}`}
               </text>
               <text x={p.x} y={p.y + 43} className="mesh-sub">
-                {peer ? `${peer.docCount} psg · ${peer.hops}h` : 'discovering'}
+                {peer ? `knows ${peer.known} · ${peer.hops}h` : 'discovering'}
               </text>
             </g>
           );
@@ -199,7 +200,7 @@ export function MeshGraph({ identity, selfShard, peers, routes, activity, respon
         <g className="mesh-node">
           <circle cx={CX} cy={CY} r={19} className="mesh-dot is-self" />
           <text x={CX} y={CY + 4} className="mesh-shard is-self">
-            {selfShard}
+            {selfStored}
           </text>
           <text x={CX} y={CY + 36} className="mesh-label is-self">
             {identity.name} · you

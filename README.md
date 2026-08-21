@@ -1,9 +1,13 @@
 # MeshNet — a distributed offline search engine
 
-Each device stores one **shard** of a corpus in a local database. When you search,
-the query travels across an **offline mesh network**; every node runs semantic
-search over its own shard, replies route back along the path the query took, and
-the originating node answers with an **on-device LLM**.
+Upload a document and it enters a mesh of browsers, then spreads on its own.
+When you search, the query travels across an **offline mesh network**; every
+node runs semantic search over what it knows, replies route back along the path
+the query took, and the originating node answers with an **on-device LLM**.
+
+Nothing is preloaded and nothing is assigned. Documents arrive by upload and
+replicate themselves according to how popular they are, how much room each node
+has, and how reliable each node has proven to be.
 
 No internet. No server. No cloud inference.
 
@@ -38,6 +42,31 @@ protocol already fragments to a 180-byte MTU, so that transport is a drop-in.
 
 ---
 
+## Two tiers: knowing versus storing
+
+Every passage is stored as two separable things.
+
+| Tier | Contents | Size | Replicated to |
+|---|---|---|---|
+| **metadata** | title, heading, 200-char snippet, int8 embedding | ~620 B, fixed | up to 8 nodes |
+| **body** | the full passage text | as long as the passage | 2–5 nodes, by policy |
+
+Metadata is what you need to *find* something. The body is what you need to
+*read* it. Making discovery highly available is cheap; making content highly
+available is not. So a node can hold metadata for the whole mesh while storing
+only the passages the policy assigns it, and still answer *"I know something
+relevant, and here is who has it."*
+
+**An honest note on the size win.** Metadata is a *fixed* ~620 bytes, 384 of
+which is the embedding. On the short first-aid samples here (~740-byte
+passages) that is nearly half a body, and wide metadata replication is barely
+cheaper than wide body replication — the UI shows the real ratio rather than a
+flattering one. On documents chunked at 1.5–4 KB it is a third to a sixth. The
+structural argument does not depend on the ratio: discovery stays available
+when the nodes holding the content do not.
+
+---
+
 ## How a query works
 
 1. The query is embedded locally (all-MiniLM-L6-v2, 384-dim).
@@ -45,13 +74,15 @@ protocol already fragments to a 180-byte MTU, so that transport is a drop-in.
    difference between 8 frames and 3.
 3. A `QUERY` packet floods outward with TTL 4.
 4. Every node dedups on message id, records the reverse path, re-floods to
-   everyone except the sender, and searches **its own shard only**.
+   everyone except the sender, and searches **its own catalog** — everything it
+   has metadata for, whether or not it stores the text.
 5. Nodes that find something above the relevance floor unicast a `RESULT` back
-   along the learned route. Nodes that find nothing **stay silent**.
+   along the learned route, each hit naming a node that **holds the body**.
+   Nodes that find nothing **stay silent**.
 6. The origin collects until every known peer has replied (or 5s), merges,
    dedups, and re-ranks.
-7. `DOC_REQ` pulls full passage text on demand — snippets travel in `RESULT`, so
-   packets stay small.
+7. `DOC_REQ` pulls full text from a *holder* — often not the node that answered,
+   because answering only requires metadata.
 8. Passages go into a grounded prompt; the answer cites each claim back to the
    node that supplied it.
 
@@ -70,6 +101,40 @@ If a reply's destination has gone offline, the packet is persisted to a
 
 ---
 
+## Replication
+
+Every node runs the same loop against gossiped state, with no coordinator and
+no consensus. It lives in [`policy.ts`](src/replication/policy.ts) as pure
+functions and [`Replicator.ts`](src/replication/Replicator.ts) as the part that
+touches the network and the clock.
+
+**Where a body goes** — weighted rendezvous hashing. Each node scores itself for
+each chunk (`weight / -ln(u)`, u from a hash of chunk and node id); the top-K
+scores are the replica set. Every node computes the same ranking from the same
+inputs. The property that earns HRW its place over a hash ring is minimal
+disruption: when a node leaves, only the chunks *it* held move, and they spread
+across the survivors rather than landing on one neighbour. There is a test for
+exactly that.
+
+**How many copies** — the larger of two pressures:
+
+| Signal | Effect | Where it comes from |
+|---|---|---|
+| **popularity** | hot chunks earn up to 3 extra copies | a G-counter: each node counts its own accesses and gossips its share, readers sum |
+| **reliability** | flaky holders raise the target until 1.5 copies are *expected online* | locally observed beacon regularity and answered requests — never self-reported |
+| **capacity** | a full node's weight drops to zero and it stops being chosen | self-reported free bytes, the one thing a node is the authority on |
+| **availability** | reconciliation acts on *live* holders, not claimed ones | holder claims gossiped in `ANNOUNCE`, expired after 60s |
+
+Reliability is measured, not announced, so two nodes can rank candidates
+slightly differently. That is deliberate: acting on the observed replica count
+means disagreement converges to slightly too many copies rather than a gap, and
+over-replication is safe where under-replication is not.
+
+**The invariant that outranks everything:** never drop the last live copy of a
+body. Storage pressure can evict anything else.
+
+---
+
 ## Running it
 
 ```bash
@@ -77,13 +142,24 @@ npm install && npm run corpus:build && npm run dev
 ```
 
 Open the page in **three tabs**. Each tab is an independent node with its own
-identity and its own IndexedDB, so give each one a different shard from the
-"This node" panel. `34 passages reachable` in the masthead means the whole
-corpus is online, split three ways.
+identity and its own IndexedDB.
 
-Then ask *"how long do I cool a burn"* from a node that does **not** hold the
-burns shard. The result comes back badged with the node that answered and its
-hop count.
+1. In tab one, drop a `.txt` or `.md` file onto the Library panel — or click one
+   of the sample documents, which are uploaded through exactly the same path.
+2. Watch the other two tabs. Metadata arrives first: they go to `knows 5 · 0 B`
+   stored while `ANNOUNCE` packets cross the wire log. Bodies follow as the
+   replicator pulls them, and each document's meter fills toward its target.
+3. Ask *"how long do I cool a burn"* from any tab.
+
+### Demoing the storage split
+
+Set a tab's **storage budget** to `4 KB` in the This node panel. It is over
+budget immediately, evicts every body it holds, and settles as a metadata-only
+node — `knows 5, stores 0`. Search from it: the results still come back, badged
+`body fetched`, because it matched on metadata it kept and pulled the text from
+a holder. That is the entire design in one interaction.
+
+Raise the budget again and it re-pulls whatever it ranks for.
 
 ### Demoing the network
 
@@ -100,9 +176,13 @@ The Network controls panel exists to break things on stage:
 npm test
 ```
 
-18 tests covering packet round-trips, fragment reassembly at a 185-byte MTU,
-int8 quantization accuracy, and the routing invariants — TTL horizons, cycle
-termination, backward learning, and rerouting around a broken link.
+53 tests. Packet round-trips including `ANNOUNCE` with a 384-byte embedding,
+fragment reassembly at a 185-byte MTU, int8 quantization accuracy, the routing
+invariants (TTL horizons, cycle termination, backward learning, rerouting
+around a broken link), and the replication policy — placement determinism,
+minimal disruption on node loss, weight proportionality, target response to
+popularity and to unreliability, convergence and settling, and the
+never-drop-the-last-copy invariant.
 
 ---
 
@@ -117,7 +197,7 @@ here with fp32, which is a ~90 MB download instead of ~23 MB. See
 [`embedder.worker.ts`](src/search/embedder.worker.ts).
 
 **A node with nothing relevant says nothing.** Without a relevance floor, a
-shard that holds no answer still returns its four least-irrelevant passages, and
+node that knows nothing relevant still returns its four least-irrelevant passages, and
 the answer layer cites them as though they were answers. On a first-aid corpus
 that is the worst available failure — confident frostbite advice for a burn
 question. There is an absolute floor per node and a relative cut-off at the
@@ -125,14 +205,16 @@ origin, and an out-of-corpus question returns *"Not in the mesh."*
 
 ---
 
-## Corpus
+## Sample documents
 
-Offline first-aid and disaster response, adapted from public-domain guidance —
-bleeding, CPR, choking, burns, hypothermia, heat stroke, snake bite, water
-purification, earthquake, flood. Chunks are distributed **round-robin** across
-shards rather than grouped by topic, deliberately: it guarantees that answering
-almost any question needs passages from several nodes, which is the behaviour
-the system exists to demonstrate.
+Six markdown files of offline first-aid and disaster response, adapted from
+public-domain guidance — bleeding, CPR, choking, burns, hypothermia, heat
+stroke, snake bite, water purification, earthquake, flood.
+
+They are **not** preloaded. `npm run corpus:build` copies them into `public/`
+untouched, and the app uploads them through the same parse → chunk → embed →
+announce path as a file dragged in from the desktop. A build step that
+pre-chunked them would be quietly exercising a path real uploads never take.
 
 This is reference material for emergencies without connectivity. It is not a
 substitute for professional medical care.
