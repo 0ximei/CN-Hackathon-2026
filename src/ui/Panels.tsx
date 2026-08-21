@@ -447,6 +447,7 @@ export function ResultsList({ state }: { state: MeshState }) {
   const local = query.hits.filter((h) => h.local).length;
   const remote = query.hits.length - local;
   const fetched = query.hits.filter((h) => !h.storedHere && h.text).length;
+  const metaOnly = query.hits.filter((h) => !h.storedHere && !h.text).length;
 
   return (
     <section className="panel">
@@ -455,6 +456,7 @@ export function ResultsList({ state }: { state: MeshState }) {
         <span className="tag mono">
           {local} local · {remote} from mesh
           {fetched ? ` · ${fetched} body fetched` : ''}
+          {metaOnly ? ` · ${metaOnly} metadata only` : ''}
         </span>
       </header>
       <ul className="results">
@@ -467,17 +469,26 @@ export function ResultsList({ state }: { state: MeshState }) {
 }
 
 function ResultRow({ hit }: { hit: MeshHit }) {
-  // "found by" and "stored on" are now different facts. A node can match a
-  // passage from metadata it holds without holding the passage, so saying only
-  // where the hit came from would misrepresent where the text lives.
-  const tier = hit.storedHere ? 'stored here' : 'body fetched';
+  // "found by", "stored on" and "retrieved from" are three different facts, and
+  // a metadata-only node makes them come apart: it matched the passage from an
+  // embedding it holds without holding the passage. Reporting only where the
+  // hit came from would let "this node" stand for all three.
+  const tier = hit.storedHere
+    ? 'stored here'
+    : hit.text
+      ? `body from ${hit.holderName || 'mesh'}`
+      : hit.holderName
+        ? `metadata only · body on ${hit.holderName}`
+        : 'metadata only · no holder known';
 
   return (
     <li className="result">
       <div className="result-head">
         <h3 className="result-title">{hit.section || hit.title}</h3>
         <span className={`origin${hit.local ? ' is-local' : ''}`}>
-          <span className="mono">{hit.local ? 'this node' : hit.fromNodeName}</span>
+          <span className="mono">
+            {hit.local ? 'matched here' : `matched by ${hit.fromNodeName}`}
+          </span>
           <span className="mono origin-hops">
             {tier} · {hit.hops}h
           </span>

@@ -100,6 +100,8 @@ export interface MeshHit {
   fromNodeName: string;
   /** Node that can serve the body. Often not the one that answered. */
   holderId: number;
+  /** Display name for holderId, empty when no holder is known. */
+  holderName: string;
   hops: number;
   local: boolean;
   /** True when this node holds the body itself. */
@@ -428,6 +430,33 @@ export class MeshNode {
     })();
   }
 
+  /** Display name for a node id, whoever it is. */
+  private nameOf(nodeId: number): string {
+    if (!nodeId) return '';
+    if (nodeId === this.identity.id) return this.identity.name;
+    return this.peersById.get(nodeId)?.name ?? `#${nodeId.toString(16).slice(0, 4)}`;
+  }
+
+  /**
+   * Files a fetched body back into whatever live query the hit came from.
+   *
+   * Without this the results list is stuck on the snippet it matched against
+   * even after the full passage has been pulled for the answer, and it has no
+   * way to tell "the body is elsewhere" from "the body is here now".
+   */
+  private noteFetchedText(docId: number, text: string, holderId: number): void {
+    for (const state of this.queries.values()) {
+      const hit = state.hits.find((h) => h.docId === docId);
+      if (!hit || hit.text) continue;
+      hit.text = text;
+      if (holderId) {
+        hit.holderId = holderId;
+        hit.holderName = this.nameOf(holderId);
+      }
+      this.emit('query', { ...state, hits: [...state.hits] });
+    }
+  }
+
   /** Picks one live holder per chunk, preferring ourselves. */
   private async holdersFor(docIds: number[]): Promise<Map<number, number>> {
     const out = new Map<number, number>();
@@ -435,6 +464,11 @@ export class MeshNode {
     const rows = await db().holders.toArray();
     for (const r of rows) {
       if (!docIds.includes(r.docId) || !live.has(r.nodeId)) continue;
+      // A row naming us is only believable if we really hold the body. Trusting
+      // it blindly makes this node its own holder for a passage it cannot
+      // serve, and fetchFullText then has nowhere to go — it drops self from
+      // the target list and silently degrades to the snippet.
+      if (r.nodeId === this.identity.id && !catalog.holdsBody(r.docId)) continue;
       if (!out.has(r.docId) || r.nodeId === this.identity.id) out.set(r.docId, r.nodeId);
     }
     return out;
@@ -453,7 +487,10 @@ export class MeshNode {
       if (existing) {
         // The same passage legitimately lives on several nodes now. Keep the
         // first answer but remember a holder if this one named a better route.
-        if (!existing.holderId && hit.holderId) existing.holderId = hit.holderId;
+        if (!existing.holderId && hit.holderId) {
+          existing.holderId = hit.holderId;
+          existing.holderName = this.nameOf(hit.holderId);
+        }
         continue;
       }
       const [section, ...rest] = hit.snippet.split(': ');
@@ -466,6 +503,7 @@ export class MeshNode {
         fromNodeId: pkt.srcId,
         fromNodeName: name,
         holderId: hit.holderId || pkt.srcId,
+        holderName: this.nameOf(hit.holderId || pkt.srcId),
         hops: res.hopCount,
         local: false,
         storedHere: catalog.holdsBody(hit.docId),
@@ -585,6 +623,7 @@ export class MeshNode {
           fromNodeId: this.identity.id,
           fromNodeName: this.identity.name,
           holderId: hit.hasBody ? this.identity.id : (holders.get(hit.docId) ?? 0),
+          holderName: this.nameOf(hit.hasBody ? this.identity.id : (holders.get(hit.docId) ?? 0)),
           hops: 0,
           local: true,
           storedHere: hit.hasBody,
@@ -653,7 +692,10 @@ export class MeshNode {
     if (hit.text) return hit.text;
     if (catalog.holdsBody(hit.docId)) {
       const local = await catalog.getBody(hit.docId);
-      if (local) return local;
+      if (local) {
+        this.noteFetchedText(hit.docId, local, this.identity.id);
+        return local;
+      }
     }
 
     const targets = [hit.holderId, hit.fromNodeId].filter(
@@ -661,9 +703,14 @@ export class MeshNode {
     );
     for (const target of targets) {
       const text = await this.requestDoc(hit.docId, target, timeoutMs);
-      if (text) return text;
+      if (text) {
+        this.noteFetchedText(hit.docId, text, target);
+        return text;
+      }
     }
-    return hit.snippet; // degrade to the snippet rather than blocking
+    // Degrade to the snippet rather than blocking — but do not record it as a
+    // body, or the UI would claim a passage it never managed to retrieve.
+    return hit.snippet;
   }
 
   /**

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_BODY_REPLICAS,
+  META_REPLICAS,
   MIN_BODY_REPLICAS,
   evictionOrder,
   hrwScore,
@@ -8,6 +9,8 @@ import {
   planFor,
   rankNodes,
   reliabilityOf,
+  shouldKeepMeta,
+  targetMetaReplicas,
   targetReplicas,
   type NodeInfo,
 } from './policy';
@@ -94,24 +97,40 @@ describe('rendezvous placement', () => {
 });
 
 describe('target replica count', () => {
-  it('holds at the floor for cold content on reliable nodes', () => {
-    expect(targetReplicas({ hits: 0, candidates: nodes(6) })).toBe(MIN_BODY_REPLICAS);
+  // These exercise the mechanism, so they pass explicit bounds rather than
+  // reading the deployed constants. With the shipped MIN/MAX close together
+  // there is no room for a signal to move anything, which is the point of the
+  // "deployed bounds" test below — the mechanism is still correct, it is just
+  // configured out.
+  const WIDE = { min: 1, max: 5 };
+
+  it('holds at the reliability-driven minimum for cold content', () => {
+    // Not MIN_BODY_REPLICAS: wanting 1.5 copies online from nodes that are up
+    // 95% of the time already costs two copies.
+    expect(targetReplicas({ hits: 0, candidates: nodes(6), ...WIDE })).toBe(2);
   });
 
   it('adds replicas as a chunk gets popular', () => {
     const candidates = nodes(6);
-    const cold = targetReplicas({ hits: 0, candidates });
-    const warm = targetReplicas({ hits: 8, candidates });
-    const hot = targetReplicas({ hits: 500, candidates });
-    expect(warm).toBeGreaterThan(cold);
-    expect(hot).toBeGreaterThan(warm);
-    expect(hot).toBeLessThanOrEqual(MAX_BODY_REPLICAS);
+    const cold = targetReplicas({ hits: 0, candidates, ...WIDE });
+    const hot = targetReplicas({ hits: 500, candidates, ...WIDE });
+    expect(hot).toBeGreaterThan(cold);
+    expect(hot).toBeLessThanOrEqual(WIDE.max);
   });
 
   it('adds replicas when the available nodes are unreliable', () => {
-    const solid = targetReplicas({ hits: 0, candidates: nodes(6, { reliability: 0.95 }) });
-    const flaky = targetReplicas({ hits: 0, candidates: nodes(6, { reliability: 0.3 }) });
+    const solid = targetReplicas({ hits: 0, candidates: nodes(6, { reliability: 0.95 }), ...WIDE });
+    const flaky = targetReplicas({ hits: 0, candidates: nodes(6, { reliability: 0.3 }), ...WIDE });
     expect(flaky).toBeGreaterThan(solid);
+  });
+
+  it('respects the deployed bounds', () => {
+    const candidates = nodes(6);
+    const cold = targetReplicas({ hits: 0, candidates });
+    const hot = targetReplicas({ hits: 500, candidates });
+    expect(cold).toBeGreaterThanOrEqual(Math.min(MIN_BODY_REPLICAS, 6));
+    expect(hot).toBeLessThanOrEqual(MAX_BODY_REPLICAS);
+    expect(hot).toBeGreaterThanOrEqual(cold);
   });
 
   it('never asks for more copies than there are nodes', () => {
@@ -333,5 +352,82 @@ describe('hrw score', () => {
       expect(Number.isFinite(s)).toBe(true);
       expect(s).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('metadata placement', () => {
+  it('bounds carriers at the metadata target', () => {
+    const ns = nodes(12);
+    for (let docId = 1; docId <= 300; docId++) {
+      const carriers = ns.filter((n) => shouldKeepMeta(docId, n.nodeId, ns));
+      expect(carriers.length).toBe(targetMetaReplicas(ns.length));
+    }
+  });
+
+  it('keeps every node a carrier on a mesh no larger than the target', () => {
+    const ns = nodes(META_REPLICAS);
+    for (const n of ns) expect(shouldKeepMeta(42, n.nodeId, ns)).toBe(true);
+  });
+
+  it('ignores free space, so the body tier cannot move the metadata tier', () => {
+    const roomy = nodes(9);
+    // Same mesh, same ids, wildly different headroom. Metadata placement must
+    // not notice: META_REPLICAS controls metadata copies and nothing else.
+    const cramped = roomy.map((n, i) => ({ ...n, freeBytes: i % 2 ? 1024 : 8 * GB }));
+    for (let docId = 1; docId <= 200; docId++) {
+      for (const n of roomy) {
+        expect(shouldKeepMeta(docId, n.nodeId, cramped)).toBe(
+          shouldKeepMeta(docId, n.nodeId, roomy),
+        );
+      }
+    }
+  });
+
+  it('spreads carriers evenly across the mesh', () => {
+    const ns = nodes(10);
+    const counts = new Map(ns.map((n) => [n.nodeId, 0]));
+    for (let docId = 1; docId <= 4000; docId++) {
+      for (const n of ns) {
+        if (shouldKeepMeta(docId, n.nodeId, ns)) counts.set(n.nodeId, counts.get(n.nodeId)! + 1);
+      }
+    }
+    const expected = (4000 * targetMetaReplicas(ns.length)) / ns.length;
+    for (const c of counts.values()) {
+      expect(c).toBeGreaterThan(expected * 0.7);
+      expect(c).toBeLessThan(expected * 1.3);
+    }
+  });
+});
+
+describe('placement symmetry', () => {
+  /**
+   * Each node ranks candidates from its own view, so the only way the mesh as
+   * a whole lands on the target is if no node systematically overrates itself.
+   * Scoring self at a perfect 1 does exactly that, and the target is exceeded
+   * without any single node doing anything wrong.
+   */
+  function meanCopies(selfReliability: (peerRel: number) => number): number {
+    const ids = [1000, 8919, 16838];
+    let held = 0;
+    for (let docId = 1; docId <= 3000; docId++) {
+      for (const self of ids) {
+        const view = ids.map((id) => ({
+          nodeId: id,
+          reliability: id === self ? selfReliability(0.6) : 0.6,
+          freeBytes: GB,
+        }));
+        const rank = rankNodes(docId, view).indexOf(self);
+        if (rank >= 0 && rank < 2) held++;
+      }
+    }
+    return held / 3000;
+  }
+
+  it('lands on the target when a node weights itself like its peers', () => {
+    expect(meanCopies((peer) => peer)).toBeCloseTo(2, 1);
+  });
+
+  it('overshoots the target when a node weights itself at a perfect 1', () => {
+    expect(meanCopies(() => 1)).toBeGreaterThan(2.2);
   });
 });

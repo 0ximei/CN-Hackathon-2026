@@ -17,6 +17,7 @@ export default defineConfig({
   },
   server: {
     host: true,
+    allowedHosts: true,
     port: Number(process.env.PORT) || 5173,
     // Fail loudly if the port is taken rather than silently drifting to 5174
     // and leaving you staring at whatever else is squatting on 5173.

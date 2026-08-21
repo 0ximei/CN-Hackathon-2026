@@ -19,8 +19,10 @@
 import {
   META_REPLICAS,
   evictionOrder,
+  mix32,
   planFor,
   reliabilityOf,
+  shouldKeepMeta,
   targetReplicas,
   type NodeInfo,
 } from './policy';
@@ -34,8 +36,23 @@ const RECONCILE_MS = 6000;
 const MAX_PULLS_PER_PASS = 3;
 /** Chunks per ANNOUNCE packet. Each entry is ~660 bytes. */
 const ENTRIES_PER_ANNOUNCE = 4;
-/** Documents re-announced per pass to refresh holder information. */
-const REANNOUNCE_PER_PASS = 1;
+/**
+ * Ceiling on documents re-announced per pass.
+ *
+ * The actual rate is derived from the library size (see reannouncePerPass): a
+ * fixed rate of one document per pass means a node with many documents cannot
+ * refresh its holder claims before they expire on everyone else, and the mesh
+ * loses track of who has what. This cap only bounds the burst.
+ */
+const MAX_REANNOUNCE_PER_PASS = 8;
+
+/**
+ * Fraction of the holder TTL a full re-announce cycle is allowed to take.
+ *
+ * Claims have to be refreshed comfortably faster than they expire; at 1.0 a
+ * single dropped pass silently deletes a holder from every peer's view.
+ */
+const REANNOUNCE_SAFETY = 0.5;
 
 /**
  * Counter window before halving.
@@ -143,10 +160,77 @@ export class Replicator {
 
   /** Cached per-peer reliability, refreshed each pass. */
   private reliabilityCache = new Map<number, number>();
-  private reannounceCursor = 0;
+  /**
+   * Offset so nodes do not walk the library in lockstep. Every node sees the
+   * same documents in the same primary-key order, so a shared starting point
+   * would have them all re-announcing the same document in the same pass and
+   * refreshing nothing else.
+   */
+  private reannounceCursor: number;
   private running = false;
 
-  constructor(private deps: ReplicatorDeps) {}
+  constructor(private deps: ReplicatorDeps) {
+    this.reannounceCursor = mix32(deps.selfId >>> 0, 0x5eed) % 1024;
+  }
+
+  /**
+   * Nodes that could hold a chunk right now: live peers plus ourselves.
+   *
+   * A node that has gone dark is not a placement target however reliable it
+   * used to be, so membership is taken from the beacon table each time rather
+   * than accumulated.
+   */
+  private candidateNodes(selfFreeBytes: number): NodeInfo[] {
+    const peers = this.deps.livePeers().map((p) => ({
+      nodeId: p.nodeId,
+      reliability: this.reliabilityCache.get(p.nodeId) ?? 0.5,
+      freeBytes: p.freeBytes,
+    }));
+    return [
+      { nodeId: this.deps.selfId, reliability: this.selfReliability(peers), freeBytes: selfFreeBytes },
+      ...peers,
+    ];
+  }
+
+  /**
+   * What weight to give ourselves when ranking placement.
+   *
+   * Emphatically *not* 1. Reliability is observed, and a node cannot observe
+   * its own downtime — it is by definition running whenever it looks. Scoring
+   * self at a perfect 1 while every peer carries a measured value below it
+   * makes each node rank itself top for most chunks, so all of them conclude
+   * they should hold and the replica target is quietly exceeded: three nodes
+   * aiming for two copies settle at 2.4, and worse as peer estimates fall.
+   *
+   * Taking the mean of the peers instead says "assume we are a typical node
+   * on this mesh", which removes the self-preference without pretending to a
+   * measurement we cannot make.
+   */
+  private selfReliability(peers: NodeInfo[]): number {
+    if (!peers.length) return 1;
+    return peers.reduce((s, p) => s + p.reliability, 0) / peers.length;
+  }
+
+  /** Documents to re-announce per pass so a full cycle beats the holder TTL. */
+  private reannouncePerPass(docCount: number): number {
+    const passes = Math.max(1, Math.floor((HOLDER_TTL_MS * REANNOUNCE_SAFETY) / RECONCILE_MS));
+    return Math.min(MAX_REANNOUNCE_PER_PASS, Math.max(1, Math.ceil(docCount / passes)));
+  }
+
+  /**
+   * How long a holder claim stays believable.
+   *
+   * Derived from the refresh cycle rather than fixed, because the two must not
+   * be allowed to cross: once a library is large enough that the cycle exceeds
+   * the TTL, every node's claims expire before they are refreshed, every node
+   * concludes it holds the only copy, and nothing is ever evicted — bodies
+   * replicate without bound no matter what MAX_BODY_REPLICAS says.
+   */
+  private holderTtlMs(docCount: number): number {
+    const perPass = this.reannouncePerPass(docCount);
+    const cycleMs = Math.ceil(docCount / perPass) * RECONCILE_MS;
+    return Math.max(HOLDER_TTL_MS, cycleMs * 2);
+  }
 
   start() {
     if (this.timer !== null) return;
@@ -263,7 +347,8 @@ export class Replicator {
    * which left every peer seeing zero live replicas and nobody pulling.
    */
   private async holderMap(): Promise<Map<number, Set<number>>> {
-    const cutoff = Date.now() - HOLDER_TTL_MS;
+    const docCount = new Set(this.deps.catalog.metas().map((m) => m.docKey)).size;
+    const cutoff = Date.now() - this.holderTtlMs(docCount);
     const rows = await db().holders.toArray();
     const out = new Map<number, Set<number>>();
     const add = (docId: number, nodeId: number) => {
@@ -290,11 +375,22 @@ export class Replicator {
    */
   private async refreshOwnHolders(): Promise<void> {
     const now = Date.now();
-    const mine = this.deps.catalog
-      .metas()
-      .filter((m) => this.deps.catalog.holdsBody(m.docId))
-      .map((m) => ({ docId: m.docId, nodeId: this.deps.selfId, seenAt: now }));
+    const selfId = this.deps.selfId;
+    const catalog = this.deps.catalog;
+    const held = new Set(catalog.metas().filter((m) => catalog.holdsBody(m.docId)).map((m) => m.docId));
+
+    const mine = [...held].map((docId) => ({ docId, nodeId: selfId, seenAt: now }));
     if (mine.length) await db().holders.bulkPut(mine);
+
+    // Prune claims about ourselves that are not true. They should not exist,
+    // but a claim we once gossiped can come back to us through a peer that has
+    // not heard about the eviction yet, and a self-claim we cannot honour is
+    // worse than a missing one: search picks us as the holder and then has
+    // nobody to ask, and replication counts a copy that is not there.
+    const stale = (await db().holders.where('nodeId').equals(selfId).toArray())
+      .filter((r) => !held.has(r.docId))
+      .map((r) => [r.docId, r.nodeId] as [number, number]);
+    if (stale.length) await db().holders.bulkDelete(stale);
   }
 
   /** Records that a node holds a body, from gossip or from our own action. */
@@ -326,7 +422,27 @@ export class Replicator {
       updatedAt: now,
     }));
 
-    const added = await this.deps.catalog.ingestMeta(metas, {
+    // The metadata tier is bounded too. Without this check META_REPLICAS is
+    // decoration: ANNOUNCE is flooded, so every node that hears one keeps a
+    // copy and metadata replicates to the entire mesh however low the constant
+    // is set. Ranking happens here rather than after ingest so a node that is
+    // not a carrier never writes the row at all.
+    //
+    // The freeBytes argument is ignored — metadata placement is deliberately
+    // blind to storage headroom. See rankForMeta.
+    const candidates = this.candidateNodes(1);
+    const keep = metas.filter(
+      (m) =>
+        shouldKeepMeta(m.docId, this.deps.selfId, candidates) ||
+        // Never drop the description of a body we hold: an undescribable body
+        // is unfindable and unservable. Never drop our own upload either.
+        this.deps.catalog.holdsBody(m.docId) ||
+        m.originId === this.deps.selfId,
+    );
+    if (!keep.length) return 0;
+    const kept = new Set(keep.map((m) => m.docId));
+
+    const added = await this.deps.catalog.ingestMeta(keep, {
       docKey: payload.docKey,
       title: payload.title,
       source: payload.source,
@@ -340,7 +456,13 @@ export class Replicator {
     // metadata was new — a re-announcement exists precisely to refresh these.
     await db().transaction('rw', db().holders, db().pop, async () => {
       for (const e of payload.entries) {
+        if (!kept.has(e.docId)) continue;
         for (const holder of e.holders) {
+          // Never let a peer tell us what we hold. We are the only authority on
+          // our own storage, and a stale claim written back about ourselves is
+          // self-refreshing: it never ages out, search resolves the holder to
+          // this node, and the body is then unreachable from here.
+          if (holder === this.deps.selfId) continue;
           await db().holders.put({ docId: e.docId, nodeId: holder, seenAt: now });
         }
         if (e.hits > 0) {
@@ -447,17 +569,7 @@ export class Replicator {
       const reliabilities = await this.peerReliability();
       this.reliabilityCache = new Map(reliabilities.map((r) => [r.nodeId, r.reliability]));
 
-      // Candidates are the nodes that could hold a body *right now*: live peers
-      // plus ourselves. A node that has gone dark is not a placement target, no
-      // matter how reliable it used to be.
-      const candidates: NodeInfo[] = [
-        { nodeId: selfId, reliability: 1, freeBytes: usage.freeBytes },
-        ...live.map((p) => ({
-          nodeId: p.nodeId,
-          reliability: this.reliabilityCache.get(p.nodeId) ?? 0.5,
-          freeBytes: p.freeBytes,
-        })),
-      ];
+      const candidates = this.candidateNodes(usage.freeBytes);
       const liveIds = new Set(candidates.map((c) => c.nodeId));
 
       const [holders, pop] = await Promise.all([this.holderMap(), this.popularityMap()]);
@@ -565,6 +677,29 @@ export class Replicator {
         }
       }
 
+      // Shed metadata for chunks this node is no longer one of the carriers
+      // for. On a mesh no larger than META_REPLICAS this never fires — every
+      // node ranks inside the target — so the small-mesh demo is untouched and
+      // the bound only starts biting once there are more nodes than copies
+      // wanted.
+      const metaEvictions: number[] = [];
+      for (const meta of catalog.metas()) {
+        if (catalog.holdsBody(meta.docId) || meta.originId === selfId) continue;
+        if (!shouldKeepMeta(meta.docId, selfId, candidates)) metaEvictions.push(meta.docId);
+      }
+      if (metaEvictions.length) {
+        const dropped = await catalog.evictMeta(metaEvictions);
+        const first = metas.find((m) => m.docId === metaEvictions[0]);
+        if (dropped && first) {
+          this.deps.onEvent?.({
+            kind: 'evict',
+            docId: first.docId,
+            title: first.title,
+            detail: `${dropped} metadata dropped — carried elsewhere`,
+          });
+        }
+      }
+
       // Refresh a rotating slice of our documents so holder claims and
       // popularity shares stay live rather than ageing out of everyone's map.
       await this.reannounceSlice();
@@ -593,7 +728,8 @@ export class Replicator {
   private async reannounceSlice(): Promise<void> {
     const docs = await db().docs.toArray();
     if (!docs.length) return;
-    for (let i = 0; i < REANNOUNCE_PER_PASS; i++) {
+    const perPass = this.reannouncePerPass(docs.length);
+    for (let i = 0; i < perPass; i++) {
       const doc = docs[this.reannounceCursor % docs.length];
       this.reannounceCursor++;
       await this.announceDocument(doc.docKey);
@@ -611,16 +747,8 @@ export class Replicator {
       this.popularityMap(),
     ]);
 
-    const live = this.deps.livePeers();
     const usage = await catalog.usage();
-    const candidates: NodeInfo[] = [
-      { nodeId: this.deps.selfId, reliability: 1, freeBytes: usage.freeBytes },
-      ...live.map((p) => ({
-        nodeId: p.nodeId,
-        reliability: this.reliabilityCache.get(p.nodeId) ?? 0.5,
-        freeBytes: p.freeBytes,
-      })),
-    ];
+    const candidates = this.candidateNodes(usage.freeBytes);
     const liveIds = new Set(candidates.map((c) => c.nodeId));
 
     const byKey = new Map<number, MetaRow[]>();

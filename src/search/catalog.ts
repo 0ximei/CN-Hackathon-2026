@@ -371,6 +371,37 @@ export class Catalog {
     this.onChange?.();
   }
 
+  /**
+   * Drops metadata this node is no longer one of the carriers for.
+   *
+   * Unlike evicting a body this makes the chunk invisible here: it can no
+   * longer be scored, so this node stops answering queries about it. That is
+   * the intended effect of a bounded metadata target — the caller decides who
+   * carries what, and the ranking is stable enough that the same nodes keep
+   * carrying it. A document left with no chunks loses its row too, so the
+   * library does not list something this node knows nothing about.
+   */
+  async evictMeta(docIds: number[]): Promise<number> {
+    const ids = docIds.filter((id) => this.metaById.has(id));
+    if (!ids.length) return 0;
+    const d = db();
+    const docKeys = new Set(ids.map((id) => this.metaById.get(id)!.docKey));
+    await d.transaction('rw', d.docs, d.catalog, d.bodies, d.holders, d.pop, async () => {
+      await d.catalog.bulkDelete(ids);
+      await d.bodies.bulkDelete(ids);
+      for (const docId of ids) {
+        await d.holders.where('docId').equals(docId).delete();
+        await d.pop.where('docId').equals(docId).delete();
+      }
+      for (const docKey of docKeys) {
+        const left = await d.catalog.where('docKey').equals(docKey).count();
+        if (left === 0) await d.docs.delete(docKey);
+      }
+    });
+    await this.reload();
+    return ids.length;
+  }
+
   /* ---------------- documents ---------------- */
 
   async documents(): Promise<DocRow[]> {

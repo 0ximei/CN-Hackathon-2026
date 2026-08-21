@@ -22,7 +22,13 @@
  * body. Storage pressure can evict anything except that.
  */
 
-/** Never fewer than this many bodies, so losing one node cannot lose data. */
+/**
+ * Floor on body copies.
+ *
+ * Note this rarely binds: MIN_EXPECTED_ONLINE below is 1.5, and reliability can
+ * never exceed 1, so the reliability term alone already asks for two copies.
+ * The floor only shows through on a mesh too small to satisfy it.
+ */
 export const MIN_BODY_REPLICAS = 2;
 /** Never more, however popular — past this the marginal availability is noise. */
 export const MAX_BODY_REPLICAS = 5;
@@ -35,12 +41,12 @@ export const MAX_BODY_REPLICAS = 5;
  * fixed ~620 bytes per chunk, which is cheap against long passages and not
  * especially cheap against short ones. See the note in db.ts.
  */
-export const META_REPLICAS = 8;
+export const META_REPLICAS = 4;
 
 /** Hits at which a chunk is considered maximally popular. Log-scaled below. */
 const POP_REFERENCE = 32;
 /** Extra replicas a maximally popular chunk earns over the minimum. */
-const POP_GAIN = 3;
+const POP_GAIN = 2;
 
 /**
  * How many replicas we want to be online at any given moment.
@@ -130,6 +136,10 @@ export interface TargetInput {
   hits: number;
   /** Nodes eligible to hold this chunk. */
   candidates: NodeInfo[];
+  /** Bounds override, so the mechanism can be exercised apart from the
+   *  deployed setting. Production callers pass neither. */
+  min?: number;
+  max?: number;
 }
 
 /**
@@ -138,31 +148,60 @@ export interface TargetInput {
  * Two independent pressures, and the larger wins: how wanted the chunk is, and
  * how untrustworthy the nodes available to hold it are.
  */
-export function targetReplicas({ hits, candidates }: TargetInput): number {
+export function targetReplicas({ hits, candidates, min, max }: TargetInput): number {
+  const lo = min ?? MIN_BODY_REPLICAS;
+  const hi = max ?? MAX_BODY_REPLICAS;
   const eligible = candidates.filter((n) => nodeWeight(n) > 0);
   if (!eligible.length) return 0;
 
   const popNorm = Math.min(1, Math.log1p(Math.max(0, hits)) / Math.log1p(POP_REFERENCE));
-  const fromPopularity = MIN_BODY_REPLICAS + Math.round(POP_GAIN * popNorm);
+  const fromPopularity = lo + Math.round(POP_GAIN * popNorm);
 
   const meanReliability =
     eligible.reduce((s, n) => s + clamp(n.reliability, 0, 1), 0) / eligible.length;
   const fromReliability = meanReliability > 0
     ? Math.ceil(MIN_EXPECTED_ONLINE / meanReliability)
-    : MAX_BODY_REPLICAS;
+    : hi;
 
   const want = Math.max(fromPopularity, fromReliability);
   // Cannot want more copies than there are nodes to put them on. The cap is
   // applied before the floor, not clamped between the two: on a mesh smaller
-  // than MIN_BODY_REPLICAS the floor is unreachable, and asking for two copies
-  // on a one-node mesh would leave reconciliation permanently unsatisfied.
-  const cap = Math.min(MAX_BODY_REPLICAS, eligible.length);
-  return Math.max(Math.min(want, cap), Math.min(MIN_BODY_REPLICAS, cap));
+  // than the floor the floor is unreachable, and asking for two copies on a
+  // one-node mesh would leave reconciliation permanently unsatisfied.
+  const cap = Math.min(hi, eligible.length);
+  return Math.max(Math.min(want, cap), Math.min(lo, cap));
 }
 
 /** Metadata target: wide, but still bounded by the mesh size. */
 export function targetMetaReplicas(candidateCount: number): number {
   return Math.min(META_REPLICAS, Math.max(1, candidateCount));
+}
+
+/**
+ * Metadata placement ranking — deliberately blind to free space.
+ *
+ * `nodeWeight` folds storage headroom in, which is right for bodies and wrong
+ * for metadata. A node that has run out of room for bodies is exactly the node
+ * that should still be able to say "I know something relevant, and here is who
+ * has it". Ranking metadata on headroom would make the metadata tier move
+ * whenever the body tier moved, which is the coupling the split exists to
+ * avoid: META_REPLICAS should control metadata copies and nothing else.
+ *
+ * Reliability still counts — metadata on a node that is never up is not
+ * discovery.
+ */
+export function rankForMeta(docId: number, nodes: NodeInfo[]): number[] {
+  return rankNodes(
+    docId,
+    nodes.map((n) => ({ ...n, freeBytes: HEADROOM_REFERENCE })),
+  );
+}
+
+/** Whether `selfId` is one of the nodes that should carry this chunk's metadata. */
+export function shouldKeepMeta(docId: number, selfId: number, nodes: NodeInfo[]): boolean {
+  const target = targetMetaReplicas(nodes.length);
+  const rank = rankForMeta(docId, nodes).indexOf(selfId);
+  return rank >= 0 && rank < target;
 }
 
 export type Action = 'pull' | 'evict' | 'hold' | 'none';
