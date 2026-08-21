@@ -1,0 +1,47 @@
+{
+  "builtAt": "2026-08-21T17:23:14.594Z",
+  "shardCount": 3,
+  "totalChunks": 34,
+  "documents": 6,
+  "shards": [
+    {
+      "id": 0,
+      "chunks": 12,
+      "words": 1493,
+      "topics": [
+        "Severe external bleeding",
+        "Recognising wound infection",
+        "Child and infant CPR",
+        "Stroke — the FAST check",
+        "Frostbite",
+        "Snake bite"
+      ]
+    },
+    {
+      "id": 1,
+      "chunks": 11,
+      "words": 1393,
+      "topics": [
+        "Embedded objects in a wound",
+        "Amputation and severed parts",
+        "Choking",
+        "Hypothermia",
+        "Heat exhaustion and heat stroke",
+        "Fractures and splinting"
+      ]
+    },
+    {
+      "id": 2,
+      "chunks": 11,
+      "words": 1279,
+      "topics": [
+        "Cleaning and dressing a minor wound",
+        "Adult CPR",
+        "Suspected heart attack",
+        "Hypothermia",
+        "Dehydration and oral rehydration",
+        "Spinal injury"
+      ]
+    }
+  ]
+}
