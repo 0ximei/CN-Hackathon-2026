@@ -18,7 +18,7 @@ achievable, and the reason is worth stating plainly:
   *to* a peripheral; it cannot *advertise as* one. There is no
   `navigator.bluetooth.advertise()` in any shipping browser — peripheral mode
   remains an unimplemented request against the Community Group spec.
-- Two phones running this PWA would therefore both be centrals, scanning for a
+- Two phones running this app would therefore both be centrals, scanning for a
   peripheral that does not exist. **They can never see each other over BLE.**
 - Firefox and every Safari version ship no Web Bluetooth at all.
 

@@ -19,7 +19,7 @@ import {
 import { FRAME_HEADER_BYTES, Reassembler, fragment } from './framing';
 import { Router } from './router';
 import { MockTransport } from './testHarness';
-import { EMBED_DIM, dequantize, dot, quantize, topK } from '../search/vector';
+import { EMBED_DIM, dequantize, dot, quantize, makeDocIds, topK } from '../search/vector';
 
 describe('packet codec', () => {
   it('round-trips a header with all fields distinct', () => {
@@ -168,7 +168,7 @@ describe('vector search', () => {
   it('ranks the planted vector first', () => {
     const n = 200;
     const matrix = new Float32Array(n * EMBED_DIM).map(() => Math.random() - 0.5);
-    const docIds = new Int32Array(n).map((_, i) => i + 1);
+    const docIds = new Uint32Array(n).map((_, i) => i + 1);
     for (let i = 0; i < n; i++) {
       const off = i * EMBED_DIM;
       let norm = 0;
@@ -184,6 +184,29 @@ describe('vector search', () => {
     for (let i = 1; i < hits.length; i++) {
       expect(hits[i - 1].score).toBeGreaterThanOrEqual(hits[i].score);
     }
+  });
+
+  it('preserves docIds above 2^31 through storage and lookup', () => {
+    // docIds are unsigned 32-bit hashes. Held in an Int32Array they wrapped
+    // negative, missed the chunk map keyed on the unsigned value, and were
+    // dropped by the `h.chunk &&` guard — silently costing this corpus 58% of
+    // its passages with no error raised anywhere. Allocating through
+    // makeDocIds is what keeps the shard store and the search path agreeing.
+    const big = [178096950, 2907280096, 4140640039];
+    const docIds = makeDocIds(big.length);
+    big.forEach((id, i) => (docIds[i] = id));
+    expect([...docIds]).toEqual(big);
+
+    const matrix = new Float32Array(big.length * EMBED_DIM);
+    for (let i = 0; i < big.length; i++) matrix[i * EMBED_DIM] = 1;
+    const probe = new Float32Array(EMBED_DIM);
+    probe[0] = 1;
+
+    // The lookup the bug actually broke: a hit's docId must find its chunk.
+    const chunkById = new Map(big.map((id) => [id, { docId: id }]));
+    const hits = topK(probe, matrix, docIds, big.length);
+    expect(hits).toHaveLength(big.length);
+    for (const hit of hits) expect(chunkById.get(hit.docId)).toBeDefined();
   });
 });
 

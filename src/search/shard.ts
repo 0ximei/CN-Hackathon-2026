@@ -10,7 +10,7 @@
 import { BM25Index } from './bm25';
 import { clearIndex, db, getMeta, setMeta, type ChunkRow } from './db';
 import { embedder } from './embedder';
-import { EMBED_DIM, dequantize, quantize, topK, type Scored } from './vector';
+import { EMBED_DIM, dequantize, makeDocIds, quantize, topK, type Scored } from './vector';
 
 export interface ShardManifest {
   builtAt: string;
@@ -80,7 +80,7 @@ export class ShardStore {
 
   /** Packed matrix of every vector in the shard, for a single-pass scan. */
   private matrix = new Float32Array(0);
-  private docIds = new Int32Array(0);
+  private docIds = makeDocIds(0);
   private chunkById = new Map<number, ChunkRow>();
   private bm25: BM25Index | null = null;
 
@@ -227,7 +227,7 @@ export class ShardStore {
     // Only chunks that actually have a vector are searchable.
     const usable = chunks.filter((c) => byId.has(c.docId));
     this.matrix = new Float32Array(usable.length * EMBED_DIM);
-    this.docIds = new Int32Array(usable.length);
+    this.docIds = makeDocIds(usable.length);
     this.chunkById = new Map();
 
     usable.forEach((chunk, i) => {

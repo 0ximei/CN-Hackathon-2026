@@ -54,6 +54,18 @@ export interface Scored {
 }
 
 /**
+ * docIds are unsigned 32-bit hashes, so the array holding them must be
+ * unsigned too. An Int32Array wraps every id above 2^31 to a negative number,
+ * which then misses the chunk map keyed on the unsigned value and is dropped
+ * without an error. Both the shard store and the search path allocate through
+ * here so the two can never disagree about the signedness again.
+ */
+export type DocIdArray = Uint32Array;
+export function makeDocIds(n: number): DocIdArray {
+  return new Uint32Array(n);
+}
+
+/**
  * Brute-force top-K over a packed matrix.
  *
  * A shard is a few hundred to a few thousand chunks, so an exact scan costs
@@ -64,7 +76,7 @@ export interface Scored {
 export function topK(
   query: Float32Array,
   matrix: Float32Array,
-  docIds: Int32Array,
+  docIds: DocIdArray,
   k: number,
   dim = EMBED_DIM,
 ): Scored[] {
