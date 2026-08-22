@@ -49,6 +49,24 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
 
       {!!summary && <Text style={styles.summary}>{summary}</Text>}
 
+      {mesh.answerText ? (
+        <View style={[styles.card, { marginHorizontal: 12, marginBottom: 12 }]}> 
+          <Text style={styles.cardTitle}>Answer</Text>
+          <Text style={styles.cardBody}>{mesh.answerText}</Text>
+        </View>
+      ) : null}
+
+      {mesh.llmStatus.phase === 'unavailable' && (
+        <View style={[styles.card, { marginHorizontal: 12, marginBottom: 12, borderColor: '#fbbf24' }]}> 
+          <Text style={styles.cardTitle}>LLM unavailable on this device</Text>
+          <Text style={styles.cardBody}>
+            This app is running on Android without the browser-only WebGPU stack. The mobile build
+            therefore falls back to extractive answers from the retrieved passages instead of
+            downloading and running a local model here.
+          </Text>
+        </View>
+      )}
+
       <FlatList
         data={hits}
         keyExtractor={(h) => String(h.docId)}

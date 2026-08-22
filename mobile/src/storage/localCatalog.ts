@@ -1,11 +1,12 @@
 import * as SQLite from 'expo-sqlite';
 
 import { BM25Index } from '@core/search/bm25';
-import { docIdOf, docKeyOf, type ParsedDoc } from '@core/lib/chunk';
+import { docIdOf, docKeyOf, parseDocument, type ParsedDoc } from '@core/lib/chunk';
 import { EMBED_DIM, makeDocIds, topK, type Scored } from '@core/search/vector';
 import { embedder } from '../search/embedder';
+import { SEED_DOCS } from '../corpus/seed';
 
-import type { StoredChunk, CatalogStats } from './types';
+import type { StoredChunk, CatalogStats, DocSummary, Provenance } from './types';
 
 const DATABASE = 'meshnet.db';
 
@@ -25,14 +26,15 @@ export class LocalCatalog {
         await db.execAsync(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS chunks (
-        docId   INTEGER PRIMARY KEY NOT NULL,
-        docKey  INTEGER NOT NULL,
-        seq     INTEGER NOT NULL,
-        title   TEXT NOT NULL,
-        section TEXT NOT NULL,
-        source  TEXT NOT NULL,
-        text    TEXT NOT NULL,
-        addedAt INTEGER NOT NULL
+        docId      INTEGER PRIMARY KEY NOT NULL,
+        docKey     INTEGER NOT NULL,
+        seq        INTEGER NOT NULL,
+        title      TEXT NOT NULL,
+        section    TEXT NOT NULL,
+        source     TEXT NOT NULL,
+        text       TEXT NOT NULL,
+        addedAt    INTEGER NOT NULL,
+        provenance TEXT NOT NULL DEFAULT 'seed'
       );
       CREATE INDEX IF NOT EXISTS chunks_docKey ON chunks (docKey);
       CREATE TABLE IF NOT EXISTS kv (
@@ -48,6 +50,50 @@ export class LocalCatalog {
       );
       CREATE INDEX IF NOT EXISTS outbox_dst ON outbox (dstId);
     `);
+        // `CREATE TABLE IF NOT EXISTS` above does not add columns to a table that
+        // already existed from before `provenance` was introduced — migrate those
+        // in place instead of forcing a reinstall.
+        const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(chunks)');
+        if (!columns.some((c) => c.name === 'provenance')) {
+            await db.execAsync(`ALTER TABLE chunks ADD COLUMN provenance TEXT NOT NULL DEFAULT 'local'`);
+        }
+
+        // One-time reconciliation, gated on a kv flag rather than "column just
+        // added" — an earlier version of this migration defaulted every
+        // pre-existing row to 'seed' unconditionally, mislabeling real uploads.
+        // This corrects that regardless of whether the column already existed,
+        // and is safe to leave in place even after every install has run it.
+        const RECONCILE_KEY = 'provenance.reconciled.v1';
+        const reconciled = await db.getFirstAsync<{ value: string }>('SELECT value FROM kv WHERE key = ?', [
+            RECONCILE_KEY,
+        ]);
+        if (!reconciled) {
+            // Seed docKeys are content-addressed and deterministic, so the exact
+            // set that came from the built-in corpus can be recomputed rather
+            // than guessed.
+            const seedKeys = SEED_DOCS.map((doc) => {
+                const parsed = parseDocument(doc.file, doc.markdown);
+                const body = parsed.chunks.map((c) => c.text).join('\n');
+                return docKeyOf(parsed.title, body);
+            });
+            const placeholders = seedKeys.map(() => '?').join(',');
+            // Anything tagged 'seed' that isn't actually one of the built-in docs
+            // was mislabeled by the earlier migration bug — it is real content.
+            await db.runAsync(
+                `UPDATE chunks SET provenance = 'local' WHERE provenance = 'seed' AND docKey NOT IN (${placeholders})`,
+                seedKeys,
+            );
+            // And anything that genuinely is the built-in corpus, however it got
+            // tagged, is 'seed'.
+            await db.runAsync(
+                `UPDATE chunks SET provenance = 'seed' WHERE docKey IN (${placeholders}) AND provenance != 'seed'`,
+                seedKeys,
+            );
+            await db.runAsync('INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)', [
+                RECONCILE_KEY,
+                String(Date.now()),
+            ]);
+        }
         const catalog = new LocalCatalog(db);
         await catalog.reload();
         return catalog;
@@ -55,7 +101,11 @@ export class LocalCatalog {
 
     /* ---------------------------- ingest ---------------------------- */
 
-    async ingestDoc(doc: ParsedDoc, filter?: (docId: number) => boolean): Promise<number> {
+    async ingestDoc(
+        doc: ParsedDoc,
+        filter?: (docId: number) => boolean,
+        provenance: 'seed' | 'local' = 'local',
+    ): Promise<number> {
         const body = doc.chunks.map((c) => c.text).join('\n');
         const docKey = docKeyOf(doc.title, body);
         const now = Date.now();
@@ -68,9 +118,9 @@ export class LocalCatalog {
                 if (filter && !filter(docId)) continue;
                 await this.db.runAsync(
                     `INSERT OR IGNORE INTO chunks
-             (docId, docKey, seq, title, section, source, text, addedAt)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [docId, docKey, seq, doc.title, chunk.section, doc.source, chunk.text, now],
+             (docId, docKey, seq, title, section, source, text, addedAt, provenance)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [docId, docKey, seq, doc.title, chunk.section, doc.source, chunk.text, now, provenance],
                 );
                 written++;
             }
@@ -78,12 +128,13 @@ export class LocalCatalog {
         return written;
     }
 
-    async ingestRemote(chunk: StoredChunk): Promise<boolean> {
+    /** Writes a chunk received from a peer. Always tagged `mesh` — never caller-supplied. */
+    async ingestRemote(chunk: Omit<StoredChunk, 'provenance'>): Promise<boolean> {
         if (this.byId.has(chunk.docId)) return false;
         await this.db.runAsync(
             `INSERT OR IGNORE INTO chunks
-         (docId, docKey, seq, title, section, source, text, addedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (docId, docKey, seq, title, section, source, text, addedAt, provenance)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 chunk.docId,
                 chunk.docKey,
@@ -93,6 +144,7 @@ export class LocalCatalog {
                 chunk.source,
                 chunk.text,
                 Date.now(),
+                'mesh' satisfies Provenance,
             ],
         );
         return true;
@@ -100,7 +152,7 @@ export class LocalCatalog {
 
     async reload(): Promise<void> {
         const rows = await this.db.getAllAsync<StoredChunk>(
-            `SELECT docId, docKey, seq, title, section, source, text FROM chunks ORDER BY docKey, seq`,
+            `SELECT docId, docKey, seq, title, section, source, text, provenance FROM chunks ORDER BY docKey, seq`,
         );
 
         this.byId = new Map(rows.map((r) => [r.docId, r]));
@@ -139,6 +191,35 @@ export class LocalCatalog {
         return this.byId.get(docId);
     }
 
+    /** Every chunk of one document, in order — what `announce()` gossips. */
+    chunksOf(docKey: number): StoredChunk[] {
+        return [...this.byId.values()]
+            .filter((c) => c.docKey === docKey)
+            .sort((a, b) => a.seq - b.seq);
+    }
+
+    /** One row per document held here, for the Files tab. */
+    documents(): DocSummary[] {
+        const byDoc = new Map<number, DocSummary>();
+        for (const c of this.byId.values()) {
+            const existing = byDoc.get(c.docKey);
+            if (existing) {
+                existing.chunks++;
+                existing.bytes += c.text.length;
+            } else {
+                byDoc.set(c.docKey, {
+                    docKey: c.docKey,
+                    title: c.title,
+                    source: c.source,
+                    provenance: c.provenance,
+                    chunks: 1,
+                    bytes: c.text.length,
+                });
+            }
+        }
+        return [...byDoc.values()].sort((a, b) => a.title.localeCompare(b.title));
+    }
+
     snippet(docId: number): string {
         const text = this.byId.get(docId)?.text ?? '';
         return text.length > SNIPPET_CHARS ? `${text.slice(0, SNIPPET_CHARS - 1)}…` : text;
@@ -158,8 +239,12 @@ export class LocalCatalog {
         return { documents: docs.size, chunks: this.byId.size, bytes };
     }
 
-    async clear(): Promise<void> {
-        await this.db.execAsync('DELETE FROM chunks; DELETE FROM outbox;');
+    /**
+     * Wipes only the seed corpus, so re-slicing coverage never touches uploads
+     * or documents pulled in from the mesh.
+     */
+    async clearSeed(): Promise<void> {
+        await this.db.execAsync(`DELETE FROM chunks WHERE provenance = 'seed'; DELETE FROM outbox;`);
         await this.reload();
     }
 
