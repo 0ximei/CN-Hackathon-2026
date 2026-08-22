@@ -39,6 +39,22 @@ export class BleTransport extends TransportEmitter implements Transport {
   private logListeners = new Set<(line: string) => void>();
   private stateListeners = new Set<(state: string, detail: string) => void>();
 
+  /**
+   * Peers to behave as though they were out of range.
+   *
+   * The browser build cuts a link by refusing to publish it from
+   * `BroadcastTransport`; there is no equivalent here, because the link is a
+   * real GATT connection and tearing it down would take fifteen seconds to
+   * rebuild — far too slow to demonstrate anything on stage. So the connection
+   * stays up and this layer drops frames in both directions instead, which is
+   * what the router above it would see either way: a peer it can no longer
+   * reach, forcing it to relearn a path through a relay.
+   *
+   * Frames are dropped rather than errored so store-and-forward runs for real —
+   * the router asks for a route, finds none, and parks the packet.
+   */
+  private severed = new Set<string>();
+
   /** Radio-level lines, newest last. Bounded so a long session cannot grow it. */
   readonly log: string[] = [];
   private static readonly LOG_CAPACITY = 300;
@@ -68,11 +84,12 @@ export class BleTransport extends TransportEmitter implements Transport {
 
     this.subscriptions = [
       BleMesh.addListener('onFrame', ({ peerId, data }) => {
+        if (this.severed.has(peerId)) return;
         this.emitFrame(peerId, fromBase64(data));
       }),
       BleMesh.addListener('onPeers', ({ peers }) => {
         this.current = peers;
-        this.emitPeers(peers.map((p) => p.peerId));
+        this.publishPeers();
       }),
       BleMesh.addListener('onLog', ({ message }) => this.note(message)),
       BleMesh.addListener('onState', ({ state, detail }) => {
@@ -97,7 +114,21 @@ export class BleTransport extends TransportEmitter implements Transport {
   }
 
   peers(): string[] {
-    return this.current.map((p) => p.peerId);
+    return this.current.map((p) => p.peerId).filter((id) => !this.severed.has(id));
+  }
+
+  /**
+   * Marks links as severed for the demo. Ids are the transport's peer ids —
+   * eight lowercase hex digits, the same form `peers()` returns.
+   */
+  setSevered(peerIds: string[]): void {
+    this.severed = new Set(peerIds);
+    for (const id of this.severed) this.note(`link to ${id} severed by the operator`);
+    this.publishPeers();
+  }
+
+  private publishPeers(): void {
+    this.emitPeers(this.peers());
   }
 
   /** Richer than `peers()` — role, MTU and signal, for the UI. */
@@ -106,6 +137,7 @@ export class BleTransport extends TransportEmitter implements Transport {
   }
 
   send(peerId: string, frame: Uint8Array): void {
+    if (this.severed.has(peerId)) return;
     // Fire and forget by design: `Transport.send` is synchronous, and the
     // native queue is what actually guarantees ordering and delivery. A false
     // here only means the link closed between the router picking a next hop and
@@ -116,7 +148,18 @@ export class BleTransport extends TransportEmitter implements Transport {
   }
 
   broadcast(frame: Uint8Array, except?: string): void {
-    void BleMesh.broadcast(toBase64(frame), except ?? null);
+    if (!this.severed.size) {
+      void BleMesh.broadcast(toBase64(frame), except ?? null);
+      return;
+    }
+    // A native broadcast cannot exclude an arbitrary set, only the one peer the
+    // frame came from. With links severed the flood is unrolled into unicasts
+    // so the severed ones can be left out — slower, and only ever on a path the
+    // operator deliberately entered.
+    for (const peer of this.peers()) {
+      if (peer === except) continue;
+      this.send(peer, frame);
+    }
   }
 
   onLog(cb: (line: string) => void): () => void {

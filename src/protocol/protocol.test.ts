@@ -7,6 +7,8 @@ import {
   decodeAnnounce,
   decodeCatalogReq,
   decodeDocRes,
+  decodeIdentReq,
+  decodeIdentRes,
   decodeHello,
   decodeQuery,
   decodeResult,
@@ -14,6 +16,9 @@ import {
   encodeCatalogReq,
   encodeDocRes,
   encodeHello,
+  encodeIdentReq,
+  encodeIdentRes,
+  identChallengeBytes,
   encodePacket,
   encodeQuery,
   encodeResult,
@@ -524,5 +529,56 @@ describe('hop counting', () => {
     expect(hopsTravelled({ flags: 4, ttl: 3 })).toBe(2);
     expect(hopsTravelled({ flags: 2, ttl: 2 })).toBe(1);
     expect(hopsTravelled({ flags: 8, ttl: 5 })).toBe(4);
+  });
+});
+
+describe('identity packets', () => {
+  it('round-trips a challenge', () => {
+    const nonce = new Uint8Array(16).map((_, i) => i * 7 + 1);
+    expect(decodeIdentReq(encodeIdentReq(nonce)).nonce).toEqual(nonce);
+  });
+
+  it('round-trips a response with its key, name, nonce and signature', () => {
+    const payload = {
+      pubKey: new Uint8Array(32).map((_, i) => i + 1),
+      name: 'Kamo',
+      nonce: new Uint8Array(16).fill(9),
+      sig: new Uint8Array(64).map((_, i) => 255 - i),
+    };
+    const back = decodeIdentRes(encodeIdentRes(payload));
+    expect(back.pubKey).toEqual(payload.pubKey);
+    expect(back.name).toBe('Kamo');
+    expect(back.nonce).toEqual(payload.nonce);
+    expect(back.sig).toEqual(payload.sig);
+  });
+
+  /**
+   * A short nonce must not silently produce a short field: the reader takes a
+   * fixed 16 bytes, so a 4-byte one would eat the start of the name.
+   */
+  it('pads a short nonce rather than shifting every field after it', () => {
+    const back = decodeIdentRes(
+      encodeIdentRes({
+        pubKey: new Uint8Array(32).fill(1),
+        name: 'Ro',
+        nonce: new Uint8Array([1, 2, 3, 4]),
+        sig: new Uint8Array(64).fill(2),
+      }),
+    );
+    expect(back.nonce).toHaveLength(16);
+    expect(back.name).toBe('Ro');
+  });
+
+  /**
+   * The signed bytes bind all three facts together. Changing the id or the name
+   * has to change what was signed, or a captured signature could be replayed
+   * under a different identity.
+   */
+  it('binds the nonce, the node id and the name into one message', () => {
+    const nonce = new Uint8Array(16).fill(3);
+    const base = identChallengeBytes(nonce, 0x1234, 'Kamo');
+    expect(identChallengeBytes(nonce, 0x1235, 'Kamo')).not.toEqual(base);
+    expect(identChallengeBytes(nonce, 0x1234, 'Miro')).not.toEqual(base);
+    expect(identChallengeBytes(new Uint8Array(16).fill(4), 0x1234, 'Kamo')).not.toEqual(base);
   });
 });

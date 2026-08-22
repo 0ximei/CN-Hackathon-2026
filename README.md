@@ -44,8 +44,16 @@ That symmetry is what turns a star of client/server links into a mesh.
 
 [`mobile/`](mobile/README.md) is a React Native app that does exactly that, on
 two or more real Android phones with no router, no pairing and no internet. It
-imports the packet codec, router and framing from `src/` rather than copying
-them, so both builds speak the same protocol.
+imports the packet codec, router, framing **and replication policy** from `src/`
+rather than copying them, so both builds speak the same protocol and cannot
+converge on different replica sets for the same document.
+
+It also has the one thing the browser build cannot have offline: **identities
+that are worth something.** Each node holds an Ed25519 keypair and its node id
+is a hash of the public key, so a node can be challenged to prove the id it is
+using — and two people can compare a safety number to establish that a proven
+key belongs to the phone in front of them. See
+[`mobile/README.md`](mobile/README.md#identity).
 
 ---
 
@@ -183,13 +191,22 @@ The Network controls panel exists to break things on stage:
 npm test
 ```
 
-53 tests. Packet round-trips including `ANNOUNCE` with a 384-byte embedding,
-fragment reassembly at a 185-byte MTU, int8 quantization accuracy, the routing
-invariants (TTL horizons, cycle termination, backward learning, rerouting
-around a broken link), and the replication policy — placement determinism,
-minimal disruption on node loss, weight proportionality, target response to
-popularity and to unreliability, convergence and settling, and the
-never-drop-the-last-copy invariant.
+116 tests, covering both builds — the Android app's portable half runs here
+too, since it imports the same protocol and policy rather than copying them.
+
+Packet round-trips including `ANNOUNCE` with a 384-byte embedding and the
+identity challenge/response, fragment reassembly at a 185-byte MTU, int8
+quantization accuracy, the routing invariants (TTL horizons, cycle termination,
+backward learning, rerouting around a broken link), and the replication policy —
+placement determinism, minimal disruption on node loss, weight proportionality,
+target response to popularity and to unreliability, convergence and settling,
+and the never-drop-the-last-copy invariant.
+
+On the mobile side: a three-node simulated mesh, a node answering from metadata
+whose body lives elsewhere, a node shedding bodies under storage pressure while
+keeping the last live copy, and the identity layer — id-to-key binding, replayed
+and unsolicited responses, key-change detection, and the rule that in-person
+trust is only granted on top of a proven key.
 
 ---
 

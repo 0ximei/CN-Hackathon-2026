@@ -33,6 +33,9 @@ export const PacketType = {
   /** Anti-entropy: "what have I missed?" */
   CATALOG_REQ: 7,
   CATALOG_RES: 8,
+  /** "Prove you are the node id you are claiming." */
+  IDENT_REQ: 9,
+  IDENT_RES: 10,
 } as const;
 export type PacketType = (typeof PacketType)[keyof typeof PacketType];
 
@@ -46,6 +49,8 @@ export const PACKET_TYPE_NAME: Record<number, string> = {
   6: 'ANNOUNCE',
   7: 'CATALOG_REQ',
   8: 'CATALOG_RES',
+  9: 'IDENT_REQ',
+  10: 'IDENT_RES',
 };
 
 export interface Packet {
@@ -509,4 +514,87 @@ export function encodeCatalogReq(c: CatalogReqPayload): Uint8Array {
 export function decodeCatalogReq(b: Uint8Array): CatalogReqPayload {
   const r = new Reader(b);
   return { sinceSec: r.u32(), max: r.u16() };
+}
+
+/* ---- IDENT_REQ / IDENT_RES: proving a node id is not just a claim ---- */
+
+/**
+ * Length of the challenge a verifier sends.
+ *
+ * The signature it elicits is only evidence if the thing signed could not have
+ * been predicted. Sixteen random bytes make a replayed IDENT_RES — captured off
+ * the air and re-sent by an impostor — useless, because the verifier will not
+ * accept a signature over a nonce it did not just generate.
+ */
+export const IDENT_NONCE_BYTES = 16;
+export const IDENT_PUBKEY_BYTES = 32;
+export const IDENT_SIG_BYTES = 64;
+
+export interface IdentReqPayload {
+  nonce: Uint8Array;
+}
+
+export function encodeIdentReq(nonce: Uint8Array): Uint8Array {
+  return new Writer().bytes(pad(nonce, IDENT_NONCE_BYTES)).finish();
+}
+
+export function decodeIdentReq(b: Uint8Array): IdentReqPayload {
+  return { nonce: new Reader(b).bytes(IDENT_NONCE_BYTES) };
+}
+
+export interface IdentResPayload {
+  /** Ed25519 public key. The node id is a hash of this, so it is checkable. */
+  pubKey: Uint8Array;
+  /** The display name being claimed — signed over, so it cannot be swapped. */
+  name: string;
+  /** The verifier's own challenge, echoed back. */
+  nonce: Uint8Array;
+  sig: Uint8Array;
+}
+
+export function encodeIdentRes(p: IdentResPayload): Uint8Array {
+  return new Writer()
+    .bytes(pad(p.pubKey, IDENT_PUBKEY_BYTES))
+    .str(p.name, 32)
+    .bytes(pad(p.nonce, IDENT_NONCE_BYTES))
+    .bytes(pad(p.sig, IDENT_SIG_BYTES))
+    .finish();
+}
+
+export function decodeIdentRes(b: Uint8Array): IdentResPayload {
+  const r = new Reader(b);
+  return {
+    pubKey: r.bytes(IDENT_PUBKEY_BYTES),
+    name: r.str(),
+    nonce: r.bytes(IDENT_NONCE_BYTES),
+    sig: r.bytes(IDENT_SIG_BYTES),
+  };
+}
+
+/**
+ * Exactly what an IDENT_RES signature covers.
+ *
+ * Kept here rather than beside the signer so both ends derive the bytes from
+ * one definition. Signing the nonce alone would let a captured signature be
+ * replayed under a different id or a different name; binding all three means
+ * the signature attests to "this key, this id, this name, for this challenge".
+ */
+export function identChallengeBytes(
+  nonce: Uint8Array,
+  nodeId: number,
+  name: string,
+): Uint8Array {
+  return new Writer()
+    .bytes(pad(nonce, IDENT_NONCE_BYTES))
+    .u32(nodeId)
+    .str(name, 32)
+    .finish();
+}
+
+/** Fixed-width field helper: truncate or zero-extend, never emit a short field. */
+function pad(a: Uint8Array, n: number): Uint8Array {
+  if (a.length === n) return a;
+  const out = new Uint8Array(n);
+  out.set(a.subarray(0, n));
+  return out;
 }
