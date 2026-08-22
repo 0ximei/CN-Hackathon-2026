@@ -71,3 +71,52 @@ describe('LocalCatalog on real SQLite', () => {
         expect(titles).toContain('Snake Bite');
     });
 });
+
+describe('a mesh that is already carrying the built-in corpus', () => {
+    /**
+     * Every other test starts from an empty catalog. A real device never does:
+     * it launches, seeds thirty-odd documents against a 1 MiB budget, and only
+     * then meets a peer. Whether an upload survives *that* is the question the
+     * empty-catalog tests cannot answer.
+     */
+    it('still replicates an upload between two seeded nodes', async () => {
+        const { MeshNode } = await import('../mesh/MeshNode');
+        const { MockTransport } = await import('@core/protocol/testHarness');
+        const { seedCorpus } = await import('../mesh/bootstrap');
+
+        const aCatalog = await open();
+        const bCatalog = await open();
+        await seedCorpus(aCatalog as never, 0x71);
+        await seedCorpus(bCatalog as never, 0x72);
+
+        const seededKnown = bCatalog.knownCount;
+        const seededUsage = await bCatalog.usage();
+        expect(seededKnown, 'B starts out knowing the corpus').toBeGreaterThan(0);
+
+        const aLink = new MockTransport('link-a');
+        const bLink = new MockTransport('link-b');
+        aLink.link(bLink);
+        const a = new MeshNode({ uuid: 'a', id: 0x71, name: 'Uploader' }, aLink, aCatalog);
+        const b = new MeshNode({ uuid: 'b', id: 0x72, name: 'Reader' }, bLink, bCatalog);
+
+        try {
+            vi.useFakeTimers();
+            await a.start();
+            await b.start();
+            a.startReplication();
+            b.startReplication();
+            await a.upload('snakebite.md', UPLOAD);
+            await vi.advanceTimersByTimeAsync(30_000);
+
+            const listed = bCatalog.documents().find((d) => d.title === 'Snake Bite');
+            expect(
+                listed,
+                `B lists the upload (knew ${seededKnown}, ${seededUsage.freeBytes}B free)`,
+            ).toBeDefined();
+        } finally {
+            vi.useRealTimers();
+            a.stop();
+            b.stop();
+        }
+    });
+});

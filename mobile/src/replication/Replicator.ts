@@ -43,7 +43,23 @@ const RECONCILE_MS = 8_000;
 /** Bodies pulled per pass, so a node joining an established mesh trickles in. */
 const MAX_PULLS_PER_PASS = 2;
 /** Chunks per ANNOUNCE packet. Each entry is ~660 bytes — two BLE frames. */
-const ENTRIES_PER_ANNOUNCE = 4;
+/**
+ * Passages per ANNOUNCE, chosen against the radio rather than the packet.
+ *
+ * The transport reports a 4 KB MTU, which is true of the interface and not of
+ * the link: underneath, every packet is cut into 514-byte GATT segments that
+ * must all arrive, in order, or the reassembler resets and the whole message is
+ * gone. There is no retransmission anywhere — a link that drops mid-message
+ * clears its queue and nothing above the radio is told.
+ *
+ * So the number that matters is segments per packet, and at four entries the
+ * worst case measured against the built-in corpus is 2731 B: six segments that
+ * all have to survive. Two entries is 1433 B, three segments. Metadata gossip
+ * is not latency-sensitive — one more packet costs nothing that matters, and
+ * halving the window in which a flap can destroy the whole thing costs nothing
+ * at all. `wiresize.test.ts` holds the budget.
+ */
+const ENTRIES_PER_ANNOUNCE = 2;
 
 /**
  * Chunks per HOLDERS packet.

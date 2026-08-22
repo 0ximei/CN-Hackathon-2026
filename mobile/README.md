@@ -308,7 +308,13 @@ works in a room, and each is commented at the code:
   517 bytes, gets what the peer allows, and frames are cut to fit with a
   one-byte header carrying a sequence number — not for ordering, which GATT
   already guarantees, but so a truncated message is *detected* rather than
-  silently concatenated into the next one.
+  silently concatenated into the next one. Detected, and then dropped: a
+  message is all-or-nothing across its segments, nothing retransmits, and a
+  link that dies mid-message clears its queue without telling anyone. Beacons
+  are one segment and re-sent every three seconds, so they always heal; a
+  metadata packet is several and is sent once, so what has to heal it is the
+  layer above asking again. That asymmetry is why a mesh can show its peers
+  perfectly while no file ever crosses it.
 - **One serialised thread.** The Android BLE stack is not re-entrant and
   misbehaves when driven from several threads, so every mutation runs on a
   single `HandlerThread`.
@@ -394,7 +400,7 @@ identity layer and the storage helpers:
 npm test
 ```
 
-133 tests. Alongside the packet round-trips, framing, routing invariants and
+135 tests. Alongside the packet round-trips, framing, routing invariants and
 replication policy in `src/core`, this build covers:
 
 - a three-node simulated mesh where a passage held only two hops away comes back
@@ -410,6 +416,12 @@ replication policy in `src/core`, this build covers:
   existing coverage stopped at "the peer learned the passage exists";
 - a catalog sync whose request is lost on the radio, recovering without waiting
   for the once-a-minute re-announcement walk to come round;
+- a budget on how many GATT segments one metadata packet may need. The transport
+  reports a 4 KB MTU, which is true of the interface and not of the link: the
+  radio cuts every packet into 514-byte segments that must all arrive or the
+  message is discarded whole, and nothing retransmits. Segments per packet is
+  therefore a reliability number, and it is invisible from every layer anyone
+  would think to review;
 - the real SQLite catalog on both ends of a replication. Every other test here
   runs the protocol against `MemoryCatalog`, so `LocalCatalog` — the storage
   layer that actually ships — had never been on either side of one. It runs

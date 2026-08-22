@@ -897,10 +897,7 @@ export class MeshNode {
                 this.onDocRes(pkt);
                 break;
             case PacketType.CATALOG_RES:
-                // The reply, so the question has landed and been answered.
-                this.syncedPeers.add(pkt.srcId);
-                this.catalogSync.delete(pkt.srcId);
-                await this.onAnnounce(pkt);
+                this.noteCatalogReply(pkt.srcId, await this.onAnnounce(pkt));
                 break;
             case PacketType.ANNOUNCE:
                 await this.onAnnounce(pkt);
@@ -1104,7 +1101,31 @@ export class MeshNode {
      * pass against how many live copies exist, how popular the chunk is, how
      * reliable the alternatives are, and whether there is room.
      */
-    private async onAnnounce(pkt: Packet): Promise<void> {
+    /**
+     * Judge a catalog reply by what it taught us, not by its arrival.
+     *
+     * A peer answers a catalog request with one packet per few passages, and on
+     * this radio each of those is several segments that either all arrive or
+     * all vanish. Treating the first reply as "synced" leaves a node that got
+     * slice one and lost slice two permanently half-informed about a document,
+     * with nothing anywhere aware of it. A reply that adds nothing is the only
+     * evidence that there is nothing left to add.
+     */
+    private noteCatalogReply(nodeId: number, added: number): void {
+        const state = this.catalogSync.get(nodeId);
+        if (!state) return;
+        if (added > 0) {
+            // Still learning. There may be more, and a slice lost on the way is
+            // invisible from this end, so ask again rather than assume.
+            state.attempts = 0;
+            state.asked = Date.now();
+            return;
+        }
+        this.syncedPeers.add(nodeId);
+        this.catalogSync.delete(nodeId);
+    }
+
+    private async onAnnounce(pkt: Packet): Promise<number> {
         const payload = decodeAnnounce(pkt.payload);
 
         // Project the holder claims into the synchronous lookup the query path
@@ -1130,6 +1151,7 @@ export class MeshNode {
                 detail: `learned ${added} passage(s) of "${payload.title}"`,
             });
         }
+        return added;
     }
 
     /**
