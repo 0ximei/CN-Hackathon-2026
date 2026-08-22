@@ -1,9 +1,10 @@
 import * as SQLite from 'expo-sqlite';
 
 import { BM25Index } from '@core/search/bm25';
-import { docIdOf, docKeyOf, type ParsedDoc } from '@core/lib/chunk';
+import { docIdOf, docKeyOf, parseDocument, type ParsedDoc } from '@core/lib/chunk';
 import { EMBED_DIM, makeDocIds, topK, type Scored } from '@core/search/vector';
 import { embedder } from '../search/embedder';
+import { SEED_DOCS } from '../corpus/seed';
 
 import type { StoredChunk, CatalogStats, DocSummary, Provenance } from './types';
 
@@ -54,7 +55,44 @@ export class LocalCatalog {
         // in place instead of forcing a reinstall.
         const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(chunks)');
         if (!columns.some((c) => c.name === 'provenance')) {
-            await db.execAsync(`ALTER TABLE chunks ADD COLUMN provenance TEXT NOT NULL DEFAULT 'seed'`);
+            await db.execAsync(`ALTER TABLE chunks ADD COLUMN provenance TEXT NOT NULL DEFAULT 'local'`);
+        }
+
+        // One-time reconciliation, gated on a kv flag rather than "column just
+        // added" — an earlier version of this migration defaulted every
+        // pre-existing row to 'seed' unconditionally, mislabeling real uploads.
+        // This corrects that regardless of whether the column already existed,
+        // and is safe to leave in place even after every install has run it.
+        const RECONCILE_KEY = 'provenance.reconciled.v1';
+        const reconciled = await db.getFirstAsync<{ value: string }>('SELECT value FROM kv WHERE key = ?', [
+            RECONCILE_KEY,
+        ]);
+        if (!reconciled) {
+            // Seed docKeys are content-addressed and deterministic, so the exact
+            // set that came from the built-in corpus can be recomputed rather
+            // than guessed.
+            const seedKeys = SEED_DOCS.map((doc) => {
+                const parsed = parseDocument(doc.file, doc.markdown);
+                const body = parsed.chunks.map((c) => c.text).join('\n');
+                return docKeyOf(parsed.title, body);
+            });
+            const placeholders = seedKeys.map(() => '?').join(',');
+            // Anything tagged 'seed' that isn't actually one of the built-in docs
+            // was mislabeled by the earlier migration bug — it is real content.
+            await db.runAsync(
+                `UPDATE chunks SET provenance = 'local' WHERE provenance = 'seed' AND docKey NOT IN (${placeholders})`,
+                seedKeys,
+            );
+            // And anything that genuinely is the built-in corpus, however it got
+            // tagged, is 'seed'.
+            await db.runAsync(
+                `UPDATE chunks SET provenance = 'seed' WHERE docKey IN (${placeholders}) AND provenance != 'seed'`,
+                seedKeys,
+            );
+            await db.runAsync('INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)', [
+                RECONCILE_KEY,
+                String(Date.now()),
+            ]);
         }
         const catalog = new LocalCatalog(db);
         await catalog.reload();
