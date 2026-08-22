@@ -191,6 +191,22 @@ const CATALOG_SYNC_MAX = 16;
  */
 const CATALOG_SYNC_DELAY_MS = 5_000;
 
+/**
+ * How long to wait for a catalog reply before asking again, and how many times.
+ *
+ * A request that leaves this node is not a request that arrived. On this radio
+ * a link routinely dies between the two, and the reply is kilobytes so it has
+ * further to fall. The only other route an upload has to a peer that missed the
+ * flood is the re-announcement walk, which covers one document a minute — many
+ * minutes on a real library, which to a user is indistinguishable from never.
+ *
+ * Four attempts because the peer may simply have nothing to send: a node with
+ * only the seed corpus answers a catalog request with silence, and retrying
+ * that forever would spend the link on a question already answered.
+ */
+const CATALOG_SYNC_RETRY_MS = 9_000;
+const CATALOG_SYNC_ATTEMPTS = 4;
+
 export interface PeerState {
     nodeId: number;
     name: string;
@@ -357,8 +373,10 @@ export class MeshNode {
     /** Outstanding identity challenges, by the node they were sent to. */
     private challenges = new Map<number, { nonce: Uint8Array; sentAt: number }>();
     private identities = new Map<number, PeerIdentity>();
-    /** Nodes already sent a CATALOG_REQ, so meeting one twice does not re-sync. */
+    /** Peers that have actually answered a CATALOG_REQ. */
     private syncedPeers = new Set<number>();
+    /** Peers still owed a catalog request: when we first saw them and last asked. */
+    private catalogSync = new Map<number, { since: number; asked: number; attempts: number }>();
     /** docId -> a peer that claimed to hold it, for the synchronous query path. */
     private holderHints = new Map<number, number>();
     private activity: ActivityEvent[] = [];
@@ -485,6 +503,7 @@ export class MeshNode {
         this.helloTimer = setInterval(() => {
             this.sendHello();
             this.expirePeers();
+            this.syncCatalogs();
             void this.refreshReliability();
         }, HELLO_INTERVAL_MS);
         this.outboxTimer = setInterval(() => void this.flushOutbox(), OUTBOX_RETRY_MS);
@@ -519,6 +538,7 @@ export class MeshNode {
         }
         this.pendingDocs.clear();
         this.challenges.clear();
+        this.catalogSync.clear();
         this.queries.clear();
         this.peers.clear();
         this.emit('peers', []);
@@ -876,8 +896,13 @@ export class MeshNode {
             case PacketType.DOC_RES:
                 this.onDocRes(pkt);
                 break;
-            case PacketType.ANNOUNCE:
             case PacketType.CATALOG_RES:
+                // The reply, so the question has landed and been answered.
+                this.syncedPeers.add(pkt.srcId);
+                this.catalogSync.delete(pkt.srcId);
+                await this.onAnnounce(pkt);
+                break;
+            case PacketType.ANNOUNCE:
                 await this.onAnnounce(pkt);
                 break;
             case PacketType.CATALOG_REQ:
@@ -941,22 +966,12 @@ export class MeshNode {
             // its id.
             this.challenge(pkt.srcId);
 
-            if (!this.syncedPeers.has(pkt.srcId)) {
-                this.syncedPeers.add(pkt.srcId);
-                const peerId = pkt.srcId;
-                setTimeout(() => {
-                    // Still there? A peer that dropped inside the settle window
-                    // has already been forgotten by expirePeers, and asking it
-                    // for a catalog would only park a packet for a node that
-                    // may never come back.
-                    if (this.peers.has(peerId)) {
-                        this.router.send(
-                            PacketType.CATALOG_REQ,
-                            encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
-                            peerId,
-                        );
-                    }
-                }, CATALOG_SYNC_DELAY_MS);
+            // Note that this peer is owed a catalog request. Sending it is the
+            // beacon tick's job: a request is only worth marking done once the
+            // peer has answered it, and one shot from a timer here could never
+            // know whether it had.
+            if (!this.syncedPeers.has(pkt.srcId) && !this.catalogSync.has(pkt.srcId)) {
+                this.catalogSync.set(pkt.srcId, { since: Date.now(), asked: 0, attempts: 0 });
             }
         }
         this.emitSoon('peers');
@@ -1275,6 +1290,36 @@ export class MeshNode {
         );
     }
 
+    /**
+     * Ask each peer we have not heard a catalog from, until it answers.
+     *
+     * Only ever addressed to a peer that is present right now, so a request is
+     * never spent on a node that has already gone; a peer that leaves and comes
+     * back is a fresh first contact and starts over.
+     */
+    private syncCatalogs(): void {
+        if (!this.catalogSync.size) return;
+        const now = Date.now();
+        for (const [nodeId, state] of this.catalogSync) {
+            if (!this.peers.has(nodeId)) continue;
+            if (state.attempts >= CATALOG_SYNC_ATTEMPTS) {
+                this.catalogSync.delete(nodeId);
+                continue;
+            }
+            const due = state.asked
+                ? state.asked + CATALOG_SYNC_RETRY_MS
+                : state.since + CATALOG_SYNC_DELAY_MS;
+            if (now < due) continue;
+            state.asked = now;
+            state.attempts++;
+            this.router.send(
+                PacketType.CATALOG_REQ,
+                encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
+                nodeId,
+            );
+        }
+    }
+
     private expirePeers(): void {
         const now = Date.now();
         let changed = false;
@@ -1287,6 +1332,7 @@ export class MeshNode {
                 // otherwise marked "synced" forever and never retried, even
                 // after it reconnects.
                 this.syncedPeers.delete(id);
+                this.catalogSync.delete(id);
                 this.note({
                     kind: 'dropped',
                     type: 'HELLO',

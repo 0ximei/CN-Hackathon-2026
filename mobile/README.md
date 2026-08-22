@@ -394,7 +394,7 @@ identity layer and the storage helpers:
 npm test
 ```
 
-127 tests. Alongside the packet round-trips, framing, routing invariants and
+133 tests. Alongside the packet round-trips, framing, routing invariants and
 replication policy in `src/core`, this build covers:
 
 - a three-node simulated mesh where a passage held only two hops away comes back
@@ -405,6 +405,16 @@ replication policy in `src/core`, this build covers:
   and refusing to shed the last live copy when there is nowhere else;
 - an upload replicating to a peer by policy, and reaching a peer that joined
   after the upload happened;
+- an upload being *read* on a node that only ever heard its metadata, which is a
+  second packet exchange against a second tier and was previously untested — the
+  existing coverage stopped at "the peer learned the passage exists";
+- a catalog sync whose request is lost on the radio, recovering without waiting
+  for the once-a-minute re-announcement walk to come round;
+- the real SQLite catalog on both ends of a replication. Every other test here
+  runs the protocol against `MemoryCatalog`, so `LocalCatalog` — the storage
+  layer that actually ships — had never been on either side of one. It runs
+  against `node:sqlite` through a shim in `src/storage/__testshim__`, so the
+  DDL, the migration and all 41 raw queries are the real ones;
 - the relevance floor returning nothing for an out-of-corpus question;
 - identity: key derivation, signature verification, id-to-key binding, replayed
   and unsolicited responses, key-change detection, and the rule that in-person
