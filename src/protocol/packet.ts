@@ -33,6 +33,11 @@ export const PacketType = {
   /** Anti-entropy: "what have I missed?" */
   CATALOG_REQ: 7,
   CATALOG_RES: 8,
+  /** "Prove you are the node id you are claiming." */
+  IDENT_REQ: 9,
+  IDENT_RES: 10,
+  /** Holder claims and popularity shares, without the metadata they describe. */
+  HOLDERS: 11,
 } as const;
 export type PacketType = (typeof PacketType)[keyof typeof PacketType];
 
@@ -46,6 +51,9 @@ export const PACKET_TYPE_NAME: Record<number, string> = {
   6: 'ANNOUNCE',
   7: 'CATALOG_REQ',
   8: 'CATALOG_RES',
+  9: 'IDENT_REQ',
+  10: 'IDENT_RES',
+  11: 'HOLDERS',
 };
 
 export interface Packet {
@@ -509,4 +517,145 @@ export function encodeCatalogReq(c: CatalogReqPayload): Uint8Array {
 export function decodeCatalogReq(b: Uint8Array): CatalogReqPayload {
   const r = new Reader(b);
   return { sinceSec: r.u32(), max: r.u16() };
+}
+
+/* ---- IDENT_REQ / IDENT_RES: proving a node id is not just a claim ---- */
+
+/**
+ * Length of the challenge a verifier sends.
+ *
+ * The signature it elicits is only evidence if the thing signed could not have
+ * been predicted. Sixteen random bytes make a replayed IDENT_RES — captured off
+ * the air and re-sent by an impostor — useless, because the verifier will not
+ * accept a signature over a nonce it did not just generate.
+ */
+export const IDENT_NONCE_BYTES = 16;
+export const IDENT_PUBKEY_BYTES = 32;
+export const IDENT_SIG_BYTES = 64;
+
+export interface IdentReqPayload {
+  nonce: Uint8Array;
+}
+
+export function encodeIdentReq(nonce: Uint8Array): Uint8Array {
+  return new Writer().bytes(pad(nonce, IDENT_NONCE_BYTES)).finish();
+}
+
+export function decodeIdentReq(b: Uint8Array): IdentReqPayload {
+  return { nonce: new Reader(b).bytes(IDENT_NONCE_BYTES) };
+}
+
+export interface IdentResPayload {
+  /** Ed25519 public key. The node id is a hash of this, so it is checkable. */
+  pubKey: Uint8Array;
+  /** The display name being claimed — signed over, so it cannot be swapped. */
+  name: string;
+  /** The verifier's own challenge, echoed back. */
+  nonce: Uint8Array;
+  sig: Uint8Array;
+}
+
+export function encodeIdentRes(p: IdentResPayload): Uint8Array {
+  return new Writer()
+    .bytes(pad(p.pubKey, IDENT_PUBKEY_BYTES))
+    .str(p.name, 32)
+    .bytes(pad(p.nonce, IDENT_NONCE_BYTES))
+    .bytes(pad(p.sig, IDENT_SIG_BYTES))
+    .finish();
+}
+
+export function decodeIdentRes(b: Uint8Array): IdentResPayload {
+  const r = new Reader(b);
+  return {
+    pubKey: r.bytes(IDENT_PUBKEY_BYTES),
+    name: r.str(),
+    nonce: r.bytes(IDENT_NONCE_BYTES),
+    sig: r.bytes(IDENT_SIG_BYTES),
+  };
+}
+
+/**
+ * Exactly what an IDENT_RES signature covers.
+ *
+ * Kept here rather than beside the signer so both ends derive the bytes from
+ * one definition. Signing the nonce alone would let a captured signature be
+ * replayed under a different id or a different name; binding all three means
+ * the signature attests to "this key, this id, this name, for this challenge".
+ */
+export function identChallengeBytes(
+  nonce: Uint8Array,
+  nodeId: number,
+  name: string,
+): Uint8Array {
+  return new Writer()
+    .bytes(pad(nonce, IDENT_NONCE_BYTES))
+    .u32(nodeId)
+    .str(name, 32)
+    .finish();
+}
+
+/** Fixed-width field helper: truncate or zero-extend, never emit a short field. */
+function pad(a: Uint8Array, n: number): Uint8Array {
+  if (a.length === n) return a;
+  const out = new Uint8Array(n);
+  out.set(a.subarray(0, n));
+  return out;
+}
+
+/* ---- HOLDERS: who has what, without re-sending what it is ---- */
+
+/**
+ * The cheap half of an ANNOUNCE.
+ *
+ * An ANNOUNCE entry is about 660 bytes, of which 384 is the embedding and 200
+ * is the snippet — and those never change. What changes is who holds the body
+ * and how often it has been read, which is a couple of dozen bytes. Re-sending
+ * the whole entry to refresh them is what a fast link lets you get away with;
+ * on a 517-byte MTU at a few kB/s it is the largest thing on the radio, and it
+ * pushes the beacons that keep peers alive out of the way.
+ *
+ * So this carries only the part that moves. A receiver that does not recognise
+ * a docId ignores it rather than inventing a chunk it cannot describe — it will
+ * hear about that chunk from a real ANNOUNCE, or ask for one.
+ */
+export interface HolderEntry {
+  docId: number;
+  /** Nodes the announcer believes hold the body. */
+  holders: number[];
+  /** The announcer's own access count for this chunk (a G-counter share). */
+  hits: number;
+}
+
+export interface HoldersPayload {
+  docKey: number;
+  entries: HolderEntry[];
+}
+
+/** Bounded so one entry cannot inflate a packet. Matches ANNOUNCE's cap. */
+const MAX_HOLDER_CLAIMS = 8;
+
+export function encodeHolders(p: HoldersPayload): Uint8Array {
+  const w = new Writer().u32(p.docKey).u8(Math.min(p.entries.length, 255));
+  for (const e of p.entries.slice(0, 255)) {
+    const holders = e.holders.slice(0, MAX_HOLDER_CLAIMS);
+    w.u32(e.docId).u32(e.hits).u8(holders.length);
+    for (const h of holders) w.u32(h);
+  }
+  return w.finish();
+}
+
+export function decodeHolders(b: Uint8Array): HoldersPayload {
+  const r = new Reader(b);
+  const docKey = r.u32();
+  const n = r.u8();
+  const entries: HolderEntry[] = [];
+  for (let i = 0; i < n; i++) {
+    const docId = r.u32();
+    const hits = r.u32();
+    const count = r.u8();
+    const holders: number[] = [];
+    for (let h = 0; h < count; h++) holders.push(r.u32());
+    entries.push({ docId, holders, hits });
+  }
+  return { docKey, entries };
 }

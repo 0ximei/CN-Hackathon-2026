@@ -3,6 +3,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 
 import { MeshScreen } from './src/ui/MeshScreen';
+import { OnboardingScreen } from './src/ui/OnboardingScreen';
 import { theme } from './src/ui/theme';
 import { useMesh } from './src/ui/useMesh';
 
@@ -14,6 +15,9 @@ export default function App() {
       <StatusBar style="light" />
       <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
         {mesh.phase === 'booting' && <Booting />}
+        {mesh.phase === 'onboarding' && (
+          <OnboardingScreen suggestedName={mesh.suggestedName} onCreate={mesh.create} />
+        )}
         {mesh.phase === 'error' && <Failed reason={mesh.error} />}
         {mesh.phase === 'ready' && <MeshScreen mesh={mesh} />}
       </SafeAreaView>

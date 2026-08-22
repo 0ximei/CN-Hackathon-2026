@@ -1,5 +1,6 @@
 import {
     BROADCAST,
+    IDENT_NONCE_BYTES,
     PACKET_TYPE_NAME,
     PacketType,
     decodeAnnounce,
@@ -7,6 +8,9 @@ import {
     decodeDocReq,
     decodeDocRes,
     decodeHello,
+    decodeHolders,
+    decodeIdentReq,
+    decodeIdentRes,
     decodeQuery,
     decodeResult,
     encodeAnnounce,
@@ -14,67 +18,70 @@ import {
     encodeDocReq,
     encodeDocRes,
     encodeHello,
+    encodeHolders,
+    encodeIdentReq,
+    encodeIdentRes,
     encodeQuery,
     encodeResult,
     decodePacket,
     encodePacket,
     hopsTravelled,
+    identChallengeBytes,
+    type AnnouncePayload,
     type Hit,
-    type MetaEntry,
+    type HoldersPayload,
     type Packet,
 } from '@core/protocol/packet';
 import { Router, type RouteEntry } from '@core/protocol/router';
 import { dequantize, fromWireScore, quantize, toWireScore } from '@core/search/vector';
 import type { Identity } from '@core/lib/ids';
 import { nextMsgId } from '@core/lib/ids';
-import { docKeyOf, parseDocument, type ParsedDoc } from '@core/lib/chunk';
-import { normalizeUploadedText } from '@core/lib/textUpload';
 
 import type { Transport } from '@core/transport/Transport';
-import type { Scored } from '@core/search/vector';
 
-import type { CatalogStats, DocSummary, StoredChunk } from '../storage/store';
+import { randomBytes } from '../identity/keys';
+import {
+    blankPeerIdentity,
+    confirmInPerson,
+    judge,
+    revokeTrust,
+    type PeerIdentity,
+    type TrustState,
+} from '../identity/trust';
+import { Replicator, type ReplicationStats } from '../replication/Replicator';
+import type { MeshCatalog } from '../storage/MeshCatalog';
+import type { CatalogStats } from '../storage/types';
 import { embedder } from '../search/embedder';
 import { fromBase64, toBase64 } from '../lib/base64';
 
 /**
  * What the orchestrator needs from a radio.
  *
- * `Transport` plus one optional extra: BLE has a running commentary worth
+ * `Transport` plus two optional extras. BLE has a running commentary worth
  * surfacing — dialling, MTU negotiation, links lost — that the other transports
- * have no equivalent for, so it is optional rather than part of the interface
- * every radio must satisfy.
+ * have no equivalent for, and it can be told to pretend a link is down, which
+ * is how the demo forces multi-hop routing without physically walking a phone
+ * out of range. Both are optional rather than part of the interface every radio
+ * must satisfy.
  */
 export type MeshTransport = Transport & {
     onLog?(cb: (line: string) => void): () => void;
+    /** Peers to behave as if unreachable. The demo's "cut a link" control. */
+    setSevered?(peerIds: string[]): void;
 };
 
 /**
- * What the orchestrator needs from storage.
+ * The key material a node needs to prove who it is.
  *
- * Narrower than `LocalCatalog` on purpose. Depending on the concrete class
- * would drag expo-sqlite into every place a node is constructed, including the
- * tests, and the routing behaviour worth testing has nothing to do with which
- * database is underneath.
+ * Optional on the constructor: a node with no credentials still routes, still
+ * searches and still replicates, it simply cannot answer a challenge and stays
+ * permanently unverified to its peers. That is a real state a mesh can be in —
+ * an older build, or a node whose keystore failed — and modelling it as
+ * "unverified" is more useful than refusing to start.
  */
-export interface MeshCatalog {
-    search(queryVec: Float32Array, queryText: string, k: number): Scored[];
-    chunk(docId: number): StoredChunk | undefined;
-    chunksOf(docKey: number): StoredChunk[];
-    documents(): DocSummary[];
-    snippet(docId: number): string;
-    stats(): CatalogStats;
-    ingestDoc(
-        doc: ParsedDoc,
-        filter: ((docId: number) => boolean) | undefined,
-        provenance: 'seed' | 'local',
-    ): Promise<number>;
-    ingestRemote(chunk: Omit<StoredChunk, 'provenance'>): Promise<boolean>;
-    reload(): Promise<void>;
-    enqueue(dstId: number, payload: string, ttlMs: number): Promise<void>;
-    dueFor(dstId?: number): Promise<{ id: number; dstId: number; payload: string }[]>;
-    dequeue(id: number): Promise<void>;
-    queuedCount(): Promise<number>;
+export interface NodeCredentials {
+    publicKey: Uint8Array;
+    sign(message: Uint8Array): Uint8Array;
 }
 
 const HELLO_INTERVAL_MS = 3_000;
@@ -93,8 +100,8 @@ const PEER_TIMEOUT_MS = 13_000;
  * The same deadline for a node that is not a neighbour.
  *
  * Distant nodes are only refreshed by the occasional flooded beacon, so judging
- * them on the direct-link deadline would evict every one of them between
- * floods and make the mesh look like it kept losing half its nodes.
+ * them on the direct-link deadline would evict every one of them between floods
+ * and make the mesh look like it kept losing half its nodes.
  */
 const DISTANT_PEER_TIMEOUT_MS = 45_000;
 
@@ -105,9 +112,7 @@ const DISTANT_PEER_TIMEOUT_MS = 45_000;
  * about a link and must be fast, and flooding it every three seconds would put
  * N x N packets on a radio that moves a few kilobytes a second. Identity — who
  * is out there and what they are called — is needed mesh-wide but changes
- * rarely, so it can travel at a third of the rate. Without it, a node two hops
- * away has a route and a node id but no name, and its results come back
- * attributed to a hex number.
+ * rarely, so it can travel at a third of the rate.
  */
 const FLOOD_HELLO_EVERY = 3;
 
@@ -116,9 +121,9 @@ const FLOOD_HELLO_EVERY = 3;
  *
  * Much longer than the browser build's window, because this radio is genuinely
  * slow. A BLE link with a negotiated 517-byte MTU moves a few kilobytes a
- * second in practice, and a two-hop reply has to be received, re-encoded and
- * re-transmitted by a phone in the middle. Cutting this short does not make the
- * answer arrive faster — it just drops the far half of the mesh.
+ * second, and a two-hop reply has to be received, re-encoded and re-transmitted
+ * by a phone in the middle. Cutting this short does not make the answer arrive
+ * faster — it drops the far half of the mesh.
  */
 const COLLECT_WINDOW_MS = 6_000;
 
@@ -127,17 +132,50 @@ const EARLY_EXIT_GRACE_MS = 400;
 
 const HITS_PER_NODE = 4;
 const DOC_FETCH_TIMEOUT_MS = 8_000;
+const IDENT_TIMEOUT_MS = 10_000;
 const OUTBOX_TTL_MS = 5 * 60 * 1000;
 const OUTBOX_RETRY_MS = 5_000;
 const ACTIVITY_CAPACITY = 200;
+/**
+ * Chunk entries a CATALOG_REQ reply will send in one go.
+ *
+ * Two hundred, as the browser build uses, is 130 KB of metadata poured into a
+ * link that has existed for one second and moves a few kilobytes a second. This
+ * is a catch-up, not a transfer: it exists so a node that joined after an upload
+ * hears that the document exists at all. Whatever does not fit arrives over the
+ * next few minutes on the replicator's re-announce cycle.
+ */
+const CATALOG_SYNC_MAX = 16;
+
+/**
+ * How long to let a new link settle before asking it for anything.
+ *
+ * The first seconds of a BLE link are the expensive ones — MTU negotiation,
+ * service discovery, the subscribe — and the first thing that should cross it
+ * is a beacon, because a peer that cannot get a HELLO through inside
+ * PEER_TIMEOUT_MS is a peer this node will shortly declare dead. Sending a
+ * catalog request into that window puts kilobytes of reply ahead of the packet
+ * that keeps the peer alive.
+ */
+const CATALOG_SYNC_DELAY_MS = 5_000;
 
 export interface PeerState {
     nodeId: number;
     name: string;
+    /** Chunks the peer has metadata for — what it can search. */
     known: number;
+    /** Chunks it holds the body of — what it can serve. */
+    stored: number;
     documents: number;
+    /** Self-reported free storage. The one signal a node is the authority on. */
+    freeBytes: number;
+    /** Locally observed, never self-reported. 0..1. */
+    reliability: number;
     lastSeen: number;
     hops: number;
+    trust: TrustState;
+    /** Whether this peer has proven the id it is using. */
+    verified: boolean;
 }
 
 export interface MeshHit {
@@ -148,15 +186,15 @@ export interface MeshHit {
     snippet: string;
     /** Full passage, once fetched. Undefined means only the snippet is held. */
     text?: string;
-    /** The node that matched it. */
+    /** The node that matched it — not necessarily one that holds it. */
     fromNodeId: number;
     fromNodeName: string;
-    /** A node believed to hold the passage, 0 when unknown. */
+    /** A node believed to hold the body, 0 when unknown. */
     holderId: number;
     holderName: string;
     hops: number;
     local: boolean;
-    /** True when this node itself holds the body, making it retrievable without a network fetch. */
+    /** True when this node itself holds the body. */
     storedHere: boolean;
 }
 
@@ -168,12 +206,45 @@ export interface QueryState {
     /** Set when the collection window closes. */
     finishedAt?: number;
     answered: number[];
+    /** Nodes that replied, for the map animation. */
+    respondedNodeIds: number[];
 }
 
+/**
+ * One line of the wire log.
+ *
+ * Structured rather than a formatted string, because the same events drive the
+ * topology view: a pre-rendered "QUERY -> all" cannot be turned back into an
+ * edge to animate. The UI formats; this records.
+ */
 export interface ActivityEvent {
+    /**
+     * Monotonic within this node's lifetime.
+     *
+     * The topology view replays only events it has not drawn yet, and several
+     * packets routinely land inside the same millisecond — a flooded QUERY
+     * produces one `sent` per link. Watermarking on `at` would silently drop
+     * every one after the first.
+     */
+    seq: number;
     at: number;
-    kind: 'sent' | 'recv' | 'forward' | 'drop' | 'radio';
-    label: string;
+    kind: 'sent' | 'forwarded' | 'received' | 'dropped' | 'replicated' | 'evicted' | 'radio';
+    type: string;
+    srcId: number;
+    dstId: number;
+    /** Transport peer id, `flood`, or `local` for events with no link behind them. */
+    peer: string;
+    /**
+     * The node at the other end of `peer`, or 0 when there isn't one.
+     *
+     * Resolved here rather than in the UI because only this layer can do it:
+     * the router names links by transport peer id, and mapping one back to a
+     * node id means consulting the route table. A view that tried would have to
+     * guess at the peer-id format, which differs between radios.
+     */
+    peerNodeId: number;
+    reason?: string;
+    detail?: string;
 }
 
 export interface MeshStats {
@@ -191,50 +262,52 @@ type Events = {
     activity(events: ActivityEvent[]): void;
     stats(stats: MeshStats): void;
     routes(routes: Map<number, RouteEntry>): void;
-    /** The catalog changed — this node's own upload, or content pulled from a peer. */
+    /** The catalog changed — an upload here, or content pulled from a peer. */
     catalog(stats: CatalogStats): void;
+    replication(stats: ReplicationStats): void;
+    identities(peers: PeerIdentity[]): void;
+    outbox(queued: number): void;
 };
-
-/** Chunk metadata entries per ANNOUNCE packet. Matches the web build's batch size. */
-const ENTRIES_PER_ANNOUNCE = 4;
-
-/** How much of a chunk rides in an ANNOUNCE entry, before the body itself is pulled. */
-const ANNOUNCE_SNIPPET_CHARS = 200;
-
-/** Chunk entries a CATALOG_REQ reply will send in one go, meeting a newly-met peer. */
-const CATALOG_SYNC_MAX = 200;
 
 /**
  * The application protocol, over whatever radio is mounted.
  *
- * Structurally this is the browser build's `MeshNode` with the storage tier
- * simplified. There is no metadata/body split and no popularity-weighted
- * partial replication the way the web build's `Replicator` does it — no
- * eviction, no storage-pressure policy, no periodic reconcile timer. What
- * exists instead is flood-and-pull: an upload gossips its chunk metadata once
- * via ANNOUNCE, and any node that hears about a chunk it doesn't hold pulls
- * the body and keeps it, permanently. Meeting a peer for the first time this
- * session also triggers a one-shot CATALOG_REQ/CATALOG_RES catch-up, so content
- * uploaded before that peer joined the mesh still reaches it — otherwise it
- * would only ever be reachable by search, never by holding a copy locally.
- * That is a real, intentional scope cut —
- * fine for a mesh sized at a handful of phones and documents, not something
- * that would hold up at web-scale library sizes. What is unchanged — and is
- * the point — is everything below it. The packet codec, the flooding router
- * with its TTL and dedup LRU, the backward-learned unicast routes and the
- * store-and-forward queue are the same modules the web app uses and the same
- * ones its test suite covers.
+ * This is the browser build's `MeshNode` with the same storage model underneath
+ * it: two tiers, and a replication policy that decides which bodies live here.
+ * Metadata gossips on ANNOUNCE and is kept by whichever nodes rank for it;
+ * bodies are pulled and evicted by `Replicator` against the shared policy in
+ * `@core/replication/policy`. Meeting a peer for the first time this session
+ * also triggers a one-shot CATALOG_REQ/CATALOG_RES catch-up, so content
+ * uploaded before that peer joined still reaches it.
+ *
+ * The layers below are the same modules the web app uses and the same ones its
+ * test suite covers: the packet codec, the flooding router with its TTL and
+ * dedup LRU, the backward-learned unicast routes, and the store-and-forward
+ * queue.
  */
 export class MeshNode {
-    private router: Router;
+    readonly router: Router;
+    readonly replicator: Replicator;
+
+    /** Injected by the network controls to demonstrate loss tolerance. 0..1. */
+    packetLoss = 0;
+    /** Set once a generative model is loaded, and advertised in HELLO. */
+    hasLlm = false;
+
     private helloTimer: ReturnType<typeof setInterval> | null = null;
     private outboxTimer: ReturnType<typeof setInterval> | null = null;
     private peers = new Map<number, PeerState>();
     private queries = new Map<number, QueryState>();
     private pendingDocs = new Map<number, (payload: { text: string; source: string } | null) => void>();
-    /** Nodes already sent a CATALOG_REQ, so meeting one twice in a session doesn't re-sync. */
+    /** Outstanding identity challenges, by the node they were sent to. */
+    private challenges = new Map<number, { nonce: Uint8Array; sentAt: number }>();
+    private identities = new Map<number, PeerIdentity>();
+    /** Nodes already sent a CATALOG_REQ, so meeting one twice does not re-sync. */
     private syncedPeers = new Set<number>();
+    /** docId -> a peer that claimed to hold it, for the synchronous query path. */
+    private holderHints = new Map<number, number>();
     private activity: ActivityEvent[] = [];
+    private activitySeq = 0;
     private queued = 0;
     private helloCount = 0;
     private listeners: { [K in keyof Events]: Set<Events[K]> } = {
@@ -244,18 +317,45 @@ export class MeshNode {
         stats: new Set(),
         routes: new Set(),
         catalog: new Set(),
+        replication: new Set(),
+        identities: new Set(),
+        outbox: new Set(),
     };
     private unsubscribes: (() => void)[] = [];
 
     constructor(
-        readonly identity: Identity,
-        private transport: MeshTransport,
+        /** Mutable only through `rename`: the id and key never change with it. */
+        public identity: Identity,
+        readonly transport: MeshTransport,
         private catalog: MeshCatalog,
+        private credentials?: NodeCredentials,
     ) {
         this.router = new Router({
             nodeId: identity.id,
             transport,
+            lossRate: () => this.packetLoss,
             onUndeliverable: (pkt, dstId) => void this.park(pkt, dstId),
+        });
+
+        this.replicator = new Replicator({
+            selfId: identity.id,
+            catalog,
+            livePeers: () =>
+                [...this.peers.values()].map((p) => ({ nodeId: p.nodeId, freeBytes: p.freeBytes })),
+            announce: (payload, dstId) => this.sendAnnounce(payload, dstId),
+            announceHolders: (payload) =>
+                this.router.send(PacketType.HOLDERS, encodeHolders(payload), BROADCAST),
+            fetchBody: (docId, from) => this.fetchBodyFrom(docId, from),
+            onStats: (stats) => this.emit('replication', stats),
+            onEvent: (e) =>
+                this.note({
+                    kind: e.kind === 'pull' ? 'replicated' : 'evicted',
+                    type: e.kind === 'pull' ? 'BODY' : 'BODY',
+                    srcId: this.identity.id,
+                    dstId: this.identity.id,
+                    peer: 'local',
+                    detail: `${e.title}: ${e.detail}`,
+                }),
         });
     }
 
@@ -268,25 +368,61 @@ export class MeshNode {
         this.unsubscribes.push(
             this.router.on('deliver', (pkt) => void this.onPacket(pkt)),
             this.router.on('forwarded', (pkt, to) =>
-                this.note('forward', `${name(pkt.type)} -> ${to === 'flood' ? 'all' : short(to)}`),
+                this.note({
+                    kind: 'forwarded',
+                    type: name(pkt.type),
+                    srcId: pkt.srcId,
+                    dstId: pkt.dstId,
+                    peer: to,
+                }),
             ),
-            this.router.on('dropped', (pkt, reason) =>
-                this.note('drop', `${pkt ? name(pkt.type) : 'frame'}: ${reason}`),
+            this.router.on('dropped', (pkt, reason, from) =>
+                this.note({
+                    kind: 'dropped',
+                    type: pkt ? name(pkt.type) : 'FRAME',
+                    srcId: pkt?.srcId ?? 0,
+                    dstId: pkt?.dstId ?? 0,
+                    peer: from,
+                    reason,
+                }),
             ),
             this.router.on('sent', (pkt, to) =>
-                this.note('sent', `${name(pkt.type)} -> ${to === 'flood' ? 'all' : short(to)}`),
+                this.note({
+                    kind: 'sent',
+                    type: name(pkt.type),
+                    srcId: pkt.srcId,
+                    dstId: pkt.dstId,
+                    peer: to,
+                }),
             ),
             this.router.on('routesChanged', (routes) => this.emit('routes', routes)),
         );
-        const offLog = this.transport.onLog?.((line) => this.note('radio', line));
+        const offLog = this.transport.onLog?.((line) =>
+            this.note({
+                kind: 'radio',
+                type: 'RADIO',
+                srcId: this.identity.id,
+                dstId: 0,
+                peer: 'local',
+                detail: line,
+            }),
+        );
         if (offLog) this.unsubscribes.push(offLog);
+
+        await this.loadIdentities();
 
         this.sendHello();
         this.helloTimer = setInterval(() => {
             this.sendHello();
             this.expirePeers();
+            void this.refreshReliability();
         }, HELLO_INTERVAL_MS);
         this.outboxTimer = setInterval(() => void this.flushOutbox(), OUTBOX_RETRY_MS);
+    }
+
+    /** Starts the replication loop. Separate from `start` so a UI can stage it. */
+    startReplication(): void {
+        this.replicator.start();
     }
 
     stop(): void {
@@ -294,6 +430,7 @@ export class MeshNode {
         if (this.outboxTimer) clearInterval(this.outboxTimer);
         this.helloTimer = null;
         this.outboxTimer = null;
+        this.replicator.stop();
         for (const off of this.unsubscribes) off();
         this.unsubscribes = [];
         this.router.stop();
@@ -309,78 +446,54 @@ export class MeshNode {
 
     /* ----------------------------- upload ---------------------------- */
 
-    /** Ingests a document here and gossips its metadata to the mesh. */
-    async upload(filename: string, raw: string): Promise<void> {
-        const text = normalizeUploadedText(raw);
-        if (!text) throw new Error(`${filename} has no readable text`);
-        const parsed = parseDocument(filename, text);
-        if (!parsed.chunks.length) throw new Error(`${filename} has no readable text`);
-
-        const body = parsed.chunks.map((c) => c.text).join('\n');
-        const docKey = docKeyOf(parsed.title, body);
-
-        await this.catalog.ingestDoc(parsed, undefined, 'local');
-        await this.catalog.reload();
+    /**
+     * Ingests a document here and gossips its metadata to the mesh.
+     *
+     * The uploading node keeps every body it created — it is the first replica
+     * by definition — and the replicator spreads them outward from there.
+     */
+    async upload(
+        filename: string,
+        raw: string,
+        onProgress?: (done: number, total: number) => void,
+    ): Promise<void> {
+        const { doc } = await this.catalog.upload(filename, raw, this.identity.id, onProgress);
         this.emit('catalog', this.catalog.stats());
-
-        await this.announce(docKey);
+        await this.replicator.announceDocument(doc.docKey);
+        void this.replicator.reconcile();
     }
 
     /**
-     * Sends one document's chunk metadata so the mesh learns it exists.
+     * Changes the label this node beacons and signs under.
      *
-     * Broadcasts on upload (a one-shot flood, not a recurring reconcile pass —
-     * well inside the radio's real throughput for a single document's worth of
-     * packets) or unicasts as a CATALOG_RES when answering a CATALOG_REQ.
-     * Returns how many chunks were described, so a catalog-sync reply can budget
-     * against `CatalogReqPayload.max`.
+     * The key and therefore the id are untouched, so peers that verified this
+     * node stay verified — what they verified was the key. The new name is
+     * signed into the next IDENT_RES, which is what stops a rename from being a
+     * way to display one name while having proven another.
      */
-    private async announce(
-        docKey: number,
-        dst: number = BROADCAST,
-        type: typeof PacketType.ANNOUNCE | typeof PacketType.CATALOG_RES = PacketType.ANNOUNCE,
-    ): Promise<number> {
-        const chunks = this.catalog.chunksOf(docKey);
-        if (!chunks.length) return 0;
+    rename(name: string): void {
+        this.identity = { ...this.identity, name };
+    }
 
-        const docBytes = chunks.reduce((n, c) => n + c.text.length, 0);
-        const createdAtSec = Math.floor(Date.now() / 1000);
+    /** Forgets a document on this device only. Peers keep their copies. */
+    async forget(docKey: number): Promise<void> {
+        await this.catalog.forget(docKey);
+        this.emit('catalog', this.catalog.stats());
+        void this.replicator.reconcile();
+    }
 
-        for (let i = 0; i < chunks.length; i += ENTRIES_PER_ANNOUNCE) {
-            const batch = chunks.slice(i, i + ENTRIES_PER_ANNOUNCE);
-            const entries: MetaEntry[] = batch.map((c) => {
-                const { q, scale } = quantize(embedder.embed(c.text));
-                return {
-                    docId: c.docId,
-                    seq: c.seq,
-                    version: 1,
-                    section: c.section,
-                    snippet: c.text.slice(0, ANNOUNCE_SNIPPET_CHARS),
-                    bytes: c.text.length,
-                    originId: this.identity.id,
-                    scale,
-                    vec: q,
-                    holders: [this.identity.id],
-                    hits: 0,
-                };
-            });
+    /** Changes how much room this node offers the mesh, then acts on it. */
+    async setBudget(bytes: number): Promise<void> {
+        await this.catalog.setBudget(bytes);
+        await this.replicator.reconcile();
+    }
 
-            this.router.send(
-                type,
-                encodeAnnounce({
-                    docKey,
-                    title: chunks[0].title,
-                    source: chunks[0].source,
-                    docBytes,
-                    chunkCount: chunks.length,
-                    docOriginId: this.identity.id,
-                    createdAtSec,
-                    entries,
-                }),
-                dst,
-            );
-        }
-        return chunks.length;
+    private sendAnnounce(payload: AnnouncePayload, dstId?: number): void {
+        this.router.send(
+            dstId === undefined ? PacketType.ANNOUNCE : PacketType.CATALOG_RES,
+            encodeAnnounce(payload),
+            dstId ?? BROADCAST,
+        );
     }
 
     /* ----------------------------- search ---------------------------- */
@@ -389,8 +502,8 @@ export class MeshNode {
      * Search this node and everything it can reach.
      *
      * Local results are available before the first packet leaves, so the UI has
-     * something to show immediately; mesh results merge in as they arrive and the
-     * promise resolves when the collection window closes.
+     * something to show immediately; mesh results merge in as they arrive and
+     * the promise resolves when the collection window closes.
      */
     async search(text: string): Promise<QueryState> {
         const queryId = nextMsgId();
@@ -399,21 +512,13 @@ export class MeshNode {
         const state: QueryState = {
             queryId,
             text,
-            hits: this.localHits(vector, text).map((hit) => ({
-                ...hit,
-                fromNodeId: this.identity.id,
-                fromNodeName: this.identity.name,
-                holderId: this.identity.id,
-                holderName: this.identity.name,
-                hops: 0,
-                local: true,
-                storedHere: true,
-            })),
+            hits: this.localHits(vector, text),
             startedAt: Date.now(),
             answered: [],
+            respondedNodeIds: [],
         };
         this.queries.set(queryId, state);
-        this.emit('query', state);
+        this.emit('query', snapshot(state));
 
         const { q, scale } = quantize(vector);
         this.router.send(
@@ -422,6 +527,12 @@ export class MeshNode {
         );
 
         await this.collect(state);
+
+        // Popularity is counted where the passage was *wanted*, not where it
+        // happened to be stored, and only ever as this node's own share of the
+        // G-counter. That is what makes a chunk earn extra replicas across the
+        // mesh rather than only on whichever node already had it.
+        await this.replicator.recordHit(state.hits.map((h) => h.docId));
         return state;
     }
 
@@ -430,8 +541,8 @@ export class MeshNode {
      *
      * If everyone we know about has answered there is nothing left to wait for,
      * so the window closes early after a short grace — long enough for a reply
-     * that is one hop behind, short enough to feel immediate. A node with no
-     * peers at all resolves almost instantly rather than staring at a timer.
+     * one hop behind, short enough to feel immediate. A node with no peers
+     * resolves almost instantly rather than staring at a timer.
      */
     private collect(state: QueryState): Promise<void> {
         return new Promise((resolve) => {
@@ -440,7 +551,7 @@ export class MeshNode {
                 clearTimeout(deadline);
                 state.finishedAt = Date.now();
                 state.hits.sort((a, b) => b.score - a.score);
-                this.emit('query', state);
+                this.emit('query', snapshot(state));
                 resolve();
             };
 
@@ -459,16 +570,31 @@ export class MeshNode {
         });
     }
 
-    private localHits(vector: Float32Array, text: string): Omit<MeshHit, 'fromNodeId' | 'fromNodeName' | 'holderId' | 'holderName' | 'hops' | 'local'>[] {
-        return this.catalog.search(vector, text, HITS_PER_NODE).map((scored) => {
-            const chunk = this.catalog.chunk(scored.docId);
+    /**
+     * This node's own answers.
+     *
+     * Note what `storedHere` is doing: a hit from the local catalog is not proof
+     * the passage is here. Metadata carries the embedding, so a node scores and
+     * returns passages whose bodies live somewhere else entirely — and those
+     * rows come back with the text absent and a holder named.
+     */
+    private localHits(vector: Float32Array, text: string): MeshHit[] {
+        return this.catalog.searchLocal(vector, text, HITS_PER_NODE).map((hit) => {
+            const holderId = hit.hasBody ? this.identity.id : this.knownHolder(hit.docId);
             return {
-                docId: scored.docId,
-                score: scored.score,
-                title: chunk?.title ?? '',
-                section: chunk?.section ?? '',
-                snippet: this.catalog.snippet(scored.docId),
-                text: chunk?.text, storedHere: true,
+                docId: hit.docId,
+                score: hit.score,
+                title: hit.meta.title,
+                section: hit.meta.section,
+                snippet: hit.meta.snippet,
+                text: hit.hasBody ? this.catalog.bodyOf(hit.docId) : undefined,
+                fromNodeId: this.identity.id,
+                fromNodeName: this.identity.name,
+                holderId,
+                holderName: this.nameOf(holderId),
+                hops: 0,
+                local: true,
+                storedHere: hit.hasBody,
             };
         });
     }
@@ -477,18 +603,19 @@ export class MeshNode {
      * Pull the full passage behind a hit.
      *
      * Snippets ride inside RESULT packets because a passage would not fit — a
-     * RESULT with four 1 KB bodies is 4 KB of radio time per answering node, most
-     * of it for hits the user will never open. The body is fetched only when it
-     * is actually wanted, and from a node that holds it rather than necessarily
+     * RESULT with four 1 KB bodies is 4 KB of radio time per answering node,
+     * most of it for hits the user will never open. The body is fetched only
+     * when it is wanted, and from a node that holds it rather than necessarily
      * the one that answered.
      */
     async fetchFullText(hit: MeshHit): Promise<string> {
         if (hit.text) return hit.text;
 
-        const local = this.catalog.chunk(hit.docId);
-        if (local) return local.text;
+        const local = await this.catalog.getBody(hit.docId);
+        if (local) return local;
 
-        const target = hit.holderId && hit.holderId !== this.identity.id ? hit.holderId : hit.fromNodeId;
+        const target =
+            hit.holderId && hit.holderId !== this.identity.id ? hit.holderId : hit.fromNodeId;
         if (!target || target === this.identity.id) return hit.snippet;
 
         const reply = await this.requestDoc(hit.docId, target);
@@ -504,13 +631,27 @@ export class MeshNode {
                     touched = true;
                 }
             }
-            if (touched) this.emit('query', { ...state, hits: [...state.hits] });
+            if (touched) this.emit('query', snapshot(state));
         }
         return reply.text;
     }
 
-    /** Sends a DOC_REQ to `target` and waits for the matching DOC_RES, or null on timeout. */
-    private requestDoc(docId: number, target: number): Promise<{ text: string; source: string } | null> {
+    /** The replicator's body pull, with the peer's reliability observed around it. */
+    private async fetchBodyFrom(docId: number, fromNodeId: number): Promise<string | null> {
+        await this.replicator.noteRequest(fromNodeId);
+        const reply = await this.requestDoc(docId, fromNodeId);
+        if (reply?.text) {
+            await this.replicator.noteResponse(fromNodeId);
+            return reply.text;
+        }
+        return null;
+    }
+
+    /** Sends a DOC_REQ to `target` and waits for the DOC_RES, or null on timeout. */
+    private requestDoc(
+        docId: number,
+        target: number,
+    ): Promise<{ text: string; source: string } | null> {
         return new Promise((resolve) => {
             const timer = setTimeout(() => {
                 this.pendingDocs.delete(docId);
@@ -527,28 +668,133 @@ export class MeshNode {
         });
     }
 
+    /* -------------------------- identity ----------------------------- */
+
+    /**
+     * Asks a peer to prove the node id it is using.
+     *
+     * Sent on first contact and re-sendable from the UI. The nonce is kept here
+     * rather than derived from anything the peer can see: a response is only
+     * evidence if it could not have been prepared in advance.
+     */
+    challenge(nodeId: number): void {
+        const { bytes: nonce } = randomBytes(IDENT_NONCE_BYTES);
+        this.challenges.set(nodeId, { nonce, sentAt: Date.now() });
+
+        const existing = this.identities.get(nodeId);
+        if (existing && existing.state === 'unknown') {
+            this.setIdentity({ ...existing, state: 'pending', detail: 'waiting for a signature' });
+        }
+
+        this.router.send(PacketType.IDENT_REQ, encodeIdentReq(nonce), nodeId);
+
+        setTimeout(() => {
+            const pending = this.challenges.get(nodeId);
+            if (!pending || pending.nonce !== nonce) return;
+            this.challenges.delete(nodeId);
+            const peer = this.identities.get(nodeId);
+            if (peer?.state === 'pending') {
+                this.setIdentity({
+                    ...peer,
+                    state: 'unknown',
+                    detail: 'no answer — it may be an older build',
+                });
+            }
+        }, IDENT_TIMEOUT_MS);
+    }
+
+    /** Records that a person compared the safety number and it matched. */
+    async markTrusted(nodeId: number): Promise<void> {
+        const peer = this.identities.get(nodeId);
+        if (!peer) return;
+        await this.setIdentity(confirmInPerson(peer, Date.now()));
+    }
+
+    /** Undoes that confirmation, back to the cryptographic fact underneath. */
+    async clearTrust(nodeId: number): Promise<void> {
+        const peer = this.identities.get(nodeId);
+        if (!peer) return;
+        await this.setIdentity(revokeTrust(peer));
+    }
+
+    peerIdentities(): PeerIdentity[] {
+        return [...this.identities.values()].sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    identityOf(nodeId: number): PeerIdentity | undefined {
+        return this.identities.get(nodeId);
+    }
+
+    private async loadIdentities(): Promise<void> {
+        for (const row of await this.catalog.peerIdentities()) {
+            this.identities.set(row.nodeId, { ...row, state: row.state as TrustState });
+        }
+        this.emit('identities', this.peerIdentities());
+    }
+
+    private async setIdentity(peer: PeerIdentity): Promise<void> {
+        this.identities.set(peer.nodeId, peer);
+        await this.catalog.putPeerIdentity(peer);
+        const known = this.peers.get(peer.nodeId);
+        if (known) {
+            this.peers.set(peer.nodeId, {
+                ...known,
+                trust: peer.state,
+                verified: peer.state === 'verified' || peer.state === 'trusted',
+            });
+            this.emit('peers', this.peerList());
+        }
+        this.emit('identities', this.peerIdentities());
+    }
+
     /* --------------------------- packet handling --------------------- */
 
     private async onPacket(pkt: Packet): Promise<void> {
-        this.note('recv', `${name(pkt.type)} from ${hex(pkt.srcId)} (${hopsTravelled(pkt)}h)`);
+        this.note({
+            kind: 'received',
+            type: name(pkt.type),
+            srcId: pkt.srcId,
+            dstId: pkt.dstId,
+            peer: peerIdOf(pkt.srcId),
+            detail: `${hopsTravelled(pkt)}h`,
+        });
 
+        // Every branch runs before the stats are published, rather than each
+        // one remembering to do it: the earlier shape returned from inside the
+        // switch, so the traffic counters only ever updated for packet types
+        // this node did not understand.
         switch (pkt.type) {
             case PacketType.HELLO:
-                return this.onHello(pkt);
+                this.onHello(pkt);
+                break;
             case PacketType.QUERY:
-                return this.onQuery(pkt);
+                this.onQuery(pkt);
+                break;
             case PacketType.RESULT:
-                return this.onResult(pkt);
+                this.onResult(pkt);
+                break;
             case PacketType.DOC_REQ:
-                return this.onDocReq(pkt);
+                await this.onDocReq(pkt);
+                break;
             case PacketType.DOC_RES:
-                return this.onDocRes(pkt);
+                this.onDocRes(pkt);
+                break;
             case PacketType.ANNOUNCE:
-                return this.onAnnounce(pkt);
-            case PacketType.CATALOG_REQ:
-                return this.onCatalogReq(pkt);
             case PacketType.CATALOG_RES:
-                return this.onAnnounce(pkt);
+                await this.onAnnounce(pkt);
+                break;
+            case PacketType.CATALOG_REQ:
+                await this.onCatalogReq(pkt);
+                break;
+            case PacketType.HOLDERS:
+                await this.onHolders(pkt);
+                break;
+            case PacketType.IDENT_REQ:
+                this.onIdentReq(pkt);
+                break;
+            case PacketType.IDENT_RES:
+                await this.onIdentRes(pkt);
+                break;
             default:
                 break;
         }
@@ -558,47 +804,95 @@ export class MeshNode {
     private onHello(pkt: Packet): void {
         const hello = decodeHello(pkt.payload);
         const known = this.peers.get(pkt.srcId);
+        const identity = this.identities.get(pkt.srcId);
+
         this.peers.set(pkt.srcId, {
             nodeId: pkt.srcId,
-            name: hello.name,
+            // A *verified* peer's name is the one it signed, not the one it
+            // beacons: HELLO is unauthenticated, so a node that has proven a
+            // name must not be able to display a different one afterwards.
+            name: identity?.verifiedAt ? identity.name : hello.name,
             known: hello.known,
+            stored: hello.stored,
             documents: hello.documents,
+            freeBytes: hello.freeKb * 1024,
+            reliability: known?.reliability ?? 0.5,
             lastSeen: Date.now(),
             hops: hopsTravelled(pkt),
+            trust: identity?.state ?? 'unknown',
+            verified: identity?.state === 'verified' || identity?.state === 'trusted',
         });
+
+        void this.replicator.noteHello(pkt.srcId, hello.freeKb * 1024);
+
         if (!known) {
-            this.note('recv', `${hello.name} joined`);
-            // Meeting a node for the first time this session: ask it for
-            // everything it holds, so content uploaded before this node was
-            // around still shows up rather than only being reachable by search.
+            this.note({
+                kind: 'received',
+                type: 'HELLO',
+                srcId: pkt.srcId,
+                dstId: this.identity.id,
+                peer: peerIdOf(pkt.srcId),
+                detail: `${hello.name} joined`,
+            });
+
+            if (!this.identities.has(pkt.srcId)) {
+                void this.setIdentity(blankPeerIdentity(pkt.srcId, hello.name, Date.now()));
+            }
+            // Prove-who-you-are and catch-me-up are both first-contact business,
+            // but they are independent: a peer that cannot sign is still worth
+            // syncing with, and a peer with nothing to sync still has to prove
+            // its id.
+            this.challenge(pkt.srcId);
+
             if (!this.syncedPeers.has(pkt.srcId)) {
                 this.syncedPeers.add(pkt.srcId);
-                this.router.send(
-                    PacketType.CATALOG_REQ,
-                    encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
-                    pkt.srcId,
-                );
+                const peerId = pkt.srcId;
+                setTimeout(() => {
+                    // Still there? A peer that dropped inside the settle window
+                    // has already been forgotten by expirePeers, and asking it
+                    // for a catalog would only park a packet for a node that
+                    // may never come back.
+                    if (this.peers.has(peerId)) {
+                        this.router.send(
+                            PacketType.CATALOG_REQ,
+                            encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
+                            peerId,
+                        );
+                    }
+                }, CATALOG_SYNC_DELAY_MS);
             }
         }
         this.emit('peers', this.peerList());
-        // A beacon is proof of reachability, which is exactly the trigger anything
-        // parked for that node has been waiting on.
+        // A beacon is proof of reachability, which is exactly the trigger
+        // anything parked for that node has been waiting on.
         void this.flushOutbox(pkt.srcId);
     }
 
     private onQuery(pkt: Packet): void {
         const query = decodeQuery(pkt.payload);
         const vector = dequantize(query.vec, query.scale);
-        const scored = this.catalog.search(vector, query.text, query.topK || HITS_PER_NODE);
+        const scored = this.catalog.searchLocal(vector, query.text, query.topK || HITS_PER_NODE);
 
-        // Answering with nothing still costs a packet and a slot in the asker's
-        // early-exit check, and staying silent would make it wait the full window.
+        // A node with nothing relevant contributes no *hits* — the floor inside
+        // searchLocal has already dropped them, and without it this would return
+        // the four least-irrelevant passages it knows for the asking node to
+        // cite as answers, which on a first-aid corpus is the worst failure
+        // available.
+        //
+        // It still sends the packet. Saying nothing at all is what the browser
+        // build does, and it is affordable there because the collection window
+        // is five seconds on a fast link; here one silent node costs the asker
+        // the entire six-second window, since the early exit waits on every
+        // known peer having replied. An empty RESULT is not a claim of
+        // relevance, it is "asked and answered".
         const hits: Hit[] = scored.map((s) => ({
             docId: s.docId,
             score: toWireScore(s.score),
-            title: this.catalog.chunk(s.docId)?.title ?? '',
-            snippet: this.catalog.snippet(s.docId),
-            holderId: this.identity.id,
+            title: s.meta.title,
+            snippet: s.meta.snippet,
+            // Name a node that actually holds the body, which is frequently not
+            // this one. Answering only requires metadata.
+            holderId: s.hasBody ? this.identity.id : this.knownHolder(s.docId),
         }));
 
         this.router.send(
@@ -613,7 +907,15 @@ export class MeshNode {
         const state = this.queries.get(result.queryId);
         if (!state) return; // window already closed, or never ours
 
+        // `answered` closes the collection window and counts every reply,
+        // including the empty ones a node with nothing relevant sends.
+        // `respondedNodeIds` lights a node up on the map, and should only mean
+        // "this node had something" — otherwise every node flashes on every
+        // query and the map stops distinguishing anything.
         if (!state.answered.includes(pkt.srcId)) state.answered.push(pkt.srcId);
+        if (result.hits.length && !state.respondedNodeIds.includes(pkt.srcId)) {
+            state.respondedNodeIds.push(pkt.srcId);
+        }
         const peer = this.peers.get(pkt.srcId);
         const hops = hopsTravelled(pkt);
 
@@ -621,10 +923,11 @@ export class MeshNode {
             const existing = state.hits.find((h) => h.docId === hit.docId);
             const score = fromWireScore(hit.score);
             if (existing) {
-                // The same passage can come back from several nodes. Keep the best
-                // score, and prefer the shortest path for the fetch that may follow.
+                // The same passage can come back from several nodes. Keep the
+                // best score, and prefer the shortest path for the fetch that
+                // may follow.
                 if (score > existing.score) existing.score = score;
-                if (hops < existing.hops) {
+                if (hops < existing.hops && !existing.storedHere) {
                     existing.hops = hops;
                     existing.holderId = hit.holderId || pkt.srcId;
                     existing.holderName = this.nameOf(existing.holderId);
@@ -648,22 +951,24 @@ export class MeshNode {
         }
 
         state.hits.sort((a, b) => b.score - a.score);
-        this.emit('query', { ...state, hits: [...state.hits] });
+        this.emit('query', snapshot(state));
     }
 
-    private onDocReq(pkt: Packet): void {
+    private async onDocReq(pkt: Packet): Promise<void> {
         const { docId } = decodeDocReq(pkt.payload);
-        const chunk = this.catalog.chunk(docId);
+        const meta = this.catalog.getMeta(docId);
+        const text = await this.catalog.getBody(docId);
         this.router.send(
             PacketType.DOC_RES,
             encodeDocRes({
                 docId,
-                title: chunk?.title ?? '',
-                section: chunk?.section ?? '',
-                // An empty body is a real answer: "I was named as a holder and I am
-                // not one". Silence would leave the asker waiting out the full timeout.
-                text: chunk?.text ?? '',
-                source: chunk?.source ?? '',
+                title: meta?.title ?? '',
+                section: meta?.section ?? '',
+                // An empty body is a real answer: "I was named as a holder and I
+                // am not one". Silence would leave the asker waiting out the
+                // full timeout for information it could have had at once.
+                text: text ?? '',
+                source: this.catalog.docRow(meta?.docKey ?? 0)?.source ?? '',
             }),
             pkt.srcId,
         );
@@ -675,61 +980,110 @@ export class MeshNode {
     }
 
     /**
-     * A peer gossiped chunk metadata. Pull the body for anything not already
-     * held — this node's half of flood-and-pull replication.
+     * A peer gossiped chunk metadata.
+     *
+     * Handing it straight to the replicator is the whole change from the
+     * previous build, which pulled every body it heard about immediately and
+     * kept it forever. Now the metadata is kept if this node ranks as a carrier
+     * for it, and the *body* is a separate decision made on the next reconcile
+     * pass against how many live copies exist, how popular the chunk is, how
+     * reliable the alternatives are, and whether there is room.
      */
     private async onAnnounce(pkt: Packet): Promise<void> {
         const payload = decodeAnnounce(pkt.payload);
-        const missing = payload.entries.filter((e) => !this.catalog.chunk(e.docId));
-        if (!missing.length) return;
 
-        let pulled = 0;
-        for (const entry of missing) {
-            const reply = await this.requestDoc(entry.docId, pkt.srcId);
-            if (!reply?.text) continue;
-            const wrote = await this.catalog.ingestRemote({
-                docId: entry.docId,
-                docKey: payload.docKey,
-                seq: entry.seq,
-                title: payload.title,
-                section: entry.section,
-                source: reply.source || payload.source,
-                text: reply.text,
-            });
-            if (wrote) pulled++;
+        // Project the holder claims into the synchronous lookup the query path
+        // uses. The authoritative copy goes to SQLite inside the replicator;
+        // this is the same information in a form `onQuery` can read without
+        // awaiting, and being slightly stale only ever costs a DOC_REQ to a
+        // node that answers "not me".
+        for (const entry of payload.entries) {
+            for (const holder of entry.holders) {
+                if (holder !== this.identity.id) this.holderHints.set(entry.docId, holder);
+            }
         }
 
-        if (pulled) {
-            await this.catalog.reload();
+        const added = await this.replicator.onAnnounce(payload, pkt.srcId);
+        if (added) {
             this.emit('catalog', this.catalog.stats());
-            this.note('recv', `pulled ${pulled} passage(s) of "${payload.title}"`);
+            this.note({
+                kind: 'received',
+                type: name(pkt.type),
+                srcId: pkt.srcId,
+                dstId: this.identity.id,
+                peer: peerIdOf(pkt.srcId),
+                detail: `learned ${added} passage(s) of "${payload.title}"`,
+            });
         }
     }
 
     /**
-     * Answers a newly-met peer's catalog sync request with the uploads and
-     * mesh-replicated documents held here.
+     * A peer said what it holds.
      *
-     * Deliberately excludes the seed corpus: `bootstrap.ts` splits it across
-     * nodes on purpose, so a search sometimes has to reach the mesh instead of
-     * answering from local storage alone — the point of the demo. Syncing it
-     * here too would converge every node to the full corpus on first contact
-     * and erase that. Real content — what a person actually uploaded, or what
-     * arrived from a peer — has no such reason to stay partial; that is what
-     * this catch-up is for.
-     *
-     * No delta tracking either — `sinceSec` is accepted for wire compatibility
-     * but ignored, since this node only ever sends a full dump once per peer
-     * (`syncedPeers` on the requester's side), not a re-sync on a timer.
+     * The same holder hints the query path reads are updated here as well as in
+     * the replicator's store, because this is now the packet that carries them
+     * most of the time — a full ANNOUNCE is comparatively rare.
      */
+    private async onHolders(pkt: Packet): Promise<void> {
+        const payload = decodeHolders(pkt.payload);
+        for (const entry of payload.entries) {
+            for (const holder of entry.holders) {
+                if (holder !== this.identity.id) this.holderHints.set(entry.docId, holder);
+            }
+        }
+        await this.replicator.onHolders(payload, pkt.srcId);
+    }
+
     private async onCatalogReq(pkt: Packet): Promise<void> {
         const req = decodeCatalogReq(pkt.payload);
-        let sent = 0;
-        for (const doc of this.catalog.documents()) {
-            if (doc.provenance === 'seed') continue;
-            if (sent >= req.max) break;
-            sent += await this.announce(doc.docKey, pkt.srcId, PacketType.CATALOG_RES);
-        }
+        await this.replicator.serveCatalogRequest(req.sinceSec, pkt.srcId, req.max);
+    }
+
+    /**
+     * Answers "prove you are who you say you are".
+     *
+     * A node with no credentials stays silent rather than sending an empty
+     * signature: an unanswered challenge reads as "unverified", which is true,
+     * where a malformed answer would read as "failed", which is an accusation.
+     */
+    private onIdentReq(pkt: Packet): void {
+        if (!this.credentials) return;
+        const { nonce } = decodeIdentReq(pkt.payload);
+        const message = identChallengeBytes(nonce, this.identity.id, this.identity.name);
+        this.router.send(
+            PacketType.IDENT_RES,
+            encodeIdentRes({
+                pubKey: this.credentials.publicKey,
+                name: this.identity.name,
+                nonce,
+                sig: this.credentials.sign(message),
+            }),
+            pkt.srcId,
+        );
+    }
+
+    private async onIdentRes(pkt: Packet): Promise<void> {
+        const res = decodeIdentRes(pkt.payload);
+        const pending = this.challenges.get(pkt.srcId);
+        this.challenges.delete(pkt.srcId);
+
+        const verdict = judge({
+            res,
+            srcId: pkt.srcId,
+            expectedNonce: pending?.nonce ?? null,
+            known: this.identities.get(pkt.srcId) ?? null,
+            now: Date.now(),
+        });
+        await this.setIdentity(verdict);
+
+        this.note({
+            kind: verdict.state === 'failed' || verdict.state === 'mismatch' ? 'dropped' : 'received',
+            type: 'IDENT_RES',
+            srcId: pkt.srcId,
+            dstId: this.identity.id,
+            peer: peerIdOf(pkt.srcId),
+            detail: `${verdict.name}: ${verdict.detail}`,
+        });
     }
 
     /* ------------------------- store and forward --------------------- */
@@ -744,7 +1098,15 @@ export class MeshNode {
     private async park(pkt: Packet, dstId: number): Promise<void> {
         await this.catalog.enqueue(dstId, toBase64(encodePacket(pkt)), OUTBOX_TTL_MS);
         this.queued = await this.catalog.queuedCount();
-        this.note('drop', `${name(pkt.type)} for ${hex(dstId)} parked`);
+        this.note({
+            kind: 'dropped',
+            type: name(pkt.type),
+            srcId: pkt.srcId,
+            dstId,
+            peer: 'local',
+            reason: 'no-route',
+            detail: 'parked for later',
+        });
         this.emitStats();
     }
 
@@ -762,7 +1124,16 @@ export class MeshNode {
                 delivered++;
             }
         }
-        if (delivered) this.note('sent', `${delivered} parked packet(s) delivered`);
+        if (delivered) {
+            this.note({
+                kind: 'sent',
+                type: 'OUTBOX',
+                srcId: this.identity.id,
+                dstId: dstId ?? 0,
+                peer: dstId === undefined ? 'flood' : peerIdOf(dstId),
+                detail: `${delivered} parked packet(s) delivered`,
+            });
+        }
         this.queued = await this.catalog.queuedCount();
         this.emitStats();
     }
@@ -771,19 +1142,27 @@ export class MeshNode {
 
     private sendHello(): void {
         const stats = this.catalog.stats();
-        // The first beacon always floods, so a node that has just joined is known
-        // across the mesh immediately rather than after up to nine seconds.
+        const free = Math.max(
+            0,
+            this.catalog.budget - stats.metaBytes - stats.bodyBytes,
+        );
+        // The first beacon always floods, so a node that has just joined is
+        // known across the mesh immediately rather than after up to nine
+        // seconds.
         const flood = this.helloCount % FLOOD_HELLO_EVERY === 0;
         this.helloCount++;
 
         this.router.send(
             PacketType.HELLO,
             encodeHello({
-                caps: 0b10,
-                known: stats.chunks,
-                stored: stats.chunks,
+                caps: (this.hasLlm ? 0b01 : 0) | 0b10,
+                known: stats.known,
+                stored: stats.stored,
                 documents: stats.documents,
-                freeKb: 0,
+                // Self-reported, and that is fine: capacity is the one signal a
+                // node is the only authority on. Reliability deliberately is
+                // not here — every node measures that itself.
+                freeKb: Math.floor(free / 1024),
                 name: this.identity.name,
             }),
             BROADCAST,
@@ -803,9 +1182,30 @@ export class MeshNode {
                 // otherwise marked "synced" forever and never retried, even
                 // after it reconnects.
                 this.syncedPeers.delete(id);
-                this.note('drop', `${peer.name} went quiet`);
+                this.note({
+                    kind: 'dropped',
+                    type: 'HELLO',
+                    srcId: id,
+                    dstId: this.identity.id,
+                    peer: peerIdOf(id),
+                    reason: 'link-loss',
+                    detail: `${peer.name} went quiet`,
+                });
                 changed = true;
             }
+        }
+        if (changed) this.emit('peers', this.peerList());
+    }
+
+    /** Refreshes the observed reliability shown against each peer. */
+    async refreshReliability(): Promise<void> {
+        const rows = await this.replicator.peerReliability();
+        let changed = false;
+        for (const row of rows) {
+            const peer = this.peers.get(row.nodeId);
+            if (!peer || peer.reliability === row.reliability) continue;
+            this.peers.set(row.nodeId, { ...peer, reliability: row.reliability });
+            changed = true;
         }
         if (changed) this.emit('peers', this.peerList());
     }
@@ -824,14 +1224,49 @@ export class MeshNode {
         return this.activity;
     }
 
+    /**
+     * A live peer believed to hold this body, or 0.
+     *
+     * Deliberately filtered to peers that are reachable right now: naming a
+     * holder that has gone dark sends the asker off to fetch from nobody, and
+     * "I do not know who has it" is a more useful answer than a stale one.
+     */
+    private knownHolder(docId: number): number {
+        const claim = this.holderHints.get(docId);
+        if (claim === undefined) return 0;
+        return this.peers.has(claim) ? claim : 0;
+    }
+
     private nameOf(nodeId: number): string {
         if (!nodeId) return '';
         if (nodeId === this.identity.id) return this.identity.name;
         return this.peers.get(nodeId)?.name ?? hex(nodeId);
     }
 
-    private note(kind: ActivityEvent['kind'], label: string): void {
-        this.activity.push({ at: Date.now(), kind, label });
+    /**
+     * Maps a transport peer id back to the node behind it.
+     *
+     * The route table is the authority — it is built from packets that actually
+     * arrived — and the hex fallback covers the window before a node's first
+     * beacon has taught us a route, since the BLE transport names links by the
+     * unsigned hex of the node id.
+     */
+    private nodeIdOfPeer(peerId: string): number {
+        if (peerId === 'flood' || peerId === 'local') return 0;
+        for (const [nodeId, entry] of this.router.getRoutes()) {
+            if (entry.peerId === peerId) return nodeId;
+        }
+        const parsed = parseInt(peerId, 16);
+        return Number.isFinite(parsed) ? parsed >>> 0 : 0;
+    }
+
+    private note(event: Omit<ActivityEvent, 'at' | 'seq' | 'peerNodeId'>): void {
+        this.activity.push({
+            seq: ++this.activitySeq,
+            at: Date.now(),
+            peerNodeId: this.nodeIdOfPeer(event.peer),
+            ...event,
+        });
         if (this.activity.length > ACTIVITY_CAPACITY) {
             this.activity.splice(0, this.activity.length - ACTIVITY_CAPACITY);
         }
@@ -840,6 +1275,7 @@ export class MeshNode {
 
     private emitStats(): void {
         this.emit('stats', { ...this.router.stats, queued: this.queued });
+        this.emit('outbox', this.queued);
     }
 
     private emit<K extends keyof Events>(event: K, ...args: Parameters<Events[K]>): void {
@@ -847,8 +1283,28 @@ export class MeshNode {
     }
 }
 
+/** Re-exported so callers have one import site for "a node and what it needs". */
+export type { MeshCatalog };
+
+/** A copy deep enough that React sees a change without sharing mutable state. */
+function snapshot(state: QueryState): QueryState {
+    return { ...state, hits: state.hits.map((h) => ({ ...h })) };
+}
+
 function name(type: number): string {
     return PACKET_TYPE_NAME[type] ?? `type ${type}`;
+}
+
+/**
+ * A node id in the form the transports use for link ids.
+ *
+ * Events that name a peer must all name it the same way, whether the name came
+ * from the router (which knows links) or from a packet header (which knows
+ * nodes). Without this the wire log shows the same phone under two different
+ * labels depending on which side of the exchange produced the line.
+ */
+function peerIdOf(nodeId: number): string {
+    return (nodeId >>> 0).toString(16).padStart(8, '0');
 }
 
 /**
@@ -860,8 +1316,4 @@ function name(type: number): string {
  */
 function hex(nodeId: number): string {
     return `#${(nodeId & 0xffff).toString(16).padStart(4, '0')}`;
-}
-
-function short(peerId: string): string {
-    return `#${peerId.slice(0, 4)}`;
 }

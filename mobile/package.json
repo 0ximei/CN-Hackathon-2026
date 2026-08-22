@@ -1,36 +1,40 @@
 {
-    "name": "meshnet-mobile",
-    "version": "0.1.0",
-    "private": true,
-    "main": "index.js",
-    "scripts": {
-        "android": "npm run bundle:corpus && expo run:android",
-        "prebuild": "npm run bundle:corpus && expo prebuild --platform android --clean",
-        "start": "expo start --dev-client",
-        "bundle:corpus": "node scripts/bundle-corpus.mjs",
-        "typecheck": "tsc --noEmit",
-        "fix-deps": "expo install --fix",
-        "ios": "expo run:ios"
-    },
-    "dependencies": {
-        "expo": "~54.0.0",
-        "expo-build-properties": "~1.0.0",
-        "expo-dev-client": "~6.0.0",
-        "expo-document-picker": "~14.0.0",
-        "expo-sqlite": "~16.0.0",
-        "expo-status-bar": "~3.0.0",
-        "react": "19.1.0",
-        "react-native": "0.81.5",
-        "react-native-safe-area-context": "~5.6.0"
-    },
-    "devDependencies": {
-        "@types/react": "~19.1.0",
-        "babel-preset-expo": "~54.0.10",
-        "typescript": "~5.9.2"
-    },
-    "expo": {
-        "autolinking": {
-            "nativeModulesDir": "./modules"
-        }
+  "name": "meshnet-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "android": "npm run bundle:corpus && expo run:android",
+    "prebuild": "npm run bundle:corpus && expo prebuild --platform android --clean",
+    "start": "expo start --dev-client",
+    "bundle:corpus": "node scripts/bundle-corpus.mjs",
+    "typecheck": "tsc --noEmit",
+    "fix-deps": "expo install --fix",
+    "ios": "expo run:ios"
+  },
+  "dependencies": {
+    "@expo/vector-icons": "^15.0.3",
+    "@noble/curves": "^2.3.0",
+    "expo": "~54.0.0",
+    "expo-build-properties": "~1.0.0",
+    "expo-crypto": "~15.0.9",
+    "expo-dev-client": "~6.0.0",
+    "expo-document-picker": "~14.0.0",
+    "expo-font": "~14.0.12",
+    "expo-sqlite": "~16.0.0",
+    "expo-status-bar": "~3.0.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-safe-area-context": "~5.6.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.0",
+    "babel-preset-expo": "~54.0.10",
+    "typescript": "~5.9.2"
+  },
+  "expo": {
+    "autolinking": {
+      "nativeModulesDir": "./modules"
     }
+  }
 }
