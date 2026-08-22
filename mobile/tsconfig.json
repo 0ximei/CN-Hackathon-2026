@@ -1,17 +1,12 @@
 {
   "compilerOptions": {
-    // Deliberately not `"extends": "expo/tsconfig.base"`.
-    //
-    // These options are read by anything that touches a file under this
-    // directory, including the root Vitest run that exercises the shared
-    // protocol layer. Extending a package would make `npm test` at the repo
-    // root fail until `npm install` had been run *here* as well, which is a
-    // confusing failure for a change that never touched the mobile app. The
-    // values below are what expo's base sets.
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["DOM", "ESNext"],
+    "lib": [
+      "DOM",
+      "ESNext"
+    ],
     "jsx": "react-jsx",
     "strict": true,
     "allowJs": true,
@@ -23,9 +18,20 @@
     "noEmit": true,
     "baseUrl": ".",
     "paths": {
-      "@core/*": ["../src/*"]
+      "@core/*": [
+        "../src/*"
+      ]
     }
   },
-  "include": ["**/*.ts", "**/*.tsx", "../src/**/*.ts"],
-  "exclude": ["node_modules", "android", "ios"]
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    "../src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "android",
+    "ios"
+  ],
+  "extends": "expo/tsconfig.base"
 }

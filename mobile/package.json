@@ -9,7 +9,8 @@
     "start": "expo start --dev-client",
     "bundle:corpus": "node scripts/bundle-corpus.mjs",
     "typecheck": "tsc --noEmit",
-    "fix-deps": "expo install --fix"
+    "fix-deps": "expo install --fix",
+    "ios": "expo run:ios"
   },
   "dependencies": {
     "expo": "~54.0.0",
@@ -23,6 +24,7 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
+    "babel-preset-expo": "~54.0.10",
     "typescript": "~5.9.2"
   },
   "expo": {
