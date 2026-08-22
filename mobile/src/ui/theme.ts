@@ -1,16 +1,21 @@
 export const theme = {
-  bg: '#0b0f14',
-  panel: '#131a23',
-  panelAlt: '#18212c',
-  border: '#233040',
-  text: '#e6edf5',
-  dim: '#8fa3ba',
-  faint: '#5b6c80',
-  accent: '#4ade80',
-  accentDim: '#166534',
+  bg: '#0b0815',
+  panel: '#1a1430',
+  panelAlt: '#241c40',
+  border: '#453a75',
+  text: '#f8f6fd',
+  dim: '#c0b2e8',
+  faint: '#8d7fb8',
+  // A deeper, more saturated violet than a typical pastel "AI product"
+  // purple — meant to read as deliberate, not a generated theme.
+  accent: '#9061f9',
+  accentDim: '#3d2d75',
+  // Warn and danger stay universal reds/ambers on purpose — this is the one
+  // place a disaster app shouldn't chase brand consistency over instant
+  // at-a-glance recognition.
   warn: '#fbbf24',
   danger: '#f87171',
-  link: '#60a5fa',
+  link: '#7c86f5',
   mono: 'monospace' as const,
 };
 

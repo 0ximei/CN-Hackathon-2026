@@ -1,5 +1,6 @@
-import React, { useMemo, useState } from 'react';
-import { ActivityIndicator, FlatList, Pressable, Text, TextInput, View } from 'react-native';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Animated, Easing, FlatList, Pressable, Text, TextInput, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 
 import type { useMesh } from '../useMesh';
 import { styles } from './styles';
@@ -42,42 +43,52 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
 
   return (
     <View style={{ flex: 1 }}>
-      <View style={styles.searchBar}>
-        <TextInput
-          value={text}
-          onChangeText={setText}
-          placeholder="how do I treat a burn"
-          placeholderTextColor={theme.faint}
-          style={styles.input}
-          returnKeyType="search"
-          onSubmitEditing={() => void mesh.search(text)}
-        />
-        <Pressable
-          onPress={() => void mesh.search(text)}
-          disabled={mesh.searching || !text.trim()}
-          style={[styles.button, (mesh.searching || !text.trim()) && styles.buttonBusy]}
-        >
-          {mesh.searching ? (
-            <ActivityIndicator color={theme.bg} size="small" />
-          ) : (
-            <Text style={styles.buttonText}>ASK</Text>
-          )}
-        </Pressable>
-      </View>
+      <View style={{ paddingHorizontal: 16, paddingTop: 10, paddingBottom: 12, gap: 12 }}>
+        <Text style={styles.heroLede}>You&rsquo;re offline — but not without help.</Text>
 
-      <View style={[styles.chipRow, { paddingHorizontal: 12, marginTop: 0, marginBottom: 6 }]}>
-        {EXAMPLES.map((ex) => (
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <TextInput
+            value={text}
+            onChangeText={setText}
+            placeholder="how do I treat a burn"
+            placeholderTextColor={theme.faint}
+            style={styles.input}
+            returnKeyType="search"
+            onSubmitEditing={() => void mesh.search(text)}
+          />
           <Pressable
-            key={ex}
-            onPress={() => ask(ex)}
-            disabled={mesh.searching}
-            style={styles.chip}
+            onPress={() => void mesh.search(text)}
+            disabled={mesh.searching || !text.trim()}
+            style={[
+              styles.button,
+              (mesh.searching || !text.trim()) && styles.buttonBusy,
+              { paddingVertical: 13 },
+            ]}
           >
-            <Text style={styles.chipText} numberOfLines={1}>
-              {ex}
-            </Text>
+            {mesh.searching ? (
+              <PulseIcon>
+                <Ionicons name="search-outline" size={18} color={theme.dim} />
+              </PulseIcon>
+            ) : (
+              <Ionicons name="search-outline" size={18} color={theme.bg} />
+            )}
           </Pressable>
-        ))}
+        </View>
+
+        <View style={[styles.chipRow, { marginTop: 0 }]}>
+          {EXAMPLES.map((ex) => (
+            <Pressable
+              key={ex}
+              onPress={() => ask(ex)}
+              disabled={mesh.searching}
+              style={styles.chip}
+            >
+              <Text style={styles.chipText} numberOfLines={1}>
+                {ex}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
       </View>
 
       {!!summary && <Text style={styles.summary}>{summary}</Text>}
@@ -85,7 +96,7 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
       <FlatList
         data={hits}
         keyExtractor={(h) => String(h.docId)}
-        contentContainerStyle={styles.listPad}
+        contentContainerStyle={[styles.listPad, { paddingHorizontal: 16 }]}
         ListHeaderComponent={<AnswerCard mesh={mesh} />}
         renderItem={({ item }) => (
           <HitRow hit={item} onOpen={() => mesh.openHit(item.docId)} />
@@ -104,6 +115,62 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
   );
 }
 
+/** Gentle breathing scale, for anything that should read as "working on it." */
+function PulseIcon({ children }: { children: React.ReactNode }) {
+  const scale = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(scale, {
+          toValue: 1.2,
+          duration: 650,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(scale, {
+          toValue: 1,
+          duration: 650,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [scale]);
+
+  return <Animated.View style={{ transform: [{ scale }] }}>{children}</Animated.View>;
+}
+
+type Mode = 'extractive' | 'generating' | 'generated';
+
+/**
+ * What produced the text on screen, made visible rather than just labelled.
+ *
+ * Both kinds of answer come from the mesh — that part is never in question, so
+ * the badge doesn't say it. What actually varies, and what changes how much to
+ * trust the words on screen, is *how* the answer was produced: a magnifying
+ * glass for verbatim sentences lifted out of retrieved passages, versus
+ * sparkles for a model's own paraphrase of them.
+ */
+function ModeBadge({ mode }: { mode: Mode }) {
+  const config: Record<Mode, { icon: React.ComponentProps<typeof Ionicons>['name']; label: string; color: string; bg: string }> = {
+    extractive: { icon: 'search-outline', label: 'verbatim passages', color: theme.link, bg: 'rgba(124,134,245,0.16)' },
+    generating: { icon: 'sparkles', label: 'thinking…', color: theme.accent, bg: theme.accentDim },
+    generated: { icon: 'sparkles', label: 'AI-written', color: theme.accent, bg: theme.accentDim },
+  };
+  const { icon, label, color, bg } = config[mode];
+  const iconEl = <Ionicons name={icon} size={13} color={color} />;
+
+  return (
+    <View style={[styles.modeBadge, { backgroundColor: bg }]}>
+      {mode === 'generating' ? <PulseIcon>{iconEl}</PulseIcon> : iconEl}
+      <Text style={[styles.modeBadgeText, { color }]}>{label}</Text>
+    </View>
+  );
+}
+
 /**
  * The grounded answer, with its citations and its mode.
  *
@@ -115,10 +182,15 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
 function AnswerCard({ mesh }: { mesh: Mesh }) {
   if (mesh.searching) {
     return (
-      <View style={styles.card}>
-        <View style={styles.hitTop}>
+      <View style={[styles.card, { marginBottom: 10 }]}>
+        <View style={[styles.hitTop, { marginBottom: 8 }]}>
           <Text style={styles.cardTitle}>Answer</Text>
-          <Text style={styles.hitBadge}>flooding query</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <PulseIcon>
+              <Ionicons name="search-outline" size={14} color={theme.dim} />
+            </PulseIcon>
+            <Text style={styles.hitBadge}>flooding query</Text>
+          </View>
         </View>
         <Text style={styles.cardBody}>
           Waiting on the mesh — replies are collected until every known peer has answered, or six
@@ -131,18 +203,15 @@ function AnswerCard({ mesh }: { mesh: Mesh }) {
   const text = mesh.answerText || mesh.answer?.text;
   if (!text) return null;
 
+  const mode: Mode =
+    mesh.answer?.mode === 'generated' ? 'generated' : mesh.answering ? 'generating' : 'extractive';
+
   return (
-    <View style={{ gap: 10 }}>
-      <View style={styles.card}>
-        <View style={styles.hitTop}>
+    <View style={{ gap: 10, marginBottom: 10 }}>
+      <View style={[styles.card, mode !== 'extractive' && styles.cardAccent]}>
+        <View style={[styles.hitTop, { marginBottom: 8 }]}>
           <Text style={styles.cardTitle}>Answer</Text>
-          <Text style={styles.hitBadge}>
-            {mesh.answer?.mode === 'generated'
-              ? 'on-device LLM'
-              : mesh.answering
-                ? 'generating'
-                : 'extractive'}
-          </Text>
+          <ModeBadge mode={mode} />
         </View>
         <Text style={styles.cardBody}>{text}</Text>
 

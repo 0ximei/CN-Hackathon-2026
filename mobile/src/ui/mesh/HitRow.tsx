@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 
 import type { MeshHit } from '../../mesh/MeshNode';
 import { styles } from './styles';
+import { theme } from '../theme';
 
 /**
  * One retrieved passage.
@@ -45,7 +47,10 @@ export function HitRow({ hit, onOpen }: { hit: MeshHit; onOpen: () => void }) {
         <Text style={styles.hitTitle} numberOfLines={1}>
           {hit.section || hit.title || 'Untitled'}
         </Text>
-        <Text style={styles.hitScore}>{hit.score.toFixed(2)}</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3 }}>
+          <Ionicons name="stats-chart-outline" size={11} color={theme.accent} />
+          <Text style={styles.hitScore}>{hit.score.toFixed(2)}</Text>
+        </View>
       </View>
       <Text style={styles.hitBadge}>
         {origin} ▸ {tier}
