@@ -77,10 +77,20 @@ export function MeshGraph({
     const [flights, setFlights] = useState<Flight[]>([]);
     const flightKey = useRef(0);
     /** Highest event sequence already drawn. See ActivityEvent.seq. */
-    const drawnUpTo = useRef(0);
+    const drawnUpTo = useRef(-1);
 
     // Turn router events into flights along the edges they actually traversed.
     useEffect(() => {
+        // The tabs mount one at a time, so arriving here means up to two hundred
+        // events have accumulated while the map was not on screen. Replaying
+        // them would animate several minutes of history in one frame; the map
+        // shows traffic as it happens, so the backlog is skipped and only what
+        // arrives from now on is drawn.
+        if (drawnUpTo.current < 0) {
+            drawnUpTo.current = activity[activity.length - 1]?.seq ?? 0;
+            return;
+        }
+
         const fresh = activity.filter((ev) => ev.seq > drawnUpTo.current);
         if (!fresh.length) return;
         drawnUpTo.current = activity[activity.length - 1]?.seq ?? drawnUpTo.current;

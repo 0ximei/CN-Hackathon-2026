@@ -10,7 +10,9 @@
     "bundle:corpus": "node scripts/bundle-corpus.mjs",
     "typecheck": "tsc --noEmit",
     "fix-deps": "expo install --fix",
-    "ios": "expo run:ios"
+    "ios": "expo run:ios",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
@@ -30,7 +32,8 @@
   "devDependencies": {
     "@types/react": "~19.1.0",
     "babel-preset-expo": "~54.0.10",
-    "typescript": "~5.9.2"
+    "typescript": "~5.9.2",
+    "vitest": "^3.2.4"
   },
   "expo": {
     "autolinking": {

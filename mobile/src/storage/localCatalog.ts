@@ -20,6 +20,7 @@ import {
 } from '../search/relevance';
 import { fromBase64, toBase64 } from '../lib/base64';
 import { openDatabase } from './schema';
+import { serializer } from './serialize';
 import {
     SNIPPET_CHARS,
     metaBytesOf,
@@ -325,6 +326,22 @@ export class LocalCatalog {
      * split visible from the first launch rather than only after replication
      * has had time to run.
      */
+    /**
+     * Every transaction on this connection, one at a time.
+     *
+     * An upload, a replication pull, an eviction pass, an incoming ANNOUNCE, a
+     * query's popularity write and a peer's beacon statistics are six
+     * independent async paths driven by three different clocks, and on a busy
+     * node they overlap constantly. `withTransactionAsync` cannot survive that
+     * — `serialize.ts` documents exactly how it fails, and why the failure
+     * loses data rather than merely erroring.
+     */
+    private readonly runSerially = serializer();
+
+    private transact(work: () => Promise<void>): Promise<void> {
+        return this.runSerially(() => this.db.withTransactionAsync(work));
+    }
+
     async ingestParsed(
         parsed: ParsedDoc,
         originId: number,
@@ -378,7 +395,7 @@ export class LocalCatalog {
             provenance,
         };
 
-        await this.db.withTransactionAsync(async () => {
+        await this.transact(async () => {
             await this.writeDoc(doc);
             for (const meta of metas) await this.writeMeta(meta);
             for (const b of bodies) await this.writeBody(b);
@@ -411,7 +428,7 @@ export class LocalCatalog {
         const newDoc = doc && !this.docsByKey.has(doc.docKey) ? doc : null;
         if (!fresh.length && !newDoc) return 0;
 
-        await this.db.withTransactionAsync(async () => {
+        await this.transact(async () => {
             if (newDoc) await this.writeDoc(newDoc);
             for (const meta of fresh) await this.writeMeta(meta);
         });
@@ -476,7 +493,7 @@ export class LocalCatalog {
         const ids = docIds.filter((id) => this.metaById.has(id));
         if (!ids.length) return 0;
         const docKeys = new Set(ids.map((id) => this.metaById.get(id)!.docKey));
-        await this.db.withTransactionAsync(async () => {
+        await this.transact(async () => {
             const list = holes(ids.length);
             await this.db.runAsync(`DELETE FROM meta WHERE docId IN (${list})`, ids);
             await this.db.runAsync(`DELETE FROM bodies WHERE docId IN (${list})`, ids);
@@ -505,7 +522,7 @@ export class LocalCatalog {
         const ids = this.metas()
             .filter((m) => m.docKey === docKey)
             .map((m) => m.docId);
-        await this.db.withTransactionAsync(async () => {
+        await this.transact(async () => {
             await this.db.runAsync('DELETE FROM docs WHERE docKey = ?', [docKey]);
             if (ids.length) {
                 const list = holes(ids.length);
@@ -560,7 +577,7 @@ export class LocalCatalog {
 
     async putHolders(rows: HolderRow[]): Promise<void> {
         if (!rows.length) return;
-        await this.db.withTransactionAsync(async () => {
+        await this.transact(async () => {
             for (const r of rows) {
                 await this.db.runAsync(
                     'INSERT OR REPLACE INTO holders (docId, nodeId, seenAt) VALUES (?, ?, ?)',
@@ -598,7 +615,7 @@ export class LocalCatalog {
     async bumpPop(docIds: number[], selfId: number): Promise<void> {
         if (!docIds.length) return;
         const now = Date.now();
-        await this.db.withTransactionAsync(async () => {
+        await this.transact(async () => {
             for (const docId of docIds) {
                 await this.db.runAsync(
                     `INSERT INTO pop (docId, nodeId, hits, updatedAt) VALUES (?, ?, 1, ?)
@@ -638,7 +655,7 @@ export class LocalCatalog {
 
     async putPeerStats(rows: PeerStatRow[]): Promise<void> {
         if (!rows.length) return;
-        await this.db.withTransactionAsync(async () => {
+        await this.transact(async () => {
             for (const r of rows) {
                 await this.db.runAsync(
                     `INSERT OR REPLACE INTO peerStats

@@ -2,33 +2,29 @@ const path = require('path');
 const { getDefaultConfig } = require('expo/metro-config');
 
 /**
- * The mesh protocol is shared with the web app rather than forked.
+ * This project resolves everything inside itself.
  *
- * `../src/protocol` (packet codec, MTU framing, flooding router) and
- * `../src/replication/policy` are pure TypeScript with no DOM or Node
- * dependency, and they carry the test suite that proves the routing
- * invariants. Copying them here would mean two codecs drifting apart until a
- * phone and a browser could no longer read each other's packets — which is
- * exactly the interoperability this project is about. So Metro is pointed at
- * the sibling directory instead, and `@core/*` resolves into it.
+ * `@core/*` is the radio-agnostic half of the mesh — the packet codec, MTU
+ * framing, the flooding router, the store-and-forward queue, the replication
+ * policy, BM25 and the vector helpers. It used to resolve into the sibling web
+ * app so a single copy served both builds. That coupling meant this app could
+ * not be built, tested or checked out without the other one present, and Metro
+ * had to be actively stopped from walking into the web app's `node_modules` and
+ * serving a second copy of React from it.
  *
- * Only the pure modules are imported. Anything touching Dexie, Web Workers or
- * `window` has a native counterpart under `mobile/src/`.
+ * The modules now live under `src/core/` and are plain TypeScript with no DOM,
+ * no Node and no React Native in them — the same code, owned here. The cost is
+ * that the two builds' wire formats can now drift apart; `src/core/protocol`
+ * carries the codec tests that make a drift show up as a failure rather than as
+ * two phones that cannot read each other.
  */
-const workspaceRoot = path.resolve(__dirname, '..');
-const projectRoot = __dirname;
-
-const config = getDefaultConfig(projectRoot);
-
-config.watchFolders = [path.resolve(workspaceRoot, 'src')];
+const config = getDefaultConfig(__dirname);
 
 config.resolver.extraNodeModules = {
   ...config.resolver.extraNodeModules,
-  '@core': path.resolve(workspaceRoot, 'src'),
+  '@core': path.resolve(__dirname, 'src/core'),
 };
 
-// Keep resolution anchored to this project's node_modules. Without it Metro
-// walks up to the web app's tree and can serve a second copy of React.
-config.resolver.nodeModulesPaths = [path.resolve(projectRoot, 'node_modules')];
+config.resolver.nodeModulesPaths = [path.resolve(__dirname, 'node_modules')];
 
 module.exports = config;

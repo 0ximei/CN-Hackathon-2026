@@ -1,10 +1,5 @@
-import type { MeshHit } from '@core/protocol/MeshNode';
-import {
-    SYSTEM_PROMPT,
-    buildUserPrompt,
-    extractiveAnswer,
-    selectPassages,
-} from '@core/llm/prompt';
+import type { MeshHit } from '../mesh/MeshNode';
+import { extractiveAnswer, selectPassages } from '@core/llm/prompt';
 
 export const MODEL_ID = 'mobile-extractive';
 

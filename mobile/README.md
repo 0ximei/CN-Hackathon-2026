@@ -12,12 +12,21 @@ public API, so every node here **advertises, accepts connections, scans and
 dials out at the same time**. That symmetry is the whole difference between a
 star of client/server links and a mesh — and it is why this app is native.
 
-Everything above the radio is the same code as the web build. The packet codec,
-the flooding router with its TTL and dedup LRU, the backward-learned unicast
-routes, the MTU framing **and the replication policy** are imported from
-`../src` rather than copied, so a change to the protocol cannot leave a phone
-and a browser unable to read each other's packets, and the two cannot converge
-on different replica sets for the same document.
+This project stands on its own. The radio-agnostic half of the mesh — the packet
+codec, the MTU framing, the flooding router with its TTL and dedup LRU, the
+store-and-forward queue, the replication policy, BM25 and the vector helpers —
+lives under [`src/core/`](src/core) and is plain TypeScript with no DOM, no Node
+and no React Native in it. `@core/*` resolves there and nowhere else.
+
+It used to resolve into the sibling web app, on the reasoning that one copy of
+the codec cannot drift. What that actually bought was an app which could not be
+built, tested or checked out without the other project present, and a Metro
+config whose job was to stop the bundler wandering into the web app's
+`node_modules` and serving a second copy of React from it. The copy is the
+lesser problem, and it is a *checked* problem:
+[`src/core/protocol/protocol.test.ts`](src/core/protocol/protocol.test.ts)
+carries the codec round-trips, so a drift between the two builds shows up as a
+failing test rather than as two devices that cannot read each other.
 
 ---
 
@@ -149,7 +158,7 @@ every passage and bodies for about 60% of them**, so a phone that has never met
 another node already reads `knows 43 · stores 26`.
 
 **Replication** runs the same loop the browser does, against the same pure
-functions in [`policy.ts`](../src/replication/policy.ts): weighted rendezvous
+functions in [`policy.ts`](src/core/replication/policy.ts): weighted rendezvous
 hashing for placement, a target driven by popularity and *locally observed*
 reliability, capacity as a self-reported weight, and the invariant that outranks
 all of them — never drop the last live copy of a body. Only the constants differ,
@@ -218,27 +227,83 @@ pass instead of three, eight seconds between passes instead of six.
 ## How the radio works
 
 `modules/ble-mesh/android/…/MeshRadio.kt` is where the interesting parts are.
-Four details separate a BLE demo that works on a bench from one that works in a
-room, and each is commented at the code:
+A handful of details separate a BLE demo that works on a bench from one that
+works in a room, and each is commented at the code:
 
 - **Exactly one link per pair.** Both ends discover each other, so both would
   dial and you would get two links between two phones — double the traffic and
   every flood arriving twice. The lower node id owns the central role and the
   higher one waits, with a nine-second escape hatch in case the call never
   comes. No negotiation is needed: both sides know both ids.
-- **Backoff on a failed dial.** Android's GATT client takes about one
-  connection attempt at a time and punishes a caller that retries in a loop:
-  the follow-ups fail with status 133 and the client interfaces they hold are
-  not reliably returned. Scan results arrive several times a second, so a dial
-  path with no backoff turns one failed connection into an unbounded redial
-  storm — a log full of `dialling …` and a mesh that never links. Each
-  consecutive failure doubles the wait, to a minute; a successful handshake
-  clears the record.
+- **Liveness outranks the tie-break.** That rule decides between two links that
+  both work, and it cannot see the difference between a working link and a dead
+  one. Asked to, it keeps whichever the role says — so a link that stopped
+  carrying anything half a minute ago beats the one the peer just built to
+  replace it, and then beats the next replacement, and the next. Peers rotate
+  their BLE address, so the new link arrives on a MAC the old one never used
+  and none of the address-based guards catch it. Dead rivals are reaped before
+  the tie-break runs, and an advertisement from a node whose link has gone quiet
+  is treated as what it is: proof the peer is powered, in range, and not
+  reaching us on that link.
+- **A connect path built around status 133.** 133 is `GATT_ERROR`, the generic
+  code the Android stack returns for most of its internal refusals, and four of
+  its causes are the caller's to avoid. The scan is paused for the duration of
+  a direct attempt, because an LE scan running during connection establishment
+  is its most common trigger and this one scans at `SCAN_MODE_LOW_LATENCY`.
+  `connectGatt` is issued on the main looper, since the stack binds part of its
+  callback plumbing to the calling thread. And after two failed direct attempts
+  the peer is handed to `autoConnect`, which waits for a device instead of
+  insisting it is there.
+- **Giving a handle back in the order the stack needs.** `disconnect()` starts
+  an asynchronous teardown; `close()` unregisters the client interface
+  immediately. Calling them back to back — the obvious way to write it — pulls
+  the registration out from under a teardown that has not happened yet, so
+  nothing finishes it and nothing reports it. The connection lingers, the next
+  `connectGatt` to that device attaches to the *existing* ACL instead of
+  opening a fresh one, and when the stack finally reaps the orphan a few
+  seconds later it takes the new link with it. That is a link that connects,
+  looks healthy, and dies seconds later for no reason either end can see, over
+  and over — and each round burns one of the small fixed number of client
+  interfaces an app gets, until `connectGatt` fails for every peer and the node
+  goes silent until the process restarts. So: disconnect, wait for the callback
+  that says it happened, *then* close, with a two-second timeout for the
+  callback that never comes. A handle that never connected is only closed —
+  disconnecting that one is what strands it.
+- **Backoff on a failed dial.** The GATT client takes about one attempt at a
+  time and answers a tight retry loop with 133. Scan results arrive several
+  times a second, so a dial path with no backoff turns one failed connection
+  into an unbounded redial storm — a log full of `dialling …` and a mesh that
+  never links. Each consecutive failure doubles the wait, to a minute; a
+  successful handshake clears the record. Scan restarts are rate-limited for
+  the same reason: Android silently stops reporting results to an app that
+  calls `startScan` more than five times in thirty seconds.
+- **An airtime budget.** One radio has to advertise, scan, and service every
+  live connection, and `SCAN_MODE_LOW_LATENCY` is a 100% duty cycle — the
+  controller scans in every interval and keeps nothing back. That is the right
+  setting for an empty room and fatal once a link exists: the connection events
+  lose to the scan, get missed, and the link dies on its supervision timeout a
+  few seconds after coming up, looking for all the world like the peer hung up.
+  So a node with no links hunts hard, and a node that has found the mesh backs
+  both the scan and the advertiser off to a duty cycle that leaves room to keep
+  what it has. Finding *more* peers is slower; a peer found over a link that
+  then drops was worth nothing anyway.
+- **Deadlines on everything the stack owes us.** Android does not always
+  deliver a completion callback, and a link whose last write never completed
+  stays subscribed, stays in the peer list, and never moves another byte —
+  quieter and harder to spot than a disconnect. The tick tears down a link with
+  a segment outstanding for twelve seconds, one that has heard nothing at all
+  for fifty, and one that subscribed but never said who it is. A link that has
+  gone quiet for twenty seconds gets a HELLO first, since a half-open
+  connection only reveals itself when you try to use it.
 - **Flow control.** `writeCharacteristic` and `notifyCharacteristicChanged`
   fail while the connection is congested and silently discard what you gave
   them. The classic Android BLE bug is to loop over your data, watch every call
   return, and lose most of it. Every link here has a queue drained by the
-  completion callback and never faster.
+  completion callback and never faster. Congestion is not failure: refusals are
+  retried for six seconds before the link is given up, which sounds long until
+  you watch two nodes trade catalogues five seconds after meeting — tens of
+  kilobytes into one link in a single tick, both directions at once, while both
+  radios are still advertising and scanning.
 - **Segmentation against the negotiated MTU**, not a guess. Each link asks for
   517 bytes, gets what the peer allows, and frames are cut to fit with a
   one-byte header carrying a sequence number — not for ordering, which GATT
@@ -321,15 +386,16 @@ embedders will route packets happily and return nonsense.
 
 ## Testing
 
-The portable half runs under the repo root's Vitest — the mesh, the replication
-loop, the identity layer, and the shared protocol:
+Everything that does not need a radio or a real SQLite runs under this
+project's own Vitest — the protocol, the mesh, the replication loop, the
+identity layer and the storage helpers:
 
 ```bash
 npm test
 ```
 
-121 tests. Alongside the web build's packet round-trips, framing, routing
-invariants and replication policy, the mobile half covers:
+127 tests. Alongside the packet round-trips, framing, routing invariants and
+replication policy in `src/core`, this build covers:
 
 - a three-node simulated mesh where a passage held only two hops away comes back
   correctly attributed;
@@ -344,7 +410,13 @@ invariants and replication policy, the mobile half covers:
   and unsolicited responses, key-change detection, and the rule that in-person
   trust is only ever granted on top of a proven key;
 - airtime: a budget on steady-state gossip, and a check that a brand-new link
-  carries beacons before it carries anything large.
+  carries beacons before it carries anything large;
+- render rate: a budget on how often the node may ask React to redraw, because
+  every event it emits is a `setState` and the map tab animates while they
+  arrive;
+- transaction serialization, including a test that reproduces the corruption
+  that happens without it — `withTransactionAsync` rolls back a *concurrent*
+  caller's uncommitted work, so two overlapping writes lose both.
 
 The radio itself is not covered there — nothing short of two phones can exercise
 a BLE stack — so `MeshRadio.kt` is verified by the steps under *Proving it
@@ -360,6 +432,11 @@ works* above.
   `MeshRadio.MAX_CENTRAL_LINKS`.
 - **Foreground only.** There is no foreground service, so Android will suspend
   the radio when the app is backgrounded. Keep the screen on for a demo.
+- **Two copies of the protocol.** `src/core` is this project's own copy of the
+  radio-agnostic modules the web build also has. The codec tests travel with it,
+  so a divergence fails the build rather than reaching two devices — but keeping
+  the two in step is now a deliberate act rather than a guarantee of the file
+  layout.
 - **A few kB/s per link.** BLE is slow, and the mesh's own overhead has to fit
   inside that alongside real traffic. Holder claims and popularity shares are
   refreshed with a compact `HOLDERS` packet (~21 bytes a chunk) rather than by
