@@ -227,8 +227,8 @@ pass instead of three, eight seconds between passes instead of six.
 ## How the radio works
 
 `modules/ble-mesh/android/…/MeshRadio.kt` is where the interesting parts are.
-Four details separate a BLE demo that works on a bench from one that works in a
-room, and each is commented at the code:
+A handful of details separate a BLE demo that works on a bench from one that
+works in a room, and each is commented at the code:
 
 - **Exactly one link per pair.** Both ends discover each other, so both would
   dial and you would get two links between two phones — double the traffic and
@@ -255,11 +255,33 @@ room, and each is commented at the code:
   successful handshake clears the record. Scan restarts are rate-limited for
   the same reason: Android silently stops reporting results to an app that
   calls `startScan` more than five times in thirty seconds.
+- **An airtime budget.** One radio has to advertise, scan, and service every
+  live connection, and `SCAN_MODE_LOW_LATENCY` is a 100% duty cycle — the
+  controller scans in every interval and keeps nothing back. That is the right
+  setting for an empty room and fatal once a link exists: the connection events
+  lose to the scan, get missed, and the link dies on its supervision timeout a
+  few seconds after coming up, looking for all the world like the peer hung up.
+  So a node with no links hunts hard, and a node that has found the mesh backs
+  both the scan and the advertiser off to a duty cycle that leaves room to keep
+  what it has. Finding *more* peers is slower; a peer found over a link that
+  then drops was worth nothing anyway.
+- **Deadlines on everything the stack owes us.** Android does not always
+  deliver a completion callback, and a link whose last write never completed
+  stays subscribed, stays in the peer list, and never moves another byte —
+  quieter and harder to spot than a disconnect. The tick tears down a link with
+  a segment outstanding for twelve seconds, one that has heard nothing at all
+  for fifty, and one that subscribed but never said who it is. A link that has
+  gone quiet for twenty seconds gets a HELLO first, since a half-open
+  connection only reveals itself when you try to use it.
 - **Flow control.** `writeCharacteristic` and `notifyCharacteristicChanged`
   fail while the connection is congested and silently discard what you gave
   them. The classic Android BLE bug is to loop over your data, watch every call
   return, and lose most of it. Every link here has a queue drained by the
-  completion callback and never faster.
+  completion callback and never faster. Congestion is not failure: refusals are
+  retried for six seconds before the link is given up, which sounds long until
+  you watch two nodes trade catalogues five seconds after meeting — tens of
+  kilobytes into one link in a single tick, both directions at once, while both
+  radios are still advertising and scanning.
 - **Segmentation against the negotiated MTU**, not a guess. Each link asks for
   517 bytes, gets what the peer allows, and frames are cut to fit with a
   one-byte header carrying a sequence number — not for ordering, which GATT

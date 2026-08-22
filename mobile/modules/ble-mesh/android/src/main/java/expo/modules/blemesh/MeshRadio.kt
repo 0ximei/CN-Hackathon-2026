@@ -108,6 +108,24 @@ class MeshRadio(
     /** Consecutive over-the-air write failures reported by the async GATT callback. */
     var writeFailures = 0
     val openedAt: Long = System.currentTimeMillis()
+    /**
+     * Last time anything arrived on this link.
+     *
+     * A GATT connection that has died without the stack noticing looks exactly
+     * like an idle one, and the app layer beacons every three seconds, so
+     * silence is a reliable signal here rather than a guess.
+     */
+    var lastHeardAt: Long = System.currentTimeMillis()
+    /**
+     * Last time the stack accepted or completed a segment on this link.
+     *
+     * [busy] is cleared by a completion callback, and Android does not always
+     * deliver one. Without a deadline the link stays `ready`, stays listed as a
+     * peer, and never moves another byte for the rest of the session.
+     */
+    var lastProgressAt: Long = System.currentTimeMillis()
+    /** Last native keepalive, so the tick does not send one every three seconds. */
+    var lastPingAt: Long = 0L
     val outbox = ArrayDeque<ByteArray>()
     var busy = false
     val reassembler = Reassembler()
@@ -173,7 +191,20 @@ class MeshRadio(
     const val TICK_MS = 3_000L
     const val SCAN_REFRESH_MS = 240_000L
     const val DRAIN_RETRY_MS = 25L
-    const val MAX_DRAIN_RETRIES = 40
+    /**
+     * How long the stack may keep refusing a segment before the link is given up.
+     *
+     * Six seconds, and it needs every one of them. Five seconds after two nodes
+     * first hear each other they exchange catalogues — tens of kilobytes of
+     * metadata queued into one link in a single tick, in both directions at
+     * once, while both radios are also advertising and scanning. A congested
+     * stack refuses writes for as long as that takes to clear.
+     *
+     * This was one second. The burst arrives a few seconds after the link comes
+     * up, which is precisely when the link was being torn down: not by the peer
+     * and not by the radio, but by this timer, for the crime of being busy.
+     */
+    const val MAX_DRAIN_RETRIES = 240
     /**
      * A write the stack accepted but the async callback then reports as failed —
      * distinct from `MAX_DRAIN_RETRIES`, which counts the stack refusing to
@@ -227,6 +258,27 @@ class MeshRadio(
     /** Android's limit is five starts per thirty seconds; stay under it. */
     const val SCAN_QUOTA = 4
     const val SCAN_QUOTA_WINDOW_MS = 30_000L
+
+    /**
+     * How long a segment may sit in the stack with no completion callback.
+     *
+     * Generous, because a genuinely congested link can take seconds to accept
+     * one write. What this catches is the callback that never comes at all.
+     */
+    const val WRITE_STALL_MS = 12_000L
+
+    /**
+     * Silence after which the peer is prodded, and after which it is presumed
+     * gone.
+     *
+     * The app layer beacons every three seconds, so twenty seconds of silence
+     * on a healthy link does not happen; the keepalive exists for the case
+     * where JS has stopped and only the radio is still up. Fifty seconds with
+     * nothing at all — not a beacon, not a keepalive reply, not an ack — is a
+     * link the stack is still holding open over a connection that is gone.
+     */
+    const val LINK_IDLE_MS = 20_000L
+    const val LINK_SILENCE_MS = 50_000L
   }
 
   /* ------------------------------------------------------------------ */
@@ -273,6 +325,7 @@ class MeshRadio(
       dialFailures.clear()
       scanStarts.clear()
       scanRestartPending = false
+      advertisingRelaxed = false
       try {
         gattServer?.close()
       } catch (e: Exception) {
@@ -355,8 +408,15 @@ class MeshRadio(
     val adv = adapter?.bluetoothLeAdvertiser ?: return
     advertiser = adv
 
+    // Same trade as the scan mode, for the same reason: every advertising event
+    // is radio time a live connection does not get. 100ms while looking for the
+    // mesh, 250ms once there is a link worth protecting — still four
+    // advertisements a second, so nothing takes meaningfully longer to find us.
     val settings = AdvertiseSettings.Builder()
-      .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+      .setAdvertiseMode(
+        if (advertisingRelaxed) AdvertiseSettings.ADVERTISE_MODE_BALANCED
+        else AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY,
+      )
       .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
       .setConnectable(true)
       .setTimeout(0)
@@ -516,6 +576,9 @@ class MeshRadio(
         }
         // Only now can this half of the link carry anything.
         link.ready = true
+        link.lastProgressAt = System.currentTimeMillis()
+        // There is a connection to protect now; back the radio off.
+        retuneRadio()
         enqueue(link, MeshWire.KIND_HELLO, idBytes(selfId))
       }
     }
@@ -524,6 +587,7 @@ class MeshRadio(
       post {
         val link = links[linkKey(device.address, Role.PERIPHERAL)] ?: return@post
         link.busy = false
+        link.lastProgressAt = System.currentTimeMillis()
         if (status != BluetoothGatt.GATT_SUCCESS) log("notify failed: status $status")
         drain(link)
       }
@@ -560,6 +624,54 @@ class MeshRadio(
   private var scanning = false
   private var scanRestartPending = false
 
+  /** The mode the running scan was started with, or -1 when not scanning. */
+  private var activeScanMode = -1
+
+  /** True while the advertiser is on its relaxed, already-connected duty cycle. */
+  private var advertisingRelaxed = false
+
+  private fun linked() = links.values.any { it.ready }
+
+  /**
+   * How hard to scan, given whether this node already has a link.
+   *
+   * `SCAN_MODE_LOW_LATENCY` is a 100% duty cycle: the controller scans in every
+   * single interval and has no radio time left over. That is the right setting
+   * for an empty room, and it is fatal once a connection exists — the link's
+   * connection events lose to the scan, get missed, and the link dies on its
+   * supervision timeout a few seconds after it came up. The peer sees a
+   * disconnect it did not ask for and neither side knows why.
+   *
+   * So the aggressive scan is what an unconnected node does to find the mesh,
+   * and a node that has found it backs off to a duty cycle that leaves the
+   * radio time to keep what it has. Discovery of *further* peers is slower;
+   * that is the correct trade, because a peer discovered on a link that then
+   * drops is worth nothing.
+   */
+  private fun desiredScanMode(): Int =
+    if (linked()) ScanSettings.SCAN_MODE_LOW_POWER else ScanSettings.SCAN_MODE_LOW_LATENCY
+
+  /**
+   * Re-tune scanning and advertising to the current link state.
+   *
+   * Called whenever a link becomes usable or is lost. Deliberately does not
+   * *start* a scan that is currently stopped: a dial in flight holds it down on
+   * purpose, and [releaseScan] is what hands it back.
+   */
+  private fun retuneRadio() {
+    if (!running) return
+    if (scanning && activeScanMode != desiredScanMode()) {
+      stopScanning()
+      startScanning()
+    }
+    val relaxed = linked()
+    if (relaxed != advertisingRelaxed) {
+      advertisingRelaxed = relaxed
+      stopAdvertising()
+      startAdvertising()
+    }
+  }
+
   private fun startScanning() {
     if (!running || scanning) return
     val s = adapter?.bluetoothLeScanner ?: return
@@ -572,6 +684,10 @@ class MeshRadio(
       if (scanRestartPending) return
       scanRestartPending = true
       val wait = scanStarts.first() + SCAN_QUOTA_WINDOW_MS - now + 200
+      // Say so. Being over quota means this node is deaf until the window
+      // rolls, and a deaf node is indistinguishable from an empty room — which
+      // is exactly the confusing silence this log line exists to break.
+      log("scan start quota reached, deaf for ${wait / 1000}s")
       handler?.postDelayed({
         scanRestartPending = false
         startScanning()
@@ -581,9 +697,10 @@ class MeshRadio(
     scanStarts.addLast(now)
 
     scanner = s
+    val mode = desiredScanMode()
     val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(MeshWire.SERVICE)).build())
     val settings = ScanSettings.Builder()
-      .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+      .setScanMode(mode)
       .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
       .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
       .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
@@ -592,7 +709,8 @@ class MeshRadio(
     try {
       s.startScan(filters, settings, scanCallback)
       scanning = true
-      log("scanning for mesh nodes")
+      activeScanMode = mode
+      log(if (mode == ScanSettings.SCAN_MODE_LOW_LATENCY) "scanning for mesh nodes" else "scanning gently, links to keep alive")
     } catch (e: Exception) {
       log("startScan threw: ${e.message}")
     }
@@ -607,6 +725,7 @@ class MeshRadio(
     }
     scanner = null
     scanning = false
+    activeScanMode = -1
   }
 
   /**
@@ -831,8 +950,11 @@ class MeshRadio(
         }
         dialling.remove(gatt.device.address)
         link.ready = true
-        // The connection is established; scanning is safe again.
+        link.lastProgressAt = System.currentTimeMillis()
+        // The connection is established; scanning is safe again — but gently,
+        // so resuming it does not immediately starve the link that just came up.
         releaseScan(link)
+        retuneRadio()
         enqueue(link, MeshWire.KIND_HELLO, idBytes(selfId))
       }
     }
@@ -845,6 +967,7 @@ class MeshRadio(
       post {
         val link = links[linkKey(gatt.device.address, Role.CENTRAL)] ?: return@post
         link.busy = false
+        link.lastProgressAt = System.currentTimeMillis()
         if (status != BluetoothGatt.GATT_SUCCESS) {
           log("write failed: status $status")
           if (++link.writeFailures >= MAX_WRITE_FAILURES) {
@@ -922,6 +1045,7 @@ class MeshRadio(
 
     if (accepted) {
       link.retries = 0
+      link.lastProgressAt = System.currentTimeMillis()
       return
     }
 
@@ -929,7 +1053,7 @@ class MeshRadio(
     link.busy = false
     link.outbox.addFirst(segment)
     if (++link.retries > MAX_DRAIN_RETRIES) {
-      teardown(link, "congested, gave up after ${link.retries} retries")
+      teardown(link, "congested for ${MAX_DRAIN_RETRIES * DRAIN_RETRY_MS / 1000}s")
       return
     }
     handler?.postDelayed({ drain(link) }, DRAIN_RETRY_MS)
@@ -981,6 +1105,9 @@ class MeshRadio(
   }
 
   private fun receive(link: Link, segment: ByteArray) {
+    // Before reassembly, deliberately: a segment arriving is proof the link is
+    // alive whether or not it completes a message.
+    link.lastHeardAt = System.currentTimeMillis()
     val message = link.reassembler.push(segment) { log("${describe(link)}: $it") } ?: return
     if (message.isEmpty()) return
     when (message[0]) {
@@ -1010,6 +1137,10 @@ class MeshRadio(
       teardown(link, "peer reported an unusable node id")
       return
     }
+    // A HELLO on a link that is already bound to this peer is a keepalive.
+    // `receive` has already recorded it; re-running the duplicate resolution
+    // and re-announcing the peer would only churn the UI.
+    if (link.identified && link.nodeId == nodeId) return
     link.nodeId = nodeId
     link.identified = true
     awaitingInbound.remove(nodeId)
@@ -1057,6 +1188,8 @@ class MeshRadio(
     link.gatt = null
     link.connected = false
     releaseScan(link)
+    // Losing the last link means going back to hunting for the mesh in earnest.
+    retuneRadio()
     if (link.identified) log("lost ${peerIdOf(link.nodeId)}: $reason") else noteDialFailure(link, reason)
     emitPeers()
   }
@@ -1097,9 +1230,38 @@ class MeshRadio(
       dialBackoff.entries.removeAll { it.value < now - MAX_DIAL_BACKOFF_MS * 2 }
       dialFailures.keys.removeAll { !dialBackoff.containsKey(it) }
       for (link in links.values.toList()) {
-        val budget = if (link.background) BACKGROUND_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
-        if (!link.ready && now - link.openedAt > budget) {
-          teardown(link, "handshake never completed")
+        if (!link.ready) {
+          val budget = if (link.background) BACKGROUND_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
+          if (now - link.openedAt > budget) teardown(link, "handshake never completed")
+          continue
+        }
+        // A segment handed to the stack whose completion callback never came.
+        // The link is not congested — `drain` handles that and gives up loudly
+        // — it is wedged: `busy` stays true, `drain` returns immediately every
+        // time, and the link sits in the peer list moving nothing.
+        if (link.busy && now - link.lastProgressAt > WRITE_STALL_MS) {
+          teardown(link, "the stack never finished a write")
+          continue
+        }
+        // Subscribed, but the peer never said who it is. It cannot be addressed
+        // and it cannot be routed through, so it is holding an outbound slot
+        // for nothing.
+        if (!link.identified) {
+          val budget = if (link.background) BACKGROUND_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
+          if (now - link.openedAt > budget) teardown(link, "peer never introduced itself")
+          continue
+        }
+        val silence = now - link.lastHeardAt
+        if (silence > LINK_SILENCE_MS) {
+          teardown(link, "silent for ${silence / 1000}s")
+          continue
+        }
+        // Half-open: the connection is gone but neither stack has noticed, so
+        // no disconnect callback is coming. Sending something is the only way
+        // to find out, and a HELLO is what the peer already expects.
+        if (silence > LINK_IDLE_MS && now - link.lastPingAt > LINK_IDLE_MS) {
+          link.lastPingAt = now
+          enqueue(link, MeshWire.KIND_HELLO, idBytes(selfId))
         }
       }
       events.onState("running", "${peers().size} peer(s)")
