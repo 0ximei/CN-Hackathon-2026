@@ -86,13 +86,18 @@ class MeshRadio(
   private inner class Link(val device: BluetoothDevice, val role: Role) {
     var gatt: BluetoothGatt? = null
     var remoteRx: BluetoothGattCharacteristic? = null
-    var nodeId: Int = 0
-    var mtu: Int = MeshWire.MIN_MTU
+    // `send`, `broadcast` and `peers` read these straight from the JS thread
+    // while the radio thread writes them. `links` being concurrent publishes
+    // the Link *object*, but every one of these is assigned after it was put
+    // in the map, so nothing orders them — a JS-thread reader is entitled to
+    // go on seeing `ready == false` forever and quietly refuse every send.
+    @Volatile var nodeId: Int = 0
+    @Volatile var mtu: Int = MeshWire.MIN_MTU
     /** Notifications are flowing; we may send. */
-    var ready = false
+    @Volatile var ready = false
     /** The peer told us its node id, so it can be addressed. */
-    var identified = false
-    var rssi: Int = 0
+    @Volatile var identified = false
+    @Volatile var rssi: Int = 0
     /**
      * Who we believed we were dialling, before a HELLO proved it. Only a
      * CENTRAL link has one, and it is what a failed dial is booked against.
@@ -185,6 +190,16 @@ class MeshRadio(
   private val dialBackoff = HashMap<Int, Long>()
   private val dialFailures = HashMap<Int, Int>()
 
+  /**
+   * GATT handles we have asked to disconnect and have not closed yet, by address.
+   *
+   * `disconnect()` is asynchronous and `close()` is not. Closing straight after
+   * disconnecting unregisters this app's client interface while the controller
+   * still has the ACL up, so nothing is left to finish the teardown or to
+   * report it — see [releaseGatt].
+   */
+  private val closing = HashMap<String, BluetoothGatt>()
+
   private companion object {
     const val MAX_CENTRAL_LINKS = 4
     const val INBOUND_GRACE_MS = 9_000L
@@ -255,6 +270,14 @@ class MeshRadio(
     /** A background connect waits for the device, so it gets a longer leash. */
     const val BACKGROUND_CONNECT_TIMEOUT_MS = 45_000L
 
+    /**
+     * How long to wait for a disconnect to land before closing the handle anyway.
+     *
+     * The callback normally arrives in tens of milliseconds. This only covers
+     * the case where it never comes at all, which must not leak the handle.
+     */
+    const val CLOSE_GRACE_MS = 2_000L
+
     /** Android's limit is five starts per thirty seconds; stay under it. */
     const val SCAN_QUOTA = 4
     const val SCAN_QUOTA_WINDOW_MS = 30_000L
@@ -319,6 +342,17 @@ class MeshRadio(
       stopScanning()
       for (link in links.values.toList()) teardown(link, "shutdown")
       links.clear()
+      // `teardown` just asked for these disconnects and posted their closes to
+      // a handler that is about to stop. Closing them here would strand them
+      // exactly the way the old teardown did, which matters because `stop` is
+      // also how the radio restarts under a new identity. Hand them to the main
+      // looper, which outlives this thread, and give the disconnects the same
+      // grace they would have had.
+      val pending = closing.values.toList()
+      closing.clear()
+      if (pending.isNotEmpty()) {
+        mainHandler.postDelayed({ for (gatt in pending) runCatching { gatt.close() } }, CLOSE_GRACE_MS)
+      }
       awaitingInbound.clear()
       dialling.clear()
       dialBackoff.clear()
@@ -847,6 +881,9 @@ class MeshRadio(
    *    of insisting on it.
    */
   private fun dial(device: BluetoothDevice, expectedNode: Int, rssi: Int) {
+    // A handle for this address still waiting on its disconnect would otherwise
+    // be closed by its timeout partway through the new connection.
+    finishClose(device.address)
     dialling.add(device.address)
     val link = Link(device, Role.CENTRAL)
     link.rssi = rssi
@@ -899,11 +936,22 @@ class MeshRadio(
           link?.connected = true
           // MTU first, then discovery: asking afterwards makes some stacks keep
           // serving the 23-byte default to already-discovered characteristics.
-          gatt.requestMtu(PREFERRED_MTU)
+          //
+          // If the stack refuses the request outright there is no `onMtuChanged`
+          // coming, and discovery is only ever started from that callback — so
+          // the link would sit half-open until the sweep collected it, having
+          // never once been usable. A refused MTU is not a reason to give up a
+          // connection; it only means smaller segments.
+          if (!gatt.requestMtu(PREFERRED_MTU)) {
+            log("mtu request refused by the stack, continuing at ${MeshWire.MIN_MTU}B")
+            gatt.discoverServices()
+          }
         } else {
           dialling.remove(gatt.device.address)
+          // The disconnect we were waiting for before closing the handle. It
+          // arrives here whether the peer hung up or `releaseGatt` asked for it.
           if (link != null) teardown(link, "disconnected (status $status)")
-          else runCatching { gatt.close() }
+          finishClose(gatt.device.address, fallback = if (link == null) gatt else null)
         }
       }
     }
@@ -1171,16 +1219,18 @@ class MeshRadio(
     link.ready = false
     try {
       when (link.role) {
-        // `close` always, `disconnect` only if there is a connection to drop:
-        // disconnecting a handle that never connected leaves the stack holding
-        // a client interface, and it has a finite number of those. Running out
-        // is one of the ways a phone starts answering every dial with 133 and
-        // keeps doing it until the app is restarted.
-        Role.CENTRAL -> link.gatt?.let {
-          if (link.connected) it.disconnect()
-          it.close()
-        }
-        Role.PERIPHERAL -> gattServer?.cancelConnection(link.device)
+        Role.CENTRAL -> link.gatt?.let { releaseGatt(link.device.address, it, link.connected) }
+        // One ACL carries both GATT sessions when a pair ends up linked in both
+        // directions, so cancelling the server side would drop the connection
+        // the central half is still using. Leaving the server session idle
+        // costs nothing; taking the radio link out from under a working central
+        // costs the peer.
+        Role.PERIPHERAL ->
+          if (links.containsKey(linkKey(link.device.address, Role.CENTRAL))) {
+            log("leaving ${link.device.address} connected for the central half")
+          } else {
+            gattServer?.cancelConnection(link.device)
+          }
       }
     } catch (e: Exception) {
       log("teardown threw: ${e.message}")
@@ -1192,6 +1242,47 @@ class MeshRadio(
     retuneRadio()
     if (link.identified) log("lost ${peerIdOf(link.nodeId)}: $reason") else noteDialFailure(link, reason)
     emitPeers()
+  }
+
+  /**
+   * Give a GATT client handle back to the stack, in the order the stack needs.
+   *
+   * `disconnect()` starts an asynchronous teardown; `close()` unregisters this
+   * app's client interface immediately. Calling them back to back — which is
+   * what this did — removes the registration while the controller still holds
+   * the ACL, so nothing is left to finish the teardown and nothing reports it.
+   * Two things follow, and between them they are the whole bug:
+   *
+   *  - The connection lingers. The *next* `connectGatt` to that device attaches
+   *    to the existing ACL rather than opening a fresh one, so the new link is
+   *    born on a connection already scheduled to die; when the stack finally
+   *    reaps the orphan a few seconds later it takes the new link with it. That
+   *    is the disconnect that arrives seconds after a connection that looked
+   *    perfectly healthy, and it repeats because each attempt leaves another.
+   *  - Every cycle burns a client interface, and an app gets a small fixed
+   *    number of them. Once they are gone `connectGatt` fails immediately, for
+   *    every peer, until the process restarts — the silence after the flapping.
+   *
+   * So: disconnect, wait for the callback to say it happened, then close. The
+   * timeout is only there for the callback that never comes.
+   */
+  private fun releaseGatt(address: String, gatt: BluetoothGatt, connected: Boolean) {
+    if (!connected) {
+      // Nothing to disconnect — closing a handle that never connected is the
+      // whole release, and disconnecting it is what strands a client interface.
+      runCatching { gatt.close() }
+      return
+    }
+    closing[address]?.let { if (it !== gatt) runCatching { it.close() } }
+    closing[address] = gatt
+    runCatching { gatt.disconnect() }
+    handler?.postDelayed({ finishClose(address) }, CLOSE_GRACE_MS)
+  }
+
+  /** Closes a handle whose disconnect has landed, or timed out. Idempotent. */
+  private fun finishClose(address: String, fallback: BluetoothGatt? = null) {
+    val gatt = closing.remove(address) ?: fallback ?: return
+    runCatching { gatt.close() }
   }
 
   /**

@@ -241,12 +241,24 @@ works in a room, and each is commented at the code:
   a direct attempt, because an LE scan running during connection establishment
   is its most common trigger and this one scans at `SCAN_MODE_LOW_LATENCY`.
   `connectGatt` is issued on the main looper, since the stack binds part of its
-  callback plumbing to the calling thread. `close()` is called on every handle
-  and `disconnect()` only on one that actually connected, so the finite pool of
-  client interfaces is not leaked — exhausting it is how a phone starts
-  answering *every* dial with 133 until the app restarts. And after two failed
-  direct attempts the peer is handed to `autoConnect`, which waits for a device
-  instead of insisting it is there.
+  callback plumbing to the calling thread. And after two failed direct attempts
+  the peer is handed to `autoConnect`, which waits for a device instead of
+  insisting it is there.
+- **Giving a handle back in the order the stack needs.** `disconnect()` starts
+  an asynchronous teardown; `close()` unregisters the client interface
+  immediately. Calling them back to back — the obvious way to write it — pulls
+  the registration out from under a teardown that has not happened yet, so
+  nothing finishes it and nothing reports it. The connection lingers, the next
+  `connectGatt` to that device attaches to the *existing* ACL instead of
+  opening a fresh one, and when the stack finally reaps the orphan a few
+  seconds later it takes the new link with it. That is a link that connects,
+  looks healthy, and dies seconds later for no reason either end can see, over
+  and over — and each round burns one of the small fixed number of client
+  interfaces an app gets, until `connectGatt` fails for every peer and the node
+  goes silent until the process restarts. So: disconnect, wait for the callback
+  that says it happened, *then* close, with a two-second timeout for the
+  callback that never comes. A handle that never connected is only closed —
+  disconnecting that one is what strands it.
 - **Backoff on a failed dial.** The GATT client takes about one attempt at a
   time and answers a tight retry loop with 133. Scan results arrive several
   times a second, so a dial path with no backoff turns one failed connection
