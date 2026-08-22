@@ -53,7 +53,7 @@ export async function seedCorpus(
   for (const doc of SEED_DOCS) {
     const parsed = parseDocument(doc.file, doc.markdown);
     chunksTotal += parsed.chunks.length;
-    chunksKept += await catalog.ingestDoc(parsed, (docId) => keeps(docId, nodeId, coverage));
+    chunksKept += await catalog.ingestDoc(parsed, (docId) => keeps(docId, nodeId, coverage), 'seed');
   }
 
   await catalog.reload();
@@ -79,6 +79,6 @@ export async function reseed(
   nodeId: number,
   coverage: number,
 ): Promise<SeedReport> {
-  await catalog.clear();
+  await catalog.clearSeed();
   return seedCorpus(catalog, nodeId, coverage);
 }

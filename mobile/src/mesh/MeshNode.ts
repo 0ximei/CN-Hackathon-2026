@@ -2,11 +2,13 @@ import {
     BROADCAST,
     PACKET_TYPE_NAME,
     PacketType,
+    decodeAnnounce,
     decodeDocReq,
     decodeDocRes,
     decodeHello,
     decodeQuery,
     decodeResult,
+    encodeAnnounce,
     encodeDocReq,
     encodeDocRes,
     encodeHello,
@@ -16,12 +18,15 @@ import {
     encodePacket,
     hopsTravelled,
     type Hit,
+    type MetaEntry,
     type Packet,
 } from '@core/protocol/packet';
 import { Router, type RouteEntry } from '@core/protocol/router';
 import { dequantize, fromWireScore, quantize, toWireScore } from '@core/search/vector';
 import type { Identity } from '@core/lib/ids';
 import { nextMsgId } from '@core/lib/ids';
+import { docKeyOf, parseDocument, type ParsedDoc } from '@core/lib/chunk';
+import { normalizeUploadedText } from '@core/lib/textUpload';
 
 import type { Transport } from '@core/transport/Transport';
 import type { Scored } from '@core/search/vector';
@@ -53,8 +58,16 @@ export type MeshTransport = Transport & {
 export interface MeshCatalog {
     search(queryVec: Float32Array, queryText: string, k: number): Scored[];
     chunk(docId: number): StoredChunk | undefined;
+    chunksOf(docKey: number): StoredChunk[];
     snippet(docId: number): string;
     stats(): CatalogStats;
+    ingestDoc(
+        doc: ParsedDoc,
+        filter: ((docId: number) => boolean) | undefined,
+        provenance: 'seed' | 'local',
+    ): Promise<number>;
+    ingestRemote(chunk: Omit<StoredChunk, 'provenance'>): Promise<boolean>;
+    reload(): Promise<void>;
     enqueue(dstId: number, payload: string, ttlMs: number): Promise<void>;
     dueFor(dstId?: number): Promise<{ id: number; dstId: number; payload: string }[]>;
     dequeue(id: number): Promise<void>;
@@ -175,14 +188,28 @@ type Events = {
     activity(events: ActivityEvent[]): void;
     stats(stats: MeshStats): void;
     routes(routes: Map<number, RouteEntry>): void;
+    /** The catalog changed — this node's own upload, or content pulled from a peer. */
+    catalog(stats: CatalogStats): void;
 };
+
+/** Chunk metadata entries per ANNOUNCE packet. Matches the web build's batch size. */
+const ENTRIES_PER_ANNOUNCE = 4;
+
+/** How much of a chunk rides in an ANNOUNCE entry, before the body itself is pulled. */
+const ANNOUNCE_SNIPPET_CHARS = 200;
 
 /**
  * The application protocol, over whatever radio is mounted.
  *
  * Structurally this is the browser build's `MeshNode` with the storage tier
- * simplified: there is no separate metadata/body split and no replicator, so a
- * node answers only for passages it actually holds. What is unchanged — and is
+ * simplified. There is no metadata/body split and no popularity-weighted
+ * partial replication the way the web build's `Replicator` does it — no
+ * eviction, no storage-pressure policy, no periodic reconcile timer. What
+ * exists instead is flood-and-pull: an upload gossips its chunk metadata once
+ * via ANNOUNCE, and any node that hears about a chunk it doesn't hold pulls
+ * the body and keeps it, permanently. That is a real, intentional scope cut —
+ * fine for a mesh sized at a handful of phones and documents, not something
+ * that would hold up at web-scale library sizes. What is unchanged — and is
  * the point — is everything below it. The packet codec, the flooding router
  * with its TTL and dedup LRU, the backward-learned unicast routes and the
  * store-and-forward queue are the same modules the web app uses and the same
@@ -204,6 +231,7 @@ export class MeshNode {
         activity: new Set(),
         stats: new Set(),
         routes: new Set(),
+        catalog: new Set(),
     };
     private unsubscribes: (() => void)[] = [];
 
@@ -265,6 +293,75 @@ export class MeshNode {
     on<K extends keyof Events>(event: K, cb: Events[K]): () => void {
         this.listeners[event].add(cb);
         return () => this.listeners[event].delete(cb);
+    }
+
+    /* ----------------------------- upload ---------------------------- */
+
+    /** Ingests a document here and gossips its metadata to the mesh. */
+    async upload(filename: string, raw: string): Promise<void> {
+        const text = normalizeUploadedText(raw);
+        if (!text) throw new Error(`${filename} has no readable text`);
+        const parsed = parseDocument(filename, text);
+        if (!parsed.chunks.length) throw new Error(`${filename} has no readable text`);
+
+        const body = parsed.chunks.map((c) => c.text).join('\n');
+        const docKey = docKeyOf(parsed.title, body);
+
+        await this.catalog.ingestDoc(parsed, undefined, 'local');
+        await this.catalog.reload();
+        this.emit('catalog', this.catalog.stats());
+
+        await this.announce(docKey);
+    }
+
+    /**
+     * Broadcasts one document's chunk metadata so the mesh learns it exists.
+     *
+     * A one-shot flood, not a recurring reconcile pass — an upload's worth of
+     * ANNOUNCE packets is a brief burst well inside the radio's real throughput,
+     * unlike re-announcing the whole catalog on a timer.
+     */
+    private async announce(docKey: number): Promise<void> {
+        const chunks = this.catalog.chunksOf(docKey);
+        if (!chunks.length) return;
+
+        const docBytes = chunks.reduce((n, c) => n + c.text.length, 0);
+        const createdAtSec = Math.floor(Date.now() / 1000);
+
+        for (let i = 0; i < chunks.length; i += ENTRIES_PER_ANNOUNCE) {
+            const batch = chunks.slice(i, i + ENTRIES_PER_ANNOUNCE);
+            const entries: MetaEntry[] = batch.map((c) => {
+                const { q, scale } = quantize(embedder.embed(c.text));
+                return {
+                    docId: c.docId,
+                    seq: c.seq,
+                    version: 1,
+                    section: c.section,
+                    snippet: c.text.slice(0, ANNOUNCE_SNIPPET_CHARS),
+                    bytes: c.text.length,
+                    originId: this.identity.id,
+                    scale,
+                    vec: q,
+                    holders: [this.identity.id],
+                    hits: 0,
+                };
+            });
+
+            this.router.send(
+                PacketType.ANNOUNCE,
+                encodeAnnounce({
+                    docKey,
+                    title: chunks[0].title,
+                    source: chunks[0].source,
+                    docBytes,
+                    chunkCount: chunks.length,
+                    docOriginId: this.identity.id,
+                    createdAtSec,
+                    entries,
+                }),
+                BROADCAST,
+            );
+        }
     }
 
     /* ----------------------------- search ---------------------------- */
@@ -375,21 +472,7 @@ export class MeshNode {
         const target = hit.holderId && hit.holderId !== this.identity.id ? hit.holderId : hit.fromNodeId;
         if (!target || target === this.identity.id) return hit.snippet;
 
-        const reply = await new Promise<{ text: string; source: string } | null>((resolve) => {
-            const timer = setTimeout(() => {
-                this.pendingDocs.delete(hit.docId);
-                resolve(null);
-            }, DOC_FETCH_TIMEOUT_MS);
-
-            this.pendingDocs.set(hit.docId, (payload) => {
-                clearTimeout(timer);
-                this.pendingDocs.delete(hit.docId);
-                resolve(payload);
-            });
-
-            this.router.send(PacketType.DOC_REQ, encodeDocReq(hit.docId), target);
-        });
-
+        const reply = await this.requestDoc(hit.docId, target);
         if (!reply?.text) return hit.snippet;
 
         // Record it against every query still showing this passage, so the row
@@ -405,6 +488,24 @@ export class MeshNode {
             if (touched) this.emit('query', { ...state, hits: [...state.hits] });
         }
         return reply.text;
+    }
+
+    /** Sends a DOC_REQ to `target` and waits for the matching DOC_RES, or null on timeout. */
+    private requestDoc(docId: number, target: number): Promise<{ text: string; source: string } | null> {
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                this.pendingDocs.delete(docId);
+                resolve(null);
+            }, DOC_FETCH_TIMEOUT_MS);
+
+            this.pendingDocs.set(docId, (payload) => {
+                clearTimeout(timer);
+                this.pendingDocs.delete(docId);
+                resolve(payload);
+            });
+
+            this.router.send(PacketType.DOC_REQ, encodeDocReq(docId), target);
+        });
     }
 
     /* --------------------------- packet handling --------------------- */
@@ -423,6 +524,8 @@ export class MeshNode {
                 return this.onDocReq(pkt);
             case PacketType.DOC_RES:
                 return this.onDocRes(pkt);
+            case PacketType.ANNOUNCE:
+                return this.onAnnounce(pkt);
             default:
                 break;
         }
@@ -533,6 +636,38 @@ export class MeshNode {
     private onDocRes(pkt: Packet): void {
         const doc = decodeDocRes(pkt.payload);
         this.pendingDocs.get(doc.docId)?.({ text: doc.text, source: doc.source });
+    }
+
+    /**
+     * A peer gossiped chunk metadata. Pull the body for anything not already
+     * held — this node's half of flood-and-pull replication.
+     */
+    private async onAnnounce(pkt: Packet): Promise<void> {
+        const payload = decodeAnnounce(pkt.payload);
+        const missing = payload.entries.filter((e) => !this.catalog.chunk(e.docId));
+        if (!missing.length) return;
+
+        let pulled = 0;
+        for (const entry of missing) {
+            const reply = await this.requestDoc(entry.docId, pkt.srcId);
+            if (!reply?.text) continue;
+            const wrote = await this.catalog.ingestRemote({
+                docId: entry.docId,
+                docKey: payload.docKey,
+                seq: entry.seq,
+                title: payload.title,
+                section: entry.section,
+                source: reply.source || payload.source,
+                text: reply.text,
+            });
+            if (wrote) pulled++;
+        }
+
+        if (pulled) {
+            await this.catalog.reload();
+            this.emit('catalog', this.catalog.stats());
+            this.note('recv', `pulled ${pulled} passage(s) of "${payload.title}"`);
+        }
     }
 
     /* ------------------------- store and forward --------------------- */

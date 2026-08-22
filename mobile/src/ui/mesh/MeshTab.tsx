@@ -1,14 +1,53 @@
-import React from 'react';
-import { ScrollView, Text, View, Pressable } from 'react-native';
+import React, { useState } from 'react';
+import { ActivityIndicator, ScrollView, Text, View, Pressable } from 'react-native';
+import * as DocumentPicker from 'expo-document-picker';
 import type { useMesh } from '../useMesh';
 type Mesh = ReturnType<typeof useMesh>;
 
 import { styles } from './styles';
+import { theme } from '../theme';
 import { PeerRow } from './PeerRow';
 import { Stat } from './Stat';
 
+async function readAssetText(uri: string): Promise<string> {
+  const response = await fetch(uri);
+  if (!response.ok) throw new Error(`could not read document: ${response.status}`);
+  return response.text();
+}
+
 export function MeshTab({ mesh }: { mesh: Mesh }) {
   const caps = mesh.capabilities;
+  const [uploading, setUploading] = useState(false);
+  const [uploadNote, setUploadNote] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const handleUpload = async () => {
+    const result = await DocumentPicker.getDocumentAsync({
+      multiple: true,
+      copyToCacheDirectory: true,
+      type: ['text/plain', 'text/markdown', 'text/*'],
+    });
+
+    if (result.canceled || !result.assets?.length) return;
+    setUploading(true);
+    setUploadNote(null);
+    try {
+      const files = await Promise.all(
+        result.assets.map(async (asset: { name?: string; uri: string }, i: number) => ({
+          name: asset.name ?? `uploaded-${i}.txt`,
+          text: await readAssetText(asset.uri),
+        })),
+      );
+      await mesh.addFiles(files);
+      setUploadNote({
+        ok: true,
+        text: `Added ${files.length} file${files.length === 1 ? '' : 's'} to this node's share.`,
+      });
+    } catch (e) {
+      setUploadNote({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setUploading(false);
+    }
+  };
 
   return (
     <ScrollView contentContainerStyle={styles.listPad}>
@@ -27,6 +66,25 @@ export function MeshTab({ mesh }: { mesh: Mesh }) {
           <Text style={styles.cardBody}>Turn it on, then restart the app.</Text>
         </View>
       )}
+
+      <View style={{ marginBottom: 12 }}>
+        <Pressable
+          onPress={() => void handleUpload()}
+          disabled={uploading}
+          style={[styles.button, uploading && styles.buttonBusy]}
+        >
+          {uploading ? (
+            <ActivityIndicator color={styles.buttonText.color ?? undefined} size="small" />
+          ) : (
+            <Text style={styles.buttonText}>UPLOAD FILES</Text>
+          )}
+        </Pressable>
+        {uploadNote && (
+          <Text style={[styles.summary, !uploadNote.ok && { color: theme.warn }]}>
+            {uploadNote.text}
+          </Text>
+        )}
+      </View>
 
       <Text style={styles.sectionTitle}>REACHABLE NODES</Text>
       {mesh.peers.length === 0 ? (

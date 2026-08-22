@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { Identity } from '@core/lib/ids';
-import { parseDocument } from '@core/lib/chunk';
 import { llm, type Answer, type LlmStatus } from '../llm/engine';
 
 import { BleTransport } from '../transport/BleTransport';
-import { LocalCatalog, type CatalogStats } from '../storage/store';
+import { LocalCatalog, type CatalogStats, type DocSummary } from '../storage/store';
 import { loadIdentity } from '../lib/identity';
 import { coverageOf, hasSeeded, reseed, seedCorpus, type SeedReport } from '../mesh/bootstrap';
 import {
@@ -17,7 +16,6 @@ import {
     type QueryState,
 } from '../mesh/MeshNode';
 import type { BleCapabilities } from '../../modules/ble-mesh';
-import { normalizeUploadedText } from '@core/lib/textUpload';
 
 export type Phase = 'booting' | 'ready' | 'error';
 
@@ -59,6 +57,7 @@ export function useMesh() {
         chunks: 0,
         bytes: 0,
     });
+    const [documents, setDocuments] = useState<DocSummary[]>([]);
     const [capabilities, setCapabilities] = useState<BleCapabilities | null>(null);
     const [coverage, setCoverage] = useState(0.6);
     const [seedReport, setSeedReport] = useState<SeedReport | null>(null);
@@ -94,6 +93,7 @@ export function useMesh() {
                 }
                 setCoverage(await coverageOf(catalog));
                 setCatalogStats(catalog.stats());
+                setDocuments(catalog.documents());
 
                 // Read capabilities before starting: a device that cannot advertise
                 // can still join a mesh, but only as a leaf, and the user should be
@@ -108,6 +108,10 @@ export function useMesh() {
                 node.on('activity', setActivity);
                 node.on('stats', setStats);
                 node.on('query', (state) => setQuery({ ...state, hits: [...state.hits] }));
+                node.on('catalog', (nextStats) => {
+                    setCatalogStats(nextStats);
+                    setDocuments(catalogRef.current?.documents() ?? []);
+                });
                 transport.onStateChange((state, detail) => setRadio({ state, detail }));
 
                 await node.start();
@@ -185,18 +189,13 @@ export function useMesh() {
         setSeedReport(await reseed(catalog, id.id, next));
         setCoverage(next);
         setCatalogStats(catalog.stats());
+        setDocuments(catalog.documents());
     }, [identity]);
 
     const addDocument = useCallback(async (filename: string, raw: string) => {
-        const catalog = catalogRef.current;
-        if (!catalog) return;
-        const text = normalizeUploadedText(raw);
-        if (!text) throw new Error(`${filename} has no readable text`);
-        const parsed = parseDocument(filename, text);
-        if (!parsed.chunks.length) throw new Error(`${filename} has no readable text`);
-        await catalog.ingestDoc(parsed, () => true);
-        await catalog.reload();
-        setCatalogStats(catalog.stats());
+        const node = nodeRef.current;
+        if (!node) return;
+        await node.upload(filename, raw);
         setError('');
     }, []);
 
@@ -226,6 +225,7 @@ export function useMesh() {
         stats,
         radio,
         catalogStats,
+        documents,
         capabilities,
         coverage,
         seedReport,

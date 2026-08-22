@@ -6,10 +6,11 @@ import { styles } from './mesh/styles';
 import { Header } from './mesh/Header';
 import { SearchTab } from './mesh/SearchTab';
 import { MeshTab } from './mesh/MeshTab';
+import { FilesTab } from './mesh/FilesTab';
 import { LogTab } from './mesh/LogTab';
 
 type Mesh = ReturnType<typeof useMesh>;
-type Tab = 'search' | 'mesh' | 'log';
+type Tab = 'search' | 'mesh' | 'files' | 'log';
 
 export function MeshScreen({ mesh }: { mesh: Mesh }) {
   const [tab, setTab] = useState<Tab>('search');
@@ -18,7 +19,7 @@ export function MeshScreen({ mesh }: { mesh: Mesh }) {
     <View style={styles.root}>
       <Header mesh={mesh} />
       <View style={styles.tabs}>
-        {(['search', 'mesh', 'log'] as Tab[]).map((t) => (
+        {(['search', 'mesh', 'files', 'log'] as Tab[]).map((t) => (
           <Pressable key={t} onPress={() => setTab(t)} style={[styles.tab, tab === t && styles.tabOn]}>
             <Text style={[styles.tabText, tab === t && styles.tabTextOn]}>{t.toUpperCase()}</Text>
           </Pressable>
@@ -26,6 +27,7 @@ export function MeshScreen({ mesh }: { mesh: Mesh }) {
       </View>
       {tab === 'search' && <SearchTab mesh={mesh} />}
       {tab === 'mesh' && <MeshTab mesh={mesh} />}
+      {tab === 'files' && <FilesTab mesh={mesh} />}
       {tab === 'log' && <LogTab activity={mesh.activity} />}
     </View>
   );

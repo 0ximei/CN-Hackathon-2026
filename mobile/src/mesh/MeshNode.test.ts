@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MockTransport } from '@core/protocol/testHarness';
 import type { Identity } from '@core/lib/ids';
 import type { Scored } from '@core/search/vector';
+import { docIdOf, docKeyOf, type ParsedDoc } from '@core/lib/chunk';
 
 import { MeshNode, type MeshCatalog, type MeshHit } from './MeshNode';
 import { embedder } from '../search/embedder';
@@ -29,7 +30,51 @@ class MemoryCatalog implements MeshCatalog {
             section: '',
             source: 'test',
             text,
+            provenance: 'seed',
         });
+    }
+
+    chunksOf(docKey: number): StoredChunk[] {
+        return [...this.chunks.values()]
+            .filter((c) => c.docKey === docKey)
+            .sort((a, b) => a.seq - b.seq);
+    }
+
+    async ingestDoc(
+        doc: ParsedDoc,
+        filter: ((docId: number) => boolean) | undefined,
+        provenance: 'seed' | 'local',
+    ): Promise<number> {
+        const body = doc.chunks.map((c) => c.text).join('\n');
+        const docKey = docKeyOf(doc.title, body);
+        let written = 0;
+        for (let seq = 0; seq < doc.chunks.length; seq++) {
+            const chunk = doc.chunks[seq];
+            const docId = docIdOf(docKey, seq, chunk.text);
+            if (filter && !filter(docId)) continue;
+            this.chunks.set(docId, {
+                docId,
+                docKey,
+                seq,
+                title: doc.title,
+                section: chunk.section,
+                source: doc.source,
+                text: chunk.text,
+                provenance,
+            });
+            written++;
+        }
+        return written;
+    }
+
+    async ingestRemote(chunk: Omit<StoredChunk, 'provenance'>): Promise<boolean> {
+        if (this.chunks.has(chunk.docId)) return false;
+        this.chunks.set(chunk.docId, { ...chunk, provenance: 'mesh' });
+        return true;
+    }
+
+    async reload(): Promise<void> {
+        // In-memory map is always current — nothing to rebuild.
     }
 
     search(queryVec: Float32Array, _queryText: string, k: number): Scored[] {
@@ -209,5 +254,39 @@ describe('MeshNode over a simulated mesh', () => {
         // And the caller is not left hanging: it degrades to the snippet.
         await vi.advanceTimersByTimeAsync(10_000);
         expect(await pending).toBe('a snippet');
+    });
+
+    /**
+     * The point of Feature A: an upload does not just sit in the uploader's own
+     * catalog — it gossips out via ANNOUNCE, and a linked peer pulls the body in
+     * on its own, unprompted, without ever having searched for it.
+     */
+    it('replicates an upload to a linked peer via ANNOUNCE', async () => {
+        const a = build(0x41, 'Uploader');
+        const b = build(0x42, 'Neighbour');
+        a.transport.link(b.transport);
+        await startAll(a.node, b.node);
+
+        const replicated = new Promise<void>((resolve) => {
+            const off = b.node.on('catalog', (stats) => {
+                if (stats.chunks > 0) {
+                    off();
+                    resolve();
+                }
+            });
+        });
+
+        await a.node.upload(
+            'burns.md',
+            '# Burns\n\nCool a burn under running water for about twenty minutes to limit tissue damage.',
+        );
+        await replicated;
+
+        expect(b.catalog.stats().chunks).toBeGreaterThan(0);
+
+        const state = await b.node.search('cool a burn under water');
+        const hit = state.hits.find((h) => h.title === 'Burns');
+        expect(hit, 'the pulled passage is now searchable locally on Bravo').toBeDefined();
+        expect(hit!.local).toBe(true);
     });
 });
