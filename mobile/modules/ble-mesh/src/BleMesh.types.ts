@@ -21,6 +21,23 @@ export interface BleCapabilities {
    * dial out but is invisible to scanners — a leaf, never a relay.
    */
   canAdvertise: boolean;
+  /**
+   * Whether this handset could carry the mesh over Wi-Fi instead of BLE.
+   *
+   * Reported so the choice rests on the phones in the room rather than on a
+   * generalisation. Only `wifiAware` matters for a *mesh*: it is the one Wi-Fi
+   * mode that publishes and subscribes at the same time and holds several data
+   * paths at once, which is the property BLE is providing here. `wifiDirect` is
+   * near-universal and forms a group with one owner — a star, not a mesh.
+   *
+   * Aware support depends on the chipset and the vendor HAL, not the Android
+   * version, so it has to be asked rather than assumed.
+   */
+  wifiDirect: boolean;
+  wifiAware: boolean;
+  /** Supported *and* usable right now — Aware goes away when Wi-Fi is off. */
+  wifiAwareReady: boolean;
+  wifiAwareDetail: string;
 }
 
 export interface StartResult {

@@ -157,6 +157,38 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
         </View>
       </View>
 
+      <Text style={styles.sectionTitle}>RADIO</Text>
+      <View style={styles.card}>
+        <Stat label="carrying the mesh" value={0} render="Bluetooth LE · dual-role" />
+        <Stat
+          label="wi-fi direct"
+          value={0}
+          render={mesh.capabilities?.wifiDirect ? 'supported' : 'not supported'}
+        />
+        <Stat
+          label="wi-fi aware"
+          value={0}
+          render={
+            mesh.capabilities?.wifiAwareReady
+              ? 'supported · available'
+              : mesh.capabilities?.wifiAware
+                ? 'supported · unavailable'
+                : 'not supported'
+          }
+        />
+        <Text style={styles.hint}>
+          Wi-Fi would move a catalogue in a blink where BLE takes seconds. Bandwidth is not what
+          BLE is providing here though — symmetry is. Every node advertises, scans and holds
+          several links in both directions at once, with no pairing and no taps, and that is what
+          makes this a mesh rather than a star. Wi-Fi Direct forms a group with one owner and a
+          device belongs to one group at a time; only Wi-Fi Aware keeps the property, and whether
+          a handset has it depends on its chipset rather than its Android version.
+        </Text>
+        {!!mesh.capabilities?.wifiAwareDetail && (
+          <Text style={styles.hint}>{mesh.capabilities.wifiAwareDetail}</Text>
+        )}
+      </View>
+
       <Text style={styles.sectionTitle}>SEARCH AND ANSWERS</Text>
       <View style={styles.card}>
         <Stat label="embedder" value={0} render="hashing · 384d · no download" />
