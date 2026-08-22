@@ -140,6 +140,8 @@ export interface MeshHit {
   holderName: string;
   hops: number;
   local: boolean;
+  /** True when this node itself holds the body, making it retrievable without a network fetch. */
+  storedHere: boolean;
 }
 
 export interface QueryState {
@@ -289,6 +291,7 @@ export class MeshNode {
         holderName: this.identity.name,
         hops: 0,
         local: true,
+        storedHere: true,
       })),
       startedAt: Date.now(),
       answered: [],
@@ -349,8 +352,7 @@ export class MeshNode {
         title: chunk?.title ?? '',
         section: chunk?.section ?? '',
         snippet: this.catalog.snippet(scored.docId),
-        text: chunk?.text,
-      };
+        text: chunk?.text,        storedHere: true,      };
     });
   }
 
@@ -501,6 +503,7 @@ export class MeshNode {
         holderName: this.nameOf(hit.holderId || pkt.srcId),
         hops,
         local: false,
+        storedHere: false,
       });
     }
 

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { Identity } from '@core/lib/ids';
+import { parseDocument } from '@core/lib/chunk';
+import { llm, type Answer, type LlmStatus } from '../llm/engine';
 
 import { BleTransport } from '../transport/BleTransport';
 import { LocalCatalog, type CatalogStats } from '../storage/store';
@@ -9,11 +11,13 @@ import { coverageOf, hasSeeded, reseed, seedCorpus, type SeedReport } from '../m
 import {
   MeshNode,
   type ActivityEvent,
+  type MeshHit,
   type MeshStats,
   type PeerState,
   type QueryState,
 } from '../mesh/MeshNode';
 import type { BleCapabilities } from '../../modules/ble-mesh';
+import { normalizeUploadedText } from '@core/lib/textUpload';
 
 export type Phase = 'booting' | 'ready' | 'error';
 
@@ -60,6 +64,17 @@ export function useMesh() {
   const [seedReport, setSeedReport] = useState<SeedReport | null>(null);
   const [query, setQuery] = useState<QueryState | null>(null);
   const [searching, setSearching] = useState(false);
+  const [llmStatus, setLlmStatus] = useState<LlmStatus>(llm.status);
+  const [answer, setAnswer] = useState<Answer | null>(null);
+  const [answerText, setAnswerText] = useState('');
+  const [answering, setAnswering] = useState(false);
+
+  useEffect(() => {
+    llm.onStatus = (next) => setLlmStatus({ ...next });
+    return () => {
+      llm.onStatus = undefined;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,10 +131,35 @@ export function useMesh() {
     const node = nodeRef.current;
     if (!node || !text.trim()) return;
     setSearching(true);
+    setAnswer(null);
+    setAnswerText('');
+    setQuery(null);
     try {
-      await node.search(text.trim());
+      const result = await node.search(text.trim());
+      setQuery(result);
+      if (!result.hits.length) {
+        setAnswer({
+          text: 'Not in the mesh — no node holds an answer to that.',
+          passages: [],
+          mode: 'extractive',
+        });
+        return;
+      }
+
+      setAnswering(true);
+      const generated = await llm.answer(
+        text.trim(),
+        result.hits,
+        async (hit: MeshHit) => node.fetchFullText(hit),
+        setAnswerText,
+      );
+      setAnswer(generated);
+      setAnswerText(generated.text);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSearching(false);
+      setAnswering(false);
     }
   }, []);
 
@@ -147,6 +187,36 @@ export function useMesh() {
     setCatalogStats(catalog.stats());
   }, [identity]);
 
+  const addDocument = useCallback(async (filename: string, raw: string) => {
+    const catalog = catalogRef.current;
+    if (!catalog) return;
+    const text = normalizeUploadedText(raw);
+    if (!text) throw new Error(`${filename} has no readable text`);
+    const parsed = parseDocument(filename, text);
+    if (!parsed.chunks.length) throw new Error(`${filename} has no readable text`);
+    await catalog.ingestDoc(parsed, () => true);
+    await catalog.reload();
+    setCatalogStats(catalog.stats());
+    setError('');
+  }, []);
+
+  const addFiles = useCallback(
+    async (files: Array<{ name: string; text: string }>) => {
+      for (const file of files) {
+        await addDocument(file.name, file.text);
+      }
+    },
+    [addDocument],
+  );
+
+  const loadLlm = useCallback(async () => {
+    try {
+      await llm.load();
+    } catch {
+      // The engine falls back to extractive answer generation automatically.
+    }
+  }, []);
+
   return {
     phase,
     error,
@@ -161,9 +231,16 @@ export function useMesh() {
     seedReport,
     query,
     searching,
+    llmStatus,
+    answer,
+    answerText,
+    answering,
     search,
     openHit,
     changeCoverage,
+    addDocument,
+    addFiles,
+    loadLlm,
     node: nodeRef.current,
   };
 }

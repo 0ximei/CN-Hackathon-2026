@@ -198,6 +198,7 @@ describe('MeshNode over a simulated mesh', () => {
       holderName: 'Gone',
       hops: 2,
       local: false,
+      storedHere: false,
     };
 
     const pending = a.node.fetchFullText(orphan);
