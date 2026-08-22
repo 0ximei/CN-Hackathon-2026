@@ -3,12 +3,14 @@ import {
     PACKET_TYPE_NAME,
     PacketType,
     decodeAnnounce,
+    decodeCatalogReq,
     decodeDocReq,
     decodeDocRes,
     decodeHello,
     decodeQuery,
     decodeResult,
     encodeAnnounce,
+    encodeCatalogReq,
     encodeDocReq,
     encodeDocRes,
     encodeHello,
@@ -31,7 +33,7 @@ import { normalizeUploadedText } from '@core/lib/textUpload';
 import type { Transport } from '@core/transport/Transport';
 import type { Scored } from '@core/search/vector';
 
-import type { CatalogStats, StoredChunk } from '../storage/store';
+import type { CatalogStats, DocSummary, StoredChunk } from '../storage/store';
 import { embedder } from '../search/embedder';
 import { fromBase64, toBase64 } from '../lib/base64';
 
@@ -59,6 +61,7 @@ export interface MeshCatalog {
     search(queryVec: Float32Array, queryText: string, k: number): Scored[];
     chunk(docId: number): StoredChunk | undefined;
     chunksOf(docKey: number): StoredChunk[];
+    documents(): DocSummary[];
     snippet(docId: number): string;
     stats(): CatalogStats;
     ingestDoc(
@@ -198,6 +201,9 @@ const ENTRIES_PER_ANNOUNCE = 4;
 /** How much of a chunk rides in an ANNOUNCE entry, before the body itself is pulled. */
 const ANNOUNCE_SNIPPET_CHARS = 200;
 
+/** Chunk entries a CATALOG_REQ reply will send in one go, meeting a newly-met peer. */
+const CATALOG_SYNC_MAX = 200;
+
 /**
  * The application protocol, over whatever radio is mounted.
  *
@@ -207,7 +213,11 @@ const ANNOUNCE_SNIPPET_CHARS = 200;
  * eviction, no storage-pressure policy, no periodic reconcile timer. What
  * exists instead is flood-and-pull: an upload gossips its chunk metadata once
  * via ANNOUNCE, and any node that hears about a chunk it doesn't hold pulls
- * the body and keeps it, permanently. That is a real, intentional scope cut —
+ * the body and keeps it, permanently. Meeting a peer for the first time this
+ * session also triggers a one-shot CATALOG_REQ/CATALOG_RES catch-up, so content
+ * uploaded before that peer joined the mesh still reaches it — otherwise it
+ * would only ever be reachable by search, never by holding a copy locally.
+ * That is a real, intentional scope cut —
  * fine for a mesh sized at a handful of phones and documents, not something
  * that would hold up at web-scale library sizes. What is unchanged — and is
  * the point — is everything below it. The packet codec, the flooding router
@@ -222,6 +232,8 @@ export class MeshNode {
     private peers = new Map<number, PeerState>();
     private queries = new Map<number, QueryState>();
     private pendingDocs = new Map<number, (payload: { text: string; source: string } | null) => void>();
+    /** Nodes already sent a CATALOG_REQ, so meeting one twice in a session doesn't re-sync. */
+    private syncedPeers = new Set<number>();
     private activity: ActivityEvent[] = [];
     private queued = 0;
     private helloCount = 0;
@@ -315,15 +327,21 @@ export class MeshNode {
     }
 
     /**
-     * Broadcasts one document's chunk metadata so the mesh learns it exists.
+     * Sends one document's chunk metadata so the mesh learns it exists.
      *
-     * A one-shot flood, not a recurring reconcile pass — an upload's worth of
-     * ANNOUNCE packets is a brief burst well inside the radio's real throughput,
-     * unlike re-announcing the whole catalog on a timer.
+     * Broadcasts on upload (a one-shot flood, not a recurring reconcile pass —
+     * well inside the radio's real throughput for a single document's worth of
+     * packets) or unicasts as a CATALOG_RES when answering a CATALOG_REQ.
+     * Returns how many chunks were described, so a catalog-sync reply can budget
+     * against `CatalogReqPayload.max`.
      */
-    private async announce(docKey: number): Promise<void> {
+    private async announce(
+        docKey: number,
+        dst: number = BROADCAST,
+        type: typeof PacketType.ANNOUNCE | typeof PacketType.CATALOG_RES = PacketType.ANNOUNCE,
+    ): Promise<number> {
         const chunks = this.catalog.chunksOf(docKey);
-        if (!chunks.length) return;
+        if (!chunks.length) return 0;
 
         const docBytes = chunks.reduce((n, c) => n + c.text.length, 0);
         const createdAtSec = Math.floor(Date.now() / 1000);
@@ -348,7 +366,7 @@ export class MeshNode {
             });
 
             this.router.send(
-                PacketType.ANNOUNCE,
+                type,
                 encodeAnnounce({
                     docKey,
                     title: chunks[0].title,
@@ -359,9 +377,10 @@ export class MeshNode {
                     createdAtSec,
                     entries,
                 }),
-                BROADCAST,
+                dst,
             );
         }
+        return chunks.length;
     }
 
     /* ----------------------------- search ---------------------------- */
@@ -526,6 +545,10 @@ export class MeshNode {
                 return this.onDocRes(pkt);
             case PacketType.ANNOUNCE:
                 return this.onAnnounce(pkt);
+            case PacketType.CATALOG_REQ:
+                return this.onCatalogReq(pkt);
+            case PacketType.CATALOG_RES:
+                return this.onAnnounce(pkt);
             default:
                 break;
         }
@@ -543,7 +566,20 @@ export class MeshNode {
             lastSeen: Date.now(),
             hops: hopsTravelled(pkt),
         });
-        if (!known) this.note('recv', `${hello.name} joined`);
+        if (!known) {
+            this.note('recv', `${hello.name} joined`);
+            // Meeting a node for the first time this session: ask it for
+            // everything it holds, so content uploaded before this node was
+            // around still shows up rather than only being reachable by search.
+            if (!this.syncedPeers.has(pkt.srcId)) {
+                this.syncedPeers.add(pkt.srcId);
+                this.router.send(
+                    PacketType.CATALOG_REQ,
+                    encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
+                    pkt.srcId,
+                );
+            }
+        }
         this.emit('peers', this.peerList());
         // A beacon is proof of reachability, which is exactly the trigger anything
         // parked for that node has been waiting on.
@@ -667,6 +703,32 @@ export class MeshNode {
             await this.catalog.reload();
             this.emit('catalog', this.catalog.stats());
             this.note('recv', `pulled ${pulled} passage(s) of "${payload.title}"`);
+        }
+    }
+
+    /**
+     * Answers a newly-met peer's catalog sync request with the uploads and
+     * mesh-replicated documents held here.
+     *
+     * Deliberately excludes the seed corpus: `bootstrap.ts` splits it across
+     * nodes on purpose, so a search sometimes has to reach the mesh instead of
+     * answering from local storage alone — the point of the demo. Syncing it
+     * here too would converge every node to the full corpus on first contact
+     * and erase that. Real content — what a person actually uploaded, or what
+     * arrived from a peer — has no such reason to stay partial; that is what
+     * this catch-up is for.
+     *
+     * No delta tracking either — `sinceSec` is accepted for wire compatibility
+     * but ignored, since this node only ever sends a full dump once per peer
+     * (`syncedPeers` on the requester's side), not a re-sync on a timer.
+     */
+    private async onCatalogReq(pkt: Packet): Promise<void> {
+        const req = decodeCatalogReq(pkt.payload);
+        let sent = 0;
+        for (const doc of this.catalog.documents()) {
+            if (doc.provenance === 'seed') continue;
+            if (sent >= req.max) break;
+            sent += await this.announce(doc.docKey, pkt.srcId, PacketType.CATALOG_RES);
         }
     }
 

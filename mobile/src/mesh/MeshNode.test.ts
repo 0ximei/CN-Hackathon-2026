@@ -7,7 +7,7 @@ import { docIdOf, docKeyOf, type ParsedDoc } from '@core/lib/chunk';
 
 import { MeshNode, type MeshCatalog, type MeshHit } from './MeshNode';
 import { embedder } from '../search/embedder';
-import type { CatalogStats, StoredChunk } from '../storage/store';
+import type { CatalogStats, DocSummary, StoredChunk } from '../storage/store';
 
 /**
  * The catalog reduced to what the orchestrator uses.
@@ -38,6 +38,27 @@ class MemoryCatalog implements MeshCatalog {
         return [...this.chunks.values()]
             .filter((c) => c.docKey === docKey)
             .sort((a, b) => a.seq - b.seq);
+    }
+
+    documents(): DocSummary[] {
+        const byDoc = new Map<number, DocSummary>();
+        for (const c of this.chunks.values()) {
+            const existing = byDoc.get(c.docKey);
+            if (existing) {
+                existing.chunks++;
+                existing.bytes += c.text.length;
+            } else {
+                byDoc.set(c.docKey, {
+                    docKey: c.docKey,
+                    title: c.title,
+                    source: c.source,
+                    provenance: c.provenance,
+                    chunks: 1,
+                    bytes: c.text.length,
+                });
+            }
+        }
+        return [...byDoc.values()];
     }
 
     async ingestDoc(
@@ -287,6 +308,50 @@ describe('MeshNode over a simulated mesh', () => {
         const state = await b.node.search('cool a burn under water');
         const hit = state.hits.find((h) => h.title === 'Burns');
         expect(hit, 'the pulled passage is now searchable locally on Bravo').toBeDefined();
+        expect(hit!.local).toBe(true);
+    });
+
+    /**
+     * The bug a real second device hit: node B joins the mesh *after* A already
+     * uploaded something. There is no periodic reconcile to eventually catch B
+     * up — the only chance is the one-shot CATALOG_REQ/CATALOG_RES exchange
+     * triggered by meeting a peer for the first time.
+     */
+    it('syncs an upload to a peer that joins after it happened', async () => {
+        vi.useFakeTimers();
+        const a = build(0x61, 'Alpha');
+        const b = build(0x62, 'LateJoiner');
+
+        await startAll(a.node);
+        await a.node.upload(
+            'snakebite.md',
+            '# Snake Bite\n\nKeep the person still and calm; immobilise the bitten limb and seek antivenom urgently.',
+        );
+
+        // B only shows up now — the file was already uploaded before it existed.
+        a.transport.link(b.transport);
+        await startAll(b.node);
+
+        const synced = new Promise<void>((resolve) => {
+            const off = b.node.on('catalog', (stats) => {
+                if (stats.chunks > 0) {
+                    off();
+                    resolve();
+                }
+            });
+        });
+
+        // A's next periodic beacon is what introduces it to B; that HELLO is
+        // what triggers B's one-shot catalog sync request back to A.
+        await vi.advanceTimersByTimeAsync(3_100);
+        await synced;
+
+        // search()'s collection window polls with real setTimeout/setInterval
+        // semantics; switch back to real timers so it can actually resolve.
+        vi.useRealTimers();
+        const state = await b.node.search('immobilise a snake bite');
+        const hit = state.hits.find((h) => h.title === 'Snake Bite');
+        expect(hit, 'the pre-existing upload reached the late-joining peer').toBeDefined();
         expect(hit!.local).toBe(true);
     });
 });
