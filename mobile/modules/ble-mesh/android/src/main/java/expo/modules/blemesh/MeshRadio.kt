@@ -26,6 +26,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.ParcelUuid
 import java.util.concurrent.ConcurrentHashMap
 
@@ -94,6 +95,12 @@ class MeshRadio(
      * CENTRAL link has one, and it is what a failed dial is booked against.
      */
     var expectedNode: Int = 0
+    /** The stack reported this link connected, so `disconnect` is meaningful. */
+    var connected = false
+    /** Dialled with autoConnect: slower to arrive, and allowed to take longer. */
+    var background = false
+    /** This dial is why the scan is paused, and must hand it back exactly once. */
+    var holdsScan = false
     var retries = 0
     /** Consecutive over-the-air write failures reported by the async GATT callback. */
     var writeFailures = 0
@@ -120,6 +127,18 @@ class MeshRadio(
 
   private var thread: HandlerThread? = null
   private var handler: Handler? = null
+
+  /**
+   * `connectGatt` is issued from here and nowhere else.
+   *
+   * The stack binds part of its client-callback plumbing to the looper of the
+   * calling thread, and a connection opened from an arbitrary background thread
+   * is a well-worn source of status 133 — sometimes immediately, sometimes only
+   * once a second link is in play. Everything *after* the connection is opened
+   * still runs on the radio thread; only the call itself moves.
+   */
+  private val mainHandler = Handler(Looper.getMainLooper())
+
   private var running = false
 
   /**
@@ -191,6 +210,20 @@ class MeshRadio(
     const val MAX_DIAL_BACKOFF_MS = 60_000L
     const val MAX_BACKOFF_DOUBLINGS = 5
     const val FACELESS_LOG_MS = 30_000L
+
+    /**
+     * Direct attempts before handing the peer to `autoConnect`. Two, because a
+     * direct connect that is going to work usually works first time, and the
+     * second only covers a peer that was briefly busy.
+     */
+    const val DIRECT_DIAL_ATTEMPTS = 2
+
+    /** A background connect waits for the device, so it gets a longer leash. */
+    const val BACKGROUND_CONNECT_TIMEOUT_MS = 45_000L
+
+    /** Android's limit is five starts per thirty seconds; stay under it. */
+    const val SCAN_QUOTA = 4
+    const val SCAN_QUOTA_WINDOW_MS = 30_000L
   }
 
   /* ------------------------------------------------------------------ */
@@ -224,6 +257,7 @@ class MeshRadio(
     if (!running) return
     running = false
     val h = handler ?: return
+    mainHandler.removeCallbacksAndMessages(null)
     h.post {
       h.removeCallbacksAndMessages(null)
       stopAdvertising()
@@ -234,6 +268,8 @@ class MeshRadio(
       dialling.clear()
       dialBackoff.clear()
       dialFailures.clear()
+      scanStarts.clear()
+      scanRestartPending = false
       try {
         gattServer?.close()
       } catch (e: Exception) {
@@ -510,8 +546,37 @@ class MeshRadio(
     }
   }
 
+  /**
+   * Android blocks an app that calls `startScan` more than five times in thirty
+   * seconds, and blocks it silently — scanning simply stops reporting results,
+   * which on this app looks exactly like an empty room. Pausing the scan around
+   * each dial makes that limit reachable, so starts are spaced to stay clear of
+   * it and a start that would breach the quota waits for the window instead.
+   */
+  private val scanStarts = ArrayDeque<Long>()
+  private var scanning = false
+  private var scanRestartPending = false
+
   private fun startScanning() {
+    if (!running || scanning) return
     val s = adapter?.bluetoothLeScanner ?: return
+
+    val now = System.currentTimeMillis()
+    while (scanStarts.isNotEmpty() && scanStarts.first() < now - SCAN_QUOTA_WINDOW_MS) {
+      scanStarts.removeFirst()
+    }
+    if (scanStarts.size >= SCAN_QUOTA) {
+      if (scanRestartPending) return
+      scanRestartPending = true
+      val wait = scanStarts.first() + SCAN_QUOTA_WINDOW_MS - now + 200
+      handler?.postDelayed({
+        scanRestartPending = false
+        startScanning()
+      }, wait)
+      return
+    }
+    scanStarts.addLast(now)
+
     scanner = s
     val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(MeshWire.SERVICE)).build())
     val settings = ScanSettings.Builder()
@@ -523,6 +588,7 @@ class MeshRadio(
       .build()
     try {
       s.startScan(filters, settings, scanCallback)
+      scanning = true
       log("scanning for mesh nodes")
     } catch (e: Exception) {
       log("startScan threw: ${e.message}")
@@ -530,12 +596,35 @@ class MeshRadio(
   }
 
   private fun stopScanning() {
+    if (!scanning) return
     try {
       scanner?.stopScan(scanCallback)
     } catch (e: Exception) {
       log("stopScan threw: ${e.message}")
     }
     scanner = null
+    scanning = false
+  }
+
+  /**
+   * Take the radio off scanning for the duration of a connection attempt.
+   *
+   * An LE scan running while a GATT connection is being established is the
+   * single most common cause of status 133 on Android, and this one scans at
+   * `SCAN_MODE_LOW_LATENCY` with aggressive matching — about as hostile to a
+   * concurrent connect as the API allows. The attempt gets the radio to itself
+   * and the scan comes back the moment no direct dial is outstanding.
+   */
+  private fun holdScanFor(link: Link) {
+    link.holdsScan = true
+    stopScanning()
+  }
+
+  private fun releaseScan(link: Link) {
+    if (!link.holdsScan) return
+    link.holdsScan = false
+    if (links.values.any { it.holdsScan }) return
+    startScanning()
   }
 
   /**
@@ -618,17 +707,66 @@ class MeshRadio(
     log("$address advertises the mesh service but no node id — older build?")
   }
 
+  /**
+   * Open a connection, doing the three things the Android stack insists on.
+   *
+   * A direct `connectGatt` is fast and usually right, and when it is not it
+   * fails as status 133 — a generic error the stack returns for most of its
+   * internal refusals. Three of its causes are ours to avoid:
+   *
+   *  - a concurrent LE scan, so the scan is paused for the attempt;
+   *  - a call from a thread other than the main looper, so the call is posted
+   *    there while everything around it stays on the radio thread;
+   *  - a direct connection to a device that is not there right now, which is
+   *    what `autoConnect` exists for. Direct attempts are tried first because
+   *    they are seconds rather than tens of seconds; after a couple of failures
+   *    the peer is clearly not answering a direct call and the attempt is handed
+   *    to the stack's background connector, which waits for the device instead
+   *    of insisting on it.
+   */
   private fun dial(device: BluetoothDevice, expectedNode: Int, rssi: Int) {
     dialling.add(device.address)
-    log("dialling ${peerIdOf(expectedNode)} at ${device.address}")
     val link = Link(device, Role.CENTRAL)
     link.rssi = rssi
     link.expectedNode = expectedNode
+    link.background = (dialFailures[expectedNode] ?: 0) >= DIRECT_DIAL_ATTEMPTS
     links[link.key] = link
-    // autoConnect=false gives a direct, fast connection; TRANSPORT_LE avoids the
-    // stack guessing BR/EDR and returning status 133 on dual-mode devices.
-    link.gatt = device.connectGatt(context, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
-    if (link.gatt == null) teardown(link, "connectGatt refused")
+
+    log(
+      "dialling ${peerIdOf(expectedNode)} at ${device.address}" +
+        if (link.background) " (background)" else "",
+    )
+
+    // A background connect may sit for a long time by design, and holding the
+    // scan down for it would blind this node for as long as it waits.
+    if (!link.background) holdScanFor(link)
+
+    mainHandler.post {
+      // TRANSPORT_LE keeps the stack from guessing BR/EDR, which is its own
+      // route to 133 on a dual-mode phone.
+      val gatt = try {
+        device.connectGatt(context, link.background, clientCallback, BluetoothDevice.TRANSPORT_LE)
+      } catch (e: Exception) {
+        null
+      }
+      val radio = handler
+      if (radio == null) {
+        // Stopped while the call was crossing threads. Nothing will run on the
+        // radio thread again, so the handle has to be released here.
+        runCatching { gatt?.close() }
+        return@post
+      }
+      radio.post {
+        if (links[link.key] !== link) {
+          // Torn down while the call was crossing threads; the handle it
+          // returned is still ours to close.
+          runCatching { gatt?.close() }
+          return@post
+        }
+        link.gatt = gatt
+        if (gatt == null) teardown(link, "connectGatt refused")
+      }
+    }
   }
 
   private val clientCallback = object : BluetoothGattCallback() {
@@ -636,6 +774,7 @@ class MeshRadio(
       post {
         val link = links[linkKey(gatt.device.address, Role.CENTRAL)]
         if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+          link?.connected = true
           // MTU first, then discovery: asking afterwards makes some stacks keep
           // serving the 23-byte default to already-discovered characteristics.
           gatt.requestMtu(PREFERRED_MTU)
@@ -689,6 +828,8 @@ class MeshRadio(
         }
         dialling.remove(gatt.device.address)
         link.ready = true
+        // The connection is established; scanning is safe again.
+        releaseScan(link)
         enqueue(link, MeshWire.KIND_HELLO, idBytes(selfId))
       }
     }
@@ -896,13 +1037,23 @@ class MeshRadio(
     link.ready = false
     try {
       when (link.role) {
-        Role.CENTRAL -> link.gatt?.let { it.disconnect(); it.close() }
+        // `close` always, `disconnect` only if there is a connection to drop:
+        // disconnecting a handle that never connected leaves the stack holding
+        // a client interface, and it has a finite number of those. Running out
+        // is one of the ways a phone starts answering every dial with 133 and
+        // keeps doing it until the app is restarted.
+        Role.CENTRAL -> link.gatt?.let {
+          if (link.connected) it.disconnect()
+          it.close()
+        }
         Role.PERIPHERAL -> gattServer?.cancelConnection(link.device)
       }
     } catch (e: Exception) {
       log("teardown threw: ${e.message}")
     }
     link.gatt = null
+    link.connected = false
+    releaseScan(link)
     if (link.identified) log("lost ${peerIdOf(link.nodeId)}: $reason") else noteDialFailure(link, reason)
     emitPeers()
   }
@@ -943,7 +1094,8 @@ class MeshRadio(
       dialBackoff.entries.removeAll { it.value < now - MAX_DIAL_BACKOFF_MS * 2 }
       dialFailures.keys.removeAll { !dialBackoff.containsKey(it) }
       for (link in links.values.toList()) {
-        if (!link.ready && now - link.openedAt > CONNECT_TIMEOUT_MS) {
+        val budget = if (link.background) BACKGROUND_CONNECT_TIMEOUT_MS else CONNECT_TIMEOUT_MS
+        if (!link.ready && now - link.openedAt > budget) {
           teardown(link, "handshake never completed")
         }
       }

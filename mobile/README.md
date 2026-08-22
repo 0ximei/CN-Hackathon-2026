@@ -226,14 +226,26 @@ room, and each is commented at the code:
   every flood arriving twice. The lower node id owns the central role and the
   higher one waits, with a nine-second escape hatch in case the call never
   comes. No negotiation is needed: both sides know both ids.
-- **Backoff on a failed dial.** Android's GATT client takes about one
-  connection attempt at a time and punishes a caller that retries in a loop:
-  the follow-ups fail with status 133 and the client interfaces they hold are
-  not reliably returned. Scan results arrive several times a second, so a dial
-  path with no backoff turns one failed connection into an unbounded redial
-  storm — a log full of `dialling …` and a mesh that never links. Each
-  consecutive failure doubles the wait, to a minute; a successful handshake
-  clears the record.
+- **A connect path built around status 133.** 133 is `GATT_ERROR`, the generic
+  code the Android stack returns for most of its internal refusals, and four of
+  its causes are the caller's to avoid. The scan is paused for the duration of
+  a direct attempt, because an LE scan running during connection establishment
+  is its most common trigger and this one scans at `SCAN_MODE_LOW_LATENCY`.
+  `connectGatt` is issued on the main looper, since the stack binds part of its
+  callback plumbing to the calling thread. `close()` is called on every handle
+  and `disconnect()` only on one that actually connected, so the finite pool of
+  client interfaces is not leaked — exhausting it is how a phone starts
+  answering *every* dial with 133 until the app restarts. And after two failed
+  direct attempts the peer is handed to `autoConnect`, which waits for a device
+  instead of insisting it is there.
+- **Backoff on a failed dial.** The GATT client takes about one attempt at a
+  time and answers a tight retry loop with 133. Scan results arrive several
+  times a second, so a dial path with no backoff turns one failed connection
+  into an unbounded redial storm — a log full of `dialling …` and a mesh that
+  never links. Each consecutive failure doubles the wait, to a minute; a
+  successful handshake clears the record. Scan restarts are rate-limited for
+  the same reason: Android silently stops reporting results to an app that
+  calls `startScan` more than five times in thirty seconds.
 - **Flow control.** `writeCharacteristic` and `notifyCharacteristicChanged`
   fail while the connection is congested and silently discard what you gave
   them. The classic Android BLE bug is to loop over your data, watch every call
