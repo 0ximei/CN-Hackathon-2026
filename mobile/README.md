@@ -226,6 +226,14 @@ room, and each is commented at the code:
   every flood arriving twice. The lower node id owns the central role and the
   higher one waits, with a nine-second escape hatch in case the call never
   comes. No negotiation is needed: both sides know both ids.
+- **Backoff on a failed dial.** Android's GATT client takes about one
+  connection attempt at a time and punishes a caller that retries in a loop:
+  the follow-ups fail with status 133 and the client interfaces they hold are
+  not reliably returned. Scan results arrive several times a second, so a dial
+  path with no backoff turns one failed connection into an unbounded redial
+  storm — a log full of `dialling …` and a mesh that never links. Each
+  consecutive failure doubles the wait, to a minute; a successful handshake
+  clears the record.
 - **Flow control.** `writeCharacteristic` and `notifyCharacteristicChanged`
   fail while the connection is congested and silently discard what you gave
   them. The classic Android BLE bug is to loop over your data, watch every call
@@ -240,9 +248,14 @@ room, and each is commented at the code:
   misbehaves when driven from several threads, so every mutation runs on a
   single `HandlerThread`.
 
-Nodes are found by a 128-bit service UUID in the advertisement, with the node id
-in the scan response — the advertisement itself has no room left, since the UUID
-alone costs 18 of its 31 bytes. Characteristics are unencrypted by design:
+Nodes are found by a 128-bit service UUID in the advertisement, which carries
+the node id alongside it: flags cost 3 of the 31 bytes and the UUID 18, leaving
+just enough for four bytes of id and its header. The id is repeated in the scan
+response, which is free, but it cannot live *only* there — an advertisement and
+its scan response are separate radio events, and whether the stack merges them
+before handing over a `ScanResult` is up to the stack. A peer whose id cannot be
+read is one the tie-break cannot rank, so it is skipped entirely.
+Characteristics are unencrypted by design:
 requiring encryption would force pairing, and a mesh whose nodes must be paired
 by hand before they can route is not a mesh. What a node *is* is established
 above the link, by the identity exchange, not by whether it managed to bond.

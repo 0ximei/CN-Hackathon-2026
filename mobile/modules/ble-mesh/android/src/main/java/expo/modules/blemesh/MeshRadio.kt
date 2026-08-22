@@ -89,6 +89,11 @@ class MeshRadio(
     /** The peer told us its node id, so it can be addressed. */
     var identified = false
     var rssi: Int = 0
+    /**
+     * Who we believed we were dialling, before a HELLO proved it. Only a
+     * CENTRAL link has one, and it is what a failed dial is booked against.
+     */
+    var expectedNode: Int = 0
     var retries = 0
     /** Consecutive over-the-air write failures reported by the async GATT callback. */
     var writeFailures = 0
@@ -101,6 +106,12 @@ class MeshRadio(
 
   private val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
   private val adapter: BluetoothAdapter? get() = manager.adapter
+
+  /**
+   * Whether the node id fits in the primary advertisement on this device. Set
+   * false only if the stack rejects the packet; see [advertiseCallback].
+   */
+  private var advertiseIdInPrimary = true
 
   private var advertiser: BluetoothLeAdvertiser? = null
   private var scanner: BluetoothLeScanner? = null
@@ -125,6 +136,14 @@ class MeshRadio(
    */
   private val awaitingInbound = HashMap<Int, Long>()
   private val dialling = HashSet<String>()
+
+  /**
+   * Node id -> the earliest time we may dial it again, and how many attempts in
+   * a row have come to nothing. Both are cleared the moment a link to that node
+   * identifies, so a peer that works is never penalised for an earlier miss.
+   */
+  private val dialBackoff = HashMap<Int, Long>()
+  private val dialFailures = HashMap<Int, Int>()
 
   private companion object {
     const val MAX_CENTRAL_LINKS = 4
@@ -153,6 +172,25 @@ class MeshRadio(
      * way to notice.
      */
     const val CONNECT_TIMEOUT_MS = 15_000L
+
+    /**
+     * How long to leave a node alone after a dial to it failed.
+     *
+     * Android's GATT client takes roughly one connection attempt at a time and
+     * punishes a caller that retries in a tight loop: the follow-up attempts
+     * fail with status 133, and the client interfaces they hold are not always
+     * given back. Scan results arrive several times a second, so a dial path
+     * with no backoff turns one failed connection into an unbounded redial
+     * storm — a log full of `dialling ...` and a mesh that never links.
+     *
+     * The wait doubles per consecutive failure. A peer that is simply out of
+     * range costs one attempt a minute instead of thousands, and a peer that
+     * comes back is dialled promptly because a successful identify clears it.
+     */
+    const val DIAL_BACKOFF_MS = 3_000L
+    const val MAX_DIAL_BACKOFF_MS = 60_000L
+    const val MAX_BACKOFF_DOUBLINGS = 5
+    const val FACELESS_LOG_MS = 30_000L
   }
 
   /* ------------------------------------------------------------------ */
@@ -194,6 +232,8 @@ class MeshRadio(
       links.clear()
       awaitingInbound.clear()
       dialling.clear()
+      dialBackoff.clear()
+      dialFailures.clear()
       try {
         gattServer?.close()
       } catch (e: Exception) {
@@ -246,6 +286,19 @@ class MeshRadio(
     }
 
     override fun onStartFailure(errorCode: Int) {
+      // A node that cannot advertise cannot be found at all, so the one failure
+      // worth recovering from automatically is the one we might have caused:
+      // some stacks count the 31 bytes differently than the arithmetic above.
+      // Drop back to a bare service UUID and let the scan response carry the id.
+      if (errorCode == AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE && advertiseIdInPrimary) {
+        advertiseIdInPrimary = false
+        log("advertisement too large with the node id in it, falling back")
+        post {
+          stopAdvertising()
+          startAdvertising()
+        }
+        return
+      }
       val reason = when (errorCode) {
         AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED -> "already started"
         AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE -> "advertisement payload too large"
@@ -270,14 +323,18 @@ class MeshRadio(
       .setTimeout(0)
       .build()
 
-    // A 128-bit service UUID costs 18 of the 31 advertisement bytes, and the
-    // flags field takes 3. The node id will not also fit, so it goes in the
-    // scan response — which a scanner in active mode always requests anyway.
-    val payload = AdvertiseData.Builder()
-      .setIncludeDeviceName(false)
-      .setIncludeTxPowerLevel(false)
-      .addServiceUuid(ParcelUuid(MeshWire.SERVICE))
-      .build()
+    // The 31-byte budget: flags 3, a 128-bit service UUID 18, four bytes of node
+    // id with its header 8 — 29, with two to spare.
+    //
+    // The id used to live in the scan response alone, on the reasoning that an
+    // active scanner always asks for one. It does, but the two reports are
+    // separate radio events and whether the stack merges them before handing
+    // over a ScanResult is up to the stack; several OEM builds deliver the
+    // advertisement by itself. [considerPeer] cannot act on a peer whose id it
+    // cannot read, so a node whose scan response never arrives is invisible to
+    // half the room. It goes in the packet that always arrives, and is repeated
+    // in the scan response, which is free.
+    val payload = advertisement(withId = advertiseIdInPrimary)
 
     val scanResponse = AdvertiseData.Builder()
       .setIncludeDeviceName(false)
@@ -289,6 +346,15 @@ class MeshRadio(
     } catch (e: Exception) {
       log("startAdvertising threw: ${e.message}")
     }
+  }
+
+  private fun advertisement(withId: Boolean): AdvertiseData {
+    val builder = AdvertiseData.Builder()
+      .setIncludeDeviceName(false)
+      .setIncludeTxPowerLevel(false)
+      .addServiceUuid(ParcelUuid(MeshWire.SERVICE))
+    if (withId) builder.addManufacturerData(MeshWire.MANUFACTURER_ID, idBytes(selfId))
+    return builder.build()
   }
 
   private fun stopAdvertising() {
@@ -484,12 +550,22 @@ class MeshRadio(
    * The wait is not unconditional. If the lower node never calls — it may have
    * hit its connection budget, or its central role may be wedged — the higher
    * one dials after a grace period rather than sitting there forever.
+   *
+   * Every path out of here that does *not* dial has to be cheap, because this
+   * runs on every advertisement and a phone in range produces several a second.
    */
   private fun considerPeer(result: ScanResult) {
     if (!running) return
     val record = result.scanRecord ?: return
-    val idData = record.getManufacturerSpecificData(MeshWire.MANUFACTURER_ID) ?: return
-    if (idData.size < 4) return
+    val idData = record.getManufacturerSpecificData(MeshWire.MANUFACTURER_ID)
+    if (idData == null || idData.size < 4) {
+      // It answers to the mesh service UUID but carries no node id, so the
+      // tie-break cannot be evaluated and it has to be skipped. Worth saying
+      // out loud once in a while: this is what an unreadable scan response
+      // looks like from this side, and it is otherwise completely silent.
+      noteFaceless(result.device.address)
+      return
+    }
     val peerNode = readId(idData)
     if (peerNode == 0 || peerNode == selfId) return
 
@@ -501,18 +577,45 @@ class MeshRadio(
     val address = result.device.address
     if (dialling.contains(address)) return
     if (links.containsKey(linkKey(address, Role.CENTRAL))) return
+    // An inbound connection from this address is this peer arriving under its
+    // own steam, mid-handshake and not yet identified. Dialling it as well only
+    // manufactures a duplicate for `identify` to close again, at the cost of a
+    // connection attempt the adapter would rather spend elsewhere.
+    if (links.containsKey(linkKey(address, Role.PERIPHERAL))) return
+    // Our own dial to this node, in flight under a different address: BLE
+    // addresses rotate, so `dialling` alone does not catch it.
+    if (links.values.any { !it.identified && it.expectedNode == peerNode }) return
+
+    val now = System.currentTimeMillis()
+    dialBackoff[peerNode]?.let { if (now < it) return }
 
     val weDial = Integer.compareUnsigned(selfId, peerNode) < 0
     if (!weDial) {
-      val since = awaitingInbound.getOrPut(peerNode) { System.currentTimeMillis() }
-      if (System.currentTimeMillis() - since < INBOUND_GRACE_MS) return
-      log("${peerIdOf(peerNode)} never dialled us, dialling it instead")
+      val since = awaitingInbound.getOrPut(peerNode) { now }
+      if (now - since < INBOUND_GRACE_MS) return
     }
 
     val centralLinks = links.values.count { it.role == Role.CENTRAL }
     if (centralLinks >= MAX_CENTRAL_LINKS) return
 
+    // Re-arm the grace period before dialling, not after it resolves. Whether
+    // this attempt succeeds or fails, the next decision about this peer should
+    // start its own wait — otherwise a lapsed grace stays lapsed and the escape
+    // hatch fires again on the very next advertisement.
+    awaitingInbound[peerNode] = now
+    if (!weDial) log("${peerIdOf(peerNode)} never dialled us, dialling it instead")
+
     dial(result.device, peerNode, result.rssi)
+  }
+
+  /** Throttled: a faceless node is reported by one advertisement in hundreds. */
+  private var facelessLoggedAt = 0L
+
+  private fun noteFaceless(address: String) {
+    val now = System.currentTimeMillis()
+    if (now - facelessLoggedAt < FACELESS_LOG_MS) return
+    facelessLoggedAt = now
+    log("$address advertises the mesh service but no node id — older build?")
   }
 
   private fun dial(device: BluetoothDevice, expectedNode: Int, rssi: Int) {
@@ -520,6 +623,7 @@ class MeshRadio(
     log("dialling ${peerIdOf(expectedNode)} at ${device.address}")
     val link = Link(device, Role.CENTRAL)
     link.rssi = rssi
+    link.expectedNode = expectedNode
     links[link.key] = link
     // autoConnect=false gives a direct, fast connection; TRANSPORT_LE avoids the
     // stack guessing BR/EDR and returning status 133 on dual-mode devices.
@@ -765,6 +869,9 @@ class MeshRadio(
     link.nodeId = nodeId
     link.identified = true
     awaitingInbound.remove(nodeId)
+    // The peer works. Anything held against it from an earlier failure is stale.
+    dialFailures.remove(nodeId)
+    dialBackoff.remove(nodeId)
 
     val duplicate = links.values.firstOrNull {
       it !== link && it.identified && it.nodeId == nodeId
@@ -796,8 +903,27 @@ class MeshRadio(
       log("teardown threw: ${e.message}")
     }
     link.gatt = null
-    if (link.identified) log("lost ${peerIdOf(link.nodeId)}: $reason")
+    if (link.identified) log("lost ${peerIdOf(link.nodeId)}: $reason") else noteDialFailure(link, reason)
     emitPeers()
+  }
+
+  /**
+   * A dial that never reached an identified link, held against the node so the
+   * next attempt waits. Only outbound links count: an inbound connection that
+   * dies is the peer's attempt to spend, not ours.
+   */
+  private fun noteDialFailure(link: Link, reason: String) {
+    if (link.role != Role.CENTRAL) return
+    val node = link.expectedNode
+    if (node == 0 || !running) return
+    val failures = (dialFailures[node] ?: 0) + 1
+    dialFailures[node] = failures
+    val wait = minOf(
+      DIAL_BACKOFF_MS shl minOf(failures - 1, MAX_BACKOFF_DOUBLINGS),
+      MAX_DIAL_BACKOFF_MS,
+    )
+    dialBackoff[node] = System.currentTimeMillis() + wait
+    log("dial to ${peerIdOf(node)} failed ($reason), attempt $failures, waiting ${wait / 1000}s")
   }
 
   /* ------------------------------------------------------------------ */
@@ -811,6 +937,11 @@ class MeshRadio(
       // advertisement; expiring the record is what lets that happen.
       val now = System.currentTimeMillis()
       awaitingInbound.entries.removeAll { it.value < now - INBOUND_GRACE_MS * 3 }
+      // A node out of range for a good while is not a node in penalty; forget
+      // its record so it is dialled promptly when it comes back, and so neither
+      // map grows for the life of the session.
+      dialBackoff.entries.removeAll { it.value < now - MAX_DIAL_BACKOFF_MS * 2 }
+      dialFailures.keys.removeAll { !dialBackoff.containsKey(it) }
       for (link in links.values.toList()) {
         if (!link.ready && now - link.openedAt > CONNECT_TIMEOUT_MS) {
           teardown(link, "handshake never completed")
