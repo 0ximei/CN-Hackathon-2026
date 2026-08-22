@@ -43,7 +43,15 @@ CREATE TABLE IF NOT EXISTS docs (
   chunkCount INTEGER NOT NULL,
   originId   INTEGER NOT NULL,
   createdAt  INTEGER NOT NULL,
-  provenance TEXT NOT NULL DEFAULT 'mesh'
+  provenance TEXT NOT NULL DEFAULT 'mesh',
+  -- Authorship. Hex rather than BLOB for the same reason the embeddings are
+  -- base64: it removes every question about how a given expo-sqlite build
+  -- round-trips a typed array, and a signature that comes back subtly wrong
+  -- would read as a forgery.
+  docHash    TEXT NOT NULL DEFAULT '',
+  authorKey  TEXT NOT NULL DEFAULT '',
+  sig        TEXT NOT NULL DEFAULT '',
+  authorship TEXT NOT NULL DEFAULT 'unsigned'
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -128,7 +136,40 @@ export async function openDatabase(): Promise<SQLite.SQLiteDatabase> {
   const db = await SQLite.openDatabaseAsync(DATABASE);
   await db.execAsync(DDL);
   await migrateFlatChunks(db);
+  await migrateColumns(db);
   return db;
+}
+
+/**
+ * Columns added to a table that already exists.
+ *
+ * `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so adding
+ * a column to the DDL above reaches fresh installs and nobody else: the app
+ * passes every test, ships, and then every query mentioning the new column
+ * fails on exactly the devices that have data. Upgrades are the one path a
+ * fresh test database cannot exercise, so it needs saying out loud.
+ *
+ * Each entry is checked against `pragma_table_info` rather than tracked by a
+ * version counter, which makes the list idempotent and order-independent — a
+ * device that skipped three releases lands in the same place as one that
+ * skipped none.
+ */
+const COLUMNS: { table: string; column: string; decl: string }[] = [
+  { table: 'docs', column: 'docHash', decl: "TEXT NOT NULL DEFAULT ''" },
+  { table: 'docs', column: 'authorKey', decl: "TEXT NOT NULL DEFAULT ''" },
+  { table: 'docs', column: 'sig', decl: "TEXT NOT NULL DEFAULT ''" },
+  { table: 'docs', column: 'authorship', decl: "TEXT NOT NULL DEFAULT 'unsigned'" },
+];
+
+async function migrateColumns(db: SQLite.SQLiteDatabase): Promise<void> {
+  for (const { table, column, decl } of COLUMNS) {
+    const existing = await db.getAllAsync<{ name: string }>(
+      `SELECT name FROM pragma_table_info(?)`,
+      [table],
+    );
+    if (existing.some((c) => c.name === column)) continue;
+    await db.execAsync(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
 }
 
 /**

@@ -1,3 +1,5 @@
+import type { Authorship } from '../identity/authorship';
+
 import type { Scored } from '@core/search/vector';
 
 /**
@@ -20,10 +22,20 @@ export interface DocRow {
     /** Total body bytes across every chunk, as the origin counted them. */
     bytes: number;
     chunkCount: number;
-    /** Node that first uploaded it. */
+    /** Node that first uploaded it, and the one the signature names. */
     originId: number;
     createdAt: number;
     provenance: Provenance;
+    /**
+     * SHA-256 of the content. Empty for the built-in corpus and for anything
+     * that arrived from a build predating the attestation.
+     */
+    docHash?: Uint8Array;
+    /** The author's Ed25519 key and its signature over the manifest. */
+    authorKey?: Uint8Array;
+    sig?: Uint8Array;
+    /** The verdict reached when this row was written. Never re-derived on read. */
+    authorship: Authorship;
 }
 
 /**

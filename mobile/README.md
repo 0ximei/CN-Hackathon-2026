@@ -333,6 +333,52 @@ above the link, by the identity exchange, not by whether it managed to bond.
 
 ---
 
+## Who wrote this
+
+Node identity was already provable: a peer answers a challenge with a signature
+and its id is the hash of its key, so claiming an id and proving it are the same
+act. That says nothing about a *document*. A file crosses several hops, is
+re-announced by nodes that did not write it, and lands on phones that have never
+met its author — so the proof has to travel with the document, not with the link
+it arrived on.
+
+An upload is signed before its first announcement leaves. What travels is the
+author's Ed25519 public key, a signature over the document's manifest, and a
+SHA-256 of the content. A receiver checks three things, and they answer
+different questions:
+
+1. **The signature verifies** under the key that came with it — somebody holding
+   that private key attested to this exact manifest.
+2. **The key hashes to the claimed author id.** Without this, step 1 proves only
+   that *someone* signed it; a forger can always sign their own forgery with
+   their own key and staple it to a stolen author id.
+3. **The content hashes to what was signed** — the part that covers the bytes
+   rather than the description of them.
+
+Every field in the manifest is length-prefixed, because without that a manifest
+with title `ab` and source `c` encodes identically to one with title `a` and
+source `bc`, and one signature would verify both — a free way to relabel someone
+else's document.
+
+The Files tab shows the author, the hash and the signature, with the document
+marked `SIGNED`, `UNSIGNED` or `FORGED`. Those are three states, not two.
+`UNSIGNED` is an honest absence — the built-in corpus, or a node with no keys —
+where `FORGED` is an accusation, and conflating them would either slander the
+seed corpus or hide a real attack. A forged document is still ingested, because
+refusing data on suspicion is how a mesh loses the ability to route; it is shown
+as claiming an author rather than having one, and the key it arrived with is
+discarded rather than stored.
+
+**Two honest limits.** The content check needs the whole document: the hash
+covers every passage in order, so a node holding four of six says "not held in
+full here" rather than reporting a failure it did not observe. And this binds a
+document to a *keypair*, not to a person — binding a keypair to a human is what
+the safety-number comparison in the Node tab is for.
+
+Attestation costs 128 bytes on an announcement: 32 for the hash, 96 for the key
+and signature, and the 96 are omitted entirely when a document is unsigned,
+which is most of what a fresh node gossips.
+
 ## Answers
 
 Retrieval finds passages; the generator turns them into an answer. On this build
@@ -375,6 +421,7 @@ the best at runtime.
 | Storage | Dexie / IndexedDB | expo-sqlite, same two tiers |
 | Replication | shared `policy.ts` | **shared `policy.ts`** |
 | Identity | random per tab, unauthenticated | **Ed25519, challenge/response** |
+| Document authorship | none | **signed on upload, verified on receipt** |
 | Embeddings | MiniLM via transformers.js | hashing embedder + BM25 (below) |
 | Relevance floor | cosine ≥ 0.42 | blended ≥ 0.40 (below) |
 | Answer generation | WebLLM (WebGPU) | **llama.cpp via `llama.rn`, GGUF, CPU** |
@@ -436,7 +483,7 @@ identity layer and the storage helpers:
 npm test
 ```
 
-141 tests. Alongside the packet round-trips, framing, routing invariants and
+156 tests. Alongside the packet round-trips, framing, routing invariants and
 replication policy in `src/core`, this build covers:
 
 - a three-node simulated mesh where a passage held only two hops away comes back
@@ -452,6 +499,14 @@ replication policy in `src/core`, this build covers:
   existing coverage stopped at "the peer learned the passage exists";
 - a catalog sync whose request is lost on the radio, recovering without waiting
   for the once-a-minute re-announcement walk to come round;
+- authorship: a signature stapled to somebody else's author id, a relay that
+  edits the title, the filename or the content hash, a character moved across a
+  field boundary, and half an attestation — each rejected, and an absent
+  signature called unsigned rather than forged;
+- a hostile peer on the wire re-announcing a real signature over an edited
+  document, and the receiving node storing it as forged with the key discarded;
+- a `docs` table created before the authorship columns existed, upgraded and
+  still readable — the upgrade path a fresh test database cannot exercise;
 - the context window: passages dropped from the back rather than cut in half,
   one over-long passage kept rather than sending none, and the assembled prompt
   measured against the window it claims to respect — because overflowing it

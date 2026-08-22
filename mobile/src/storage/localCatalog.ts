@@ -20,6 +20,8 @@ import {
 } from '../search/relevance';
 import { fromBase64, toBase64 } from '../lib/base64';
 import { openDatabase } from './schema';
+import { hashDocument, type Authorship } from '../identity/authorship';
+import { fromHex, toHex } from '../identity/keys';
 import { serializer } from './serialize';
 import {
     SNIPPET_CHARS,
@@ -99,14 +101,32 @@ export class LocalCatalog {
         interface MetaSql extends Omit<MetaRow, 'q'> {
             q: string;
         }
+        interface DocSql extends Omit<DocRow, 'docHash' | 'authorKey' | 'sig' | 'authorship'> {
+            docHash: string;
+            authorKey: string;
+            sig: string;
+            authorship: string;
+        }
+        // Hex in, bytes out. An empty column is an absent field rather than a
+        // zero-length key, so `verifyAuthorship` sees "unsigned" and not
+        // "signed with nothing".
+        const fromSql = (d: DocSql): DocRow => ({
+            ...d,
+            docHash: d.docHash ? fromHex(d.docHash) : undefined,
+            authorKey: d.authorKey ? fromHex(d.authorKey) : undefined,
+            sig: d.sig ? fromHex(d.sig) : undefined,
+            authorship: (d.authorship || 'unsigned') as Authorship,
+        });
         const [metaRows, bodyRows, docRows] = await Promise.all([
             this.db.getAllAsync<MetaSql>(
                 `SELECT docId, docKey, seq, title, section, snippet, q, scale, bytes, originId, version, updatedAt
                    FROM meta ORDER BY docKey, seq`,
             ),
             this.db.getAllAsync<{ docId: number; text: string }>('SELECT docId, text FROM bodies'),
-            this.db.getAllAsync<DocRow>(
-                `SELECT docKey, title, source, bytes, chunkCount, originId, createdAt, provenance FROM docs`,
+            this.db.getAllAsync<DocSql>(
+                `SELECT docKey, title, source, bytes, chunkCount, originId, createdAt, provenance,
+                        docHash, authorKey, sig, authorship
+                   FROM docs`,
             ),
         ]);
 
@@ -116,7 +136,7 @@ export class LocalCatalog {
         this.rowOf = new Map();
         this.bodyText = new Map(bodyRows.map((b) => [b.docId, b.text]));
         this.haveBody = new Set(this.bodyText.keys());
-        this.docsByKey = new Map(docRows.map((d) => [d.docKey, d]));
+        this.docsByKey = new Map(docRows.map((d) => [d.docKey, fromSql(d)]));
 
         metaRows.forEach((row, i) => {
             const bytes = fromBase64(row.q);
@@ -393,6 +413,13 @@ export class LocalCatalog {
             originId,
             createdAt: now,
             provenance,
+            // Computed here because this is the only place that has every
+            // chunk's text at once. A node that later holds two chunks out of
+            // six cannot derive it, which is exactly why it has to travel.
+            docHash: hashDocument(parsed.title, parsed.chunks.map((c) => c.text)),
+            // Nothing has signed it yet. `MeshNode.upload` attests immediately
+            // afterwards if this node has keys; a seeded document never does.
+            authorship: 'unsigned',
         };
 
         await this.transact(async () => {
@@ -751,8 +778,9 @@ export class LocalCatalog {
     private async writeDoc(doc: DocRow): Promise<void> {
         await this.db.runAsync(
             `INSERT OR REPLACE INTO docs
-               (docKey, title, source, bytes, chunkCount, originId, createdAt, provenance)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+               (docKey, title, source, bytes, chunkCount, originId, createdAt, provenance,
+                docHash, authorKey, sig, authorship)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 doc.docKey,
                 doc.title,
@@ -762,8 +790,30 @@ export class LocalCatalog {
                 doc.originId,
                 doc.createdAt,
                 doc.provenance,
+                doc.docHash ? toHex(doc.docHash) : '',
+                doc.authorKey ? toHex(doc.authorKey) : '',
+                doc.sig ? toHex(doc.sig) : '',
+                doc.authorship,
             ],
         );
+    }
+
+    /**
+     * Records this node's own signature over a document it just wrote.
+     *
+     * Separate from the write above because signing needs the node's secret
+     * key, and the catalog has never held one — `MeshNode` owns credentials,
+     * and giving storage a signing key so it could inline one step would put
+     * the key in the layer with the widest surface.
+     */
+    async attest(docKey: number, authorKey: Uint8Array, sig: Uint8Array): Promise<void> {
+        const doc = this.docsByKey.get(docKey);
+        if (!doc) return;
+        const signed: DocRow = { ...doc, authorKey, sig, authorship: 'verified' };
+        await this.transact(async () => {
+            await this.writeDoc(signed);
+        });
+        this.docsByKey.set(docKey, signed);
     }
 
     private async writeMeta(meta: MetaRow): Promise<void> {

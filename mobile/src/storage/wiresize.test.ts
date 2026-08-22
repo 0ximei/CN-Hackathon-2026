@@ -11,6 +11,9 @@ vi.mock('expo-sqlite', () => import('./__testshim__/expo-sqlite'));
  * all-or-nothing across however many segments it takes. Nothing retransmits: a
  * link that drops mid-message clears its queue silently.
  *
+ * Measured on the signed worst case: the authorship attestation adds 128 bytes
+ * to every announcement of a document somebody actually wrote.
+ *
  * That makes segments-per-packet a reliability number, not a performance one,
  * and it is invisible from every layer that would normally be reviewed. This
  * test makes it visible: raise the entries per announce, the snippet length or
@@ -47,6 +50,11 @@ it('keeps one metadata packet inside its segment budget', async () => {
                     chunkCount: rows.length,
                     docOriginId: 0x71,
                     createdAtSec: Math.floor(Date.now() / 1000),
+                    // The signed case, which is the one that costs: 32 bytes of
+                    // content hash always, plus 96 for the key and signature.
+                    docHash: new Uint8Array(32).fill(0xab),
+                    authorKey: new Uint8Array(32).fill(0xcd),
+                    sig: new Uint8Array(64).fill(0xef),
                     entries: slice.map((m) => ({
                         docId: m.docId,
                         seq: m.seq,

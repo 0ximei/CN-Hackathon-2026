@@ -3,6 +3,7 @@ import { normalizeUploadedText } from '@core/lib/textUpload';
 import { BM25Index } from '@core/search/bm25';
 import { EMBED_DIM, quantize } from '@core/search/vector';
 
+import { hashDocument } from '../identity/authorship';
 import { embedder } from '../search/embedder';
 import { BM25_TIEBREAK, MIN_RELEVANCE, relevanceOf, termCoverage } from '../search/relevance';
 import type { MeshCatalog } from './MeshCatalog';
@@ -80,9 +81,17 @@ export class MemoryCatalog implements MeshCatalog {
                 originId: 0,
                 createdAt: Date.now(),
                 provenance: 'seed',
+                docHash: hashDocument(title, [text]),
+                authorship: 'unsigned',
             });
         }
         this.reindex();
+    }
+
+    async attest(docKey: number, authorKey: Uint8Array, sig: Uint8Array): Promise<void> {
+        const doc = this.docsByKey.get(docKey);
+        if (!doc) return;
+        this.docsByKey.set(docKey, { ...doc, authorKey, sig, authorship: 'verified' });
     }
 
     /** Drops the body but keeps the metadata — a metadata-only node, on demand. */
@@ -282,6 +291,8 @@ export class MemoryCatalog implements MeshCatalog {
             originId,
             createdAt: now,
             provenance,
+            docHash: hashDocument(parsed.title, parsed.chunks.map((c) => c.text)),
+            authorship: 'unsigned',
         };
         this.docsByKey.set(docKey, doc);
         this.reindex();

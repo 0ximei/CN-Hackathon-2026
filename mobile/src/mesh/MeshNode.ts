@@ -39,6 +39,7 @@ import { nextMsgId } from '@core/lib/ids';
 
 import type { Transport } from '@core/transport/Transport';
 
+import { manifestBytes } from '../identity/authorship';
 import { randomBytes } from '../identity/keys';
 import {
     blankPeerIdentity,
@@ -50,7 +51,7 @@ import {
 } from '../identity/trust';
 import { Replicator, type ReplicationStats } from '../replication/Replicator';
 import type { MeshCatalog } from '../storage/MeshCatalog';
-import type { CatalogStats } from '../storage/types';
+import type { CatalogStats, DocRow } from '../storage/types';
 import { embedder } from '../search/embedder';
 import { fromBase64, toBase64 } from '../lib/base64';
 
@@ -563,9 +564,35 @@ export class MeshNode {
         onProgress?: (done: number, total: number) => void,
     ): Promise<void> {
         const { doc } = await this.catalog.upload(filename, raw, this.identity.id, onProgress);
+        await this.sign(doc);
         this.emit('catalog', this.catalog.stats());
         await this.replicator.announceDocument(doc.docKey);
         void this.replicator.reconcile();
+    }
+
+    /**
+     * Attests to a document this node wrote, before anyone else sees it.
+     *
+     * Signed before the announce rather than after, so the first packet to
+     * leave already carries the proof. A node with no credentials skips it and
+     * the document travels unsigned, which is honest — an unsigned document
+     * shows as unsigned rather than as somebody's word for it.
+     */
+    private async sign(doc: DocRow): Promise<void> {
+        if (!this.credentials || !doc.docHash) return;
+        const sig = this.credentials.sign(
+            manifestBytes({
+                docKey: doc.docKey,
+                docHash: doc.docHash,
+                title: doc.title,
+                source: doc.source,
+                chunkCount: doc.chunkCount,
+                bytes: doc.bytes,
+                createdAtSec: Math.floor(doc.createdAt / 1000),
+                authorId: this.identity.id,
+            }),
+        );
+        await this.catalog.attest(doc.docKey, this.credentials.publicKey, sig);
     }
 
     /**

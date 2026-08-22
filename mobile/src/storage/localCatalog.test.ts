@@ -120,3 +120,74 @@ describe('a mesh that is already carrying the built-in corpus', () => {
         }
     });
 });
+
+describe('upgrading a database that already has data', () => {
+    /**
+     * The failure mode this guards is invisible on a fresh install and fatal on
+     * an upgraded one: `CREATE TABLE IF NOT EXISTS` is a no-op against a table
+     * that exists, so a column added to the DDL reaches new devices only. Every
+     * test passes, the app ships, and then every query naming the column fails
+     * on exactly the phones that have something to lose.
+     */
+    it('adds the authorship columns to a docs table created without them', async () => {
+        const { DatabaseSync } = await import('node:sqlite');
+        const db = new DatabaseSync(':memory:');
+        db.exec(`CREATE TABLE docs (
+            docKey INTEGER PRIMARY KEY NOT NULL, title TEXT NOT NULL, source TEXT NOT NULL,
+            bytes INTEGER NOT NULL, chunkCount INTEGER NOT NULL, originId INTEGER NOT NULL,
+            createdAt INTEGER NOT NULL, provenance TEXT NOT NULL DEFAULT 'mesh')`);
+        db.exec("INSERT INTO docs VALUES (1,'Burns','burns.md',10,2,7,0,'local')");
+
+        // The same shape `migrateColumns` runs: check, then add.
+        for (const [name, decl] of [
+            ['docHash', "TEXT NOT NULL DEFAULT ''"],
+            ['authorKey', "TEXT NOT NULL DEFAULT ''"],
+            ['sig', "TEXT NOT NULL DEFAULT ''"],
+            ['authorship', "TEXT NOT NULL DEFAULT 'unsigned'"],
+        ]) {
+            const cols = db.prepare("SELECT name FROM pragma_table_info('docs')").all() as { name: string }[];
+            if (cols.some((c) => c.name === name)) continue;
+            db.exec(`ALTER TABLE docs ADD COLUMN ${name} ${decl}`);
+        }
+
+        const row = db.prepare('SELECT docKey, title, authorship, docHash FROM docs').get() as Record<string, unknown>;
+        expect(row.title, 'the existing row survived').toBe('Burns');
+        expect(row.authorship, 'and picked up an honest default').toBe('unsigned');
+        expect(row.docHash).toBe('');
+    });
+
+    it('signs an upload and keeps the signature across a reload', async () => {
+        const { keysFromSeed, nodeIdFor, sign } = await import('../identity/keys');
+        const { manifestBytes } = await import('../identity/authorship');
+        const keys = keysFromSeed(new Uint8Array(32).fill(9));
+        const authorId = nodeIdFor(keys.publicKey);
+
+        const catalog = await open();
+        const { doc } = await catalog.upload('snakebite.md', UPLOAD, authorId);
+        expect(doc.docHash?.length, 'the content hash is computed at ingest').toBe(32);
+
+        const sig = sign(
+            manifestBytes({
+                docKey: doc.docKey,
+                docHash: doc.docHash!,
+                title: doc.title,
+                source: doc.source,
+                chunkCount: doc.chunkCount,
+                bytes: doc.bytes,
+                createdAtSec: Math.floor(doc.createdAt / 1000),
+                authorId,
+            }),
+            keys.secretKey,
+        );
+        await catalog.attest(doc.docKey, keys.publicKey, sig);
+
+        // Round-trip through SQLite, which is where hex encoding could quietly
+        // corrupt a key and make a genuine document read as a forgery.
+        await catalog.reload();
+        const stored = catalog.docRow(doc.docKey)!;
+        expect(stored.authorship).toBe('verified');
+        expect(stored.authorKey).toEqual(keys.publicKey);
+        expect(stored.sig).toEqual(sig);
+        expect(stored.docHash).toEqual(doc.docHash);
+    });
+});
