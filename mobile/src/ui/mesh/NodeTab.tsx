@@ -6,6 +6,7 @@ import { styles } from './styles';
 import { bytes, theme } from '../theme';
 import { Stat } from './Stat';
 import { IdentityPanel } from './IdentityPanel';
+import { MODELS, formatBytes } from '../../llm/models';
 
 type Mesh = ReturnType<typeof useMesh>;
 
@@ -25,6 +26,7 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
   const pct = budget ? Math.min(100, (used / budget) * 100) : 0;
   const metaShare = used ? Math.round((mesh.catalogStats.metaBytes / used) * 100) : 0;
   const known = mesh.catalogStats.known;
+  const phase = mesh.llmStatus.phase;
 
   return (
     <ScrollView contentContainerStyle={styles.listPad}>
@@ -158,28 +160,90 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
       <Text style={styles.sectionTitle}>SEARCH AND ANSWERS</Text>
       <View style={styles.card}>
         <Stat label="embedder" value={0} render="hashing · 384d · no download" />
-        <Stat
-          label="generator"
-          value={0}
-          render={
-            mesh.llmStatus.phase === 'ready'
-              ? 'on-device model ready'
-              : mesh.llmStatus.phase === 'loading'
-                ? `${Math.round(mesh.llmStatus.progress * 100)}%`
-                : 'extractive mode'
-          }
-        />
+        <Stat label="generator" value={0} render={generatorLabel(mesh)} />
+        {(phase === 'downloading' || phase === 'loading') && (
+          <View style={styles.progress}>
+            <View style={[styles.progressFill, { width: `${Math.round(mesh.llmStatus.progress * 100)}%` }]} />
+          </View>
+        )}
+        {!!mesh.llmStatus.detail && <Text style={styles.hint}>{mesh.llmStatus.detail}</Text>}
         <Text style={styles.hint}>
-          The browser build runs MiniLM through transformers.js and answers with WebLLM. React
-          Native has neither a Web Worker nor a threaded WASM runtime, so this is a hashing
-          embedder blended with BM25 — instant, deterministic, and not semantic.
+          Answers are generated on this phone from the passages the mesh returned — the model is
+          never the source. Without one, answers are the corpus sentences that best match the
+          question, which cannot invent a dosage. Every hit says which mode produced it.
         </Text>
-        {mesh.llmStatus.phase !== 'ready' && mesh.llmStatus.phase !== 'unavailable' && (
-          <Pressable onPress={() => void mesh.loadLlm()} style={[styles.buttonGhost, { marginTop: 10 }]}>
-            <Text style={styles.buttonGhostText}>TRY TO LOAD A LOCAL MODEL</Text>
+
+        {phase === 'downloading' ? (
+          <Pressable onPress={mesh.cancelLlmFetch} style={[styles.buttonGhost, { marginTop: 10 }]}>
+            <Text style={styles.buttonGhostText}>CANCEL DOWNLOAD</Text>
           </Pressable>
+        ) : phase === 'ready' ? (
+          <View style={{ marginTop: 10 }}>
+            <Pressable onPress={() => void mesh.unloadLlm()} style={styles.buttonGhost}>
+              <Text style={styles.buttonGhostText}>UNLOAD — FREE THE MEMORY</Text>
+            </Pressable>
+          </View>
+        ) : phase === 'unavailable' ? (
+          <Text style={styles.hint}>
+            This binary was built before on-device models were added. Rebuild with{' '}
+            <Text style={styles.statValue}>npm run android</Text> to enable them.
+          </Text>
+        ) : (
+          <View style={{ marginTop: 10 }}>
+            {mesh.llmModels.map((m) => (
+              <Pressable key={m.name} onPress={() => void mesh.loadLlm()} style={[styles.buttonGhost, { marginBottom: 8 }]}>
+                <Text style={styles.buttonGhostText}>
+                  LOAD {m.name.toUpperCase()} · {formatBytes(m.bytes)}
+                </Text>
+              </Pressable>
+            ))}
+            {MODELS.map((spec) => (
+              <Pressable
+                key={spec.id}
+                onPress={() => void mesh.fetchLlm(spec)}
+                style={[styles.buttonGhost, { marginBottom: 8 }]}
+              >
+                <Text style={styles.buttonGhostText}>
+                  DOWNLOAD {spec.name.toUpperCase()} · {formatBytes(spec.bytes)}
+                </Text>
+              </Pressable>
+            ))}
+            <Pressable onPress={() => void mesh.importLlm()} style={styles.buttonGhost}>
+              <Text style={styles.buttonGhostText}>OPEN A .GGUF FROM THIS DEVICE</Text>
+            </Pressable>
+            <Text style={styles.hint}>
+              Downloading needs a network this once. Opening a file does not — a model can arrive
+              over USB or from another phone, which is the only route that works where this app is
+              meant to be used.
+            </Text>
+          </View>
+        )}
+
+        {!!mesh.llmModels.length && phase !== 'downloading' && (
+          <View style={{ marginTop: 12 }}>
+            {mesh.llmModels.map((m) => (
+              <View key={`installed-${m.name}`} style={styles.statRow}>
+                <Text style={styles.statLabel} numberOfLines={1}>
+                  {m.name}
+                </Text>
+                <Pressable onPress={() => void mesh.removeLlm(m.name)}>
+                  <Text style={[styles.statValue, { color: theme.danger }]}>DELETE</Text>
+                </Pressable>
+              </View>
+            ))}
+          </View>
         )}
       </View>
     </ScrollView>
   );
+}
+
+function generatorLabel(mesh: Mesh): string {
+  const { phase, progress, model } = mesh.llmStatus;
+  if (phase === 'ready') return model ? `${model} · on device` : 'on-device model ready';
+  if (phase === 'generating') return 'generating';
+  if (phase === 'downloading') return `downloading — ${Math.round(progress * 100)}%`;
+  if (phase === 'loading') return `loading — ${Math.round(progress * 100)}%`;
+  if (phase === 'error') return 'failed — extractive mode';
+  return 'extractive mode';
 }

@@ -2,7 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { RouteEntry } from '@core/protocol/router';
 
+import * as DocumentPicker from 'expo-document-picker';
+
 import { llm, type Answer, type LlmStatus } from '../llm/engine';
+import { DEFAULT_MODEL, type ModelSpec } from '../llm/models';
 import { BleTransport } from '../transport/BleTransport';
 import { LocalCatalog, type CatalogStats } from '../storage/store';
 import {
@@ -105,6 +108,7 @@ export function useMesh() {
     const [query, setQuery] = useState<QueryState | null>(null);
     const [searching, setSearching] = useState(false);
     const [llmStatus, setLlmStatus] = useState<LlmStatus>(llm.status);
+    const [llmModels, setLlmModels] = useState<{ name: string; uri: string; bytes: number }[]>([]);
     const [answer, setAnswer] = useState<Answer | null>(null);
     const [answerText, setAnswerText] = useState('');
     const [answering, setAnswering] = useState(false);
@@ -124,6 +128,27 @@ export function useMesh() {
         llm.onStatus = (next) => setLlmStatus({ ...next });
         return () => {
             llm.onStatus = undefined;
+        };
+    }, []);
+
+    /**
+     * Bring back a model the user already downloaded.
+     *
+     * Loading takes seconds and costs nothing but memory, and a model that was
+     * fetched once was fetched on purpose — making someone press the button
+     * again after every launch would be a worse default than doing it here.
+     */
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            await llm.load();
+            if (cancelled) return;
+            setLlmModels(await llm.installed());
+            const node = nodeRef.current;
+            if (node) node.hasLlm = llm.ready;
+        })();
+        return () => {
+            cancelled = true;
         };
     }, []);
 
@@ -389,15 +414,62 @@ export function useMesh() {
         if (catalog) setCatalogStats(catalog.stats());
     }, []);
 
-    const loadLlm = useCallback(async () => {
-        try {
-            await llm.load();
-            const node = nodeRef.current;
-            if (node) node.hasLlm = llm.ready;
-        } catch {
-            // The engine falls back to extractive answers automatically.
-        }
+    /**
+     * Every path that can end with a model loaded ends here.
+     *
+     * `hasLlm` is beaconed to the mesh in the HELLO capability bits, so a peer
+     * decides where to route a question partly on this. Letting it drift from
+     * what the engine can actually do would have the mesh sending questions to
+     * a node that answers them extractively while claiming otherwise.
+     */
+    const settleLlm = useCallback(async () => {
+        setLlmModels(await llm.installed());
+        const node = nodeRef.current;
+        if (node) node.hasLlm = llm.ready;
     }, []);
+
+    const loadLlm = useCallback(async () => {
+        await llm.load();
+        await settleLlm();
+    }, [settleLlm]);
+
+    /** Downloads a model over whatever connectivity exists right now. */
+    const fetchLlm = useCallback(
+        async (spec: ModelSpec = DEFAULT_MODEL) => {
+            await llm.fetch(spec);
+            await settleLlm();
+        },
+        [settleLlm],
+    );
+
+    const cancelLlmFetch = useCallback(() => llm.cancelFetch(), []);
+
+    /** Adopts a .gguf the user picked from device storage — needs no network. */
+    const importLlm = useCallback(async () => {
+        const picked = await DocumentPicker.getDocumentAsync({
+            // No MIME type is registered for GGUF, so filtering by one hides
+            // every model on the device. The engine validates by loading it.
+            type: ['*/*'],
+            copyToCacheDirectory: true,
+        });
+        if (picked.canceled || !picked.assets?.length) return;
+        const asset: { name?: string; uri: string } = picked.assets[0];
+        await llm.importFile(asset.uri, asset.name ?? 'imported.gguf');
+        await settleLlm();
+    }, [settleLlm]);
+
+    const unloadLlm = useCallback(async () => {
+        await llm.unload();
+        await settleLlm();
+    }, [settleLlm]);
+
+    const removeLlm = useCallback(
+        async (name: string) => {
+            await llm.remove(name);
+            await settleLlm();
+        },
+        [settleLlm],
+    );
 
     const challengePeer = useCallback((nodeId: number) => {
         nodeRef.current?.challenge(nodeId);
@@ -472,7 +544,13 @@ export function useMesh() {
         addFiles,
         forget,
         setBudget,
+        llmModels,
         loadLlm,
+        fetchLlm,
+        cancelLlmFetch,
+        importLlm,
+        unloadLlm,
+        removeLlm,
         challengePeer,
         trustPeer,
         untrustPeer,

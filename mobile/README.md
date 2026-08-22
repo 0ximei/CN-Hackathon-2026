@@ -333,6 +333,40 @@ above the link, by the identity exchange, not by whether it managed to bond.
 
 ---
 
+## Answers
+
+Retrieval finds passages; the generator turns them into an answer. On this build
+that is llama.cpp, through `llama.rn`, running a quantised GGUF on the CPU.
+
+**The model is never the source.** It is handed the retrieved passages, numbered,
+and told to restate them with citations — a 0.5B model asked a first-aid
+question from its own weights produces fluent, confident, wrong dosages, which
+on this corpus is the worst failure available. `src/core/llm/prompt.ts` holds
+that prompt, and `src/llm/context.ts` cuts the passages to fit the window before
+they reach it: llama.cpp does not politely shorten an over-long prompt, it drops
+tokens from the front, and the front is where the system prompt lives.
+
+**It is optional at every level.** No model present, a model that will not load,
+a generation that fails or comes back too short — every one of those falls
+through to the extractive answer, which is the corpus sentences that best match
+the question. Those cannot invent a dosage, and for procedural first aid they
+are often better than a paraphrase. Every answer says which mode produced it, and
+`hasLlm` is beaconed in the HELLO capability bits so the mesh knows which nodes
+can generate.
+
+**Getting a model onto a phone** has two routes, and only one of them is the
+interesting one. Downloading needs a network once — the Node tab lists three
+(360M / 0.5B / 1B, 258 MB to 770 MB) with real sizes and a resumable progress
+bar. Opening a `.gguf` already on the device needs no network at all, which is
+the route that works where this app is meant to be used: a model can arrive over
+USB, on a card, or from another phone's file manager. CPU only, deliberately —
+Android GPU backends vary by vendor and fail in ways that look like bad answers
+rather than errors.
+
+Adding `llama.rn` costs about 74 MB of native libraries in the APK: llama.cpp is
+shipped as one `.so` per ARM feature level (v8, v8.2, dotprod, i8mm) and picks
+the best at runtime.
+
 ## What differs from the web build
 
 | | Web | Android |
@@ -343,14 +377,16 @@ above the link, by the identity exchange, not by whether it managed to bond.
 | Identity | random per tab, unauthenticated | **Ed25519, challenge/response** |
 | Embeddings | MiniLM via transformers.js | hashing embedder + BM25 (below) |
 | Relevance floor | cosine ≥ 0.42 | blended ≥ 0.40 (below) |
-| Answer generation | WebLLM | not ported — extractive answers |
+| Answer generation | WebLLM (WebGPU) | **llama.cpp via `llama.rn`, GGUF, CPU** |
 | Topology view | SVG | plain Views + `Animated` |
 | Pairing | QR / copy-paste | none needed — BLE discovers |
 
-**The embedder is the significant one.** React Native has no Web Workers and no
-WASM runtime with threads, so `Xenova/all-MiniLM-L6-v2` does not port. Running a
-real transformer on Android means ExecuTorch or a TFLite delegate plus a ~23 MB
-model download — the one thing a disaster-response tool cannot assume. So
+**The embedder is the significant one**, and it is a different problem from the
+generator below. Retrieval runs on every passage at seed time and on every
+keystroke-length query, so it has to be present, instant and free. React Native
+has no Web Workers and no threaded WASM runtime, so `Xenova/all-MiniLM-L6-v2`
+does not port, and every native alternative wants a model download — the one
+thing a disaster-response tool cannot assume. So
 `src/search/embedder.ts` is a hashing embedder over unigrams, bigrams and
 character 4-grams: instant, deterministic, no download, and **not semantic**. It
 matches "burns" to "burned" through shared character n-grams but will not match
@@ -400,7 +436,7 @@ identity layer and the storage helpers:
 npm test
 ```
 
-135 tests. Alongside the packet round-trips, framing, routing invariants and
+141 tests. Alongside the packet round-trips, framing, routing invariants and
 replication policy in `src/core`, this build covers:
 
 - a three-node simulated mesh where a passage held only two hops away comes back
@@ -416,6 +452,11 @@ replication policy in `src/core`, this build covers:
   existing coverage stopped at "the peer learned the passage exists";
 - a catalog sync whose request is lost on the radio, recovering without waiting
   for the once-a-minute re-announcement walk to come round;
+- the context window: passages dropped from the back rather than cut in half,
+  one over-long passage kept rather than sending none, and the assembled prompt
+  measured against the window it claims to respect — because overflowing it
+  drops the system prompt, which is the only thing keeping a small model on the
+  passages;
 - a budget on how many GATT segments one metadata packet may need. The transport
   reports a 4 KB MTU, which is true of the interface and not of the link: the
   radio cuts every packet into 514-byte segments that must all arrive or the
