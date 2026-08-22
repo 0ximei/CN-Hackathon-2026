@@ -235,6 +235,16 @@ works in a room, and each is commented at the code:
   every flood arriving twice. The lower node id owns the central role and the
   higher one waits, with a nine-second escape hatch in case the call never
   comes. No negotiation is needed: both sides know both ids.
+- **Liveness outranks the tie-break.** That rule decides between two links that
+  both work, and it cannot see the difference between a working link and a dead
+  one. Asked to, it keeps whichever the role says — so a link that stopped
+  carrying anything half a minute ago beats the one the peer just built to
+  replace it, and then beats the next replacement, and the next. Peers rotate
+  their BLE address, so the new link arrives on a MAC the old one never used
+  and none of the address-based guards catch it. Dead rivals are reaped before
+  the tie-break runs, and an advertisement from a node whose link has gone quiet
+  is treated as what it is: proof the peer is powered, in range, and not
+  reaching us on that link.
 - **A connect path built around status 133.** 133 is `GATT_ERROR`, the generic
   code the Android stack returns for most of its internal refusals, and four of
   its causes are the caller's to avoid. The scan is paused for the duration of

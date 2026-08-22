@@ -294,14 +294,20 @@ class MeshRadio(
      * Silence after which the peer is prodded, and after which it is presumed
      * gone.
      *
-     * The app layer beacons every three seconds, so twenty seconds of silence
-     * on a healthy link does not happen; the keepalive exists for the case
-     * where JS has stopped and only the radio is still up. Fifty seconds with
-     * nothing at all — not a beacon, not a keepalive reply, not an ack — is a
-     * link the stack is still holding open over a connection that is gone.
+     * The app layer beacons every three seconds, so ten seconds of silence is
+     * already three missed beacons and the link is suspect; the keepalive also
+     * covers the case where JS has stopped and only the radio is still up.
+     * Twenty-five seconds with nothing at all — not a beacon, not a keepalive
+     * reply, not an ack — is a link the stack is holding open over a connection
+     * that is gone.
+     *
+     * These were 20s and 50s, which is slower than the app layer's own
+     * thirteen-second peer timeout. A radio insisting on a link that the layer
+     * above had already written off is what "0 peers" looks like from the
+     * inside.
      */
-    const val LINK_IDLE_MS = 20_000L
-    const val LINK_SILENCE_MS = 50_000L
+    const val LINK_IDLE_MS = 10_000L
+    const val LINK_SILENCE_MS = 25_000L
   }
 
   /* ------------------------------------------------------------------ */
@@ -550,6 +556,12 @@ class MeshRadio(
     override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
       post {
         if (newState == BluetoothProfile.STATE_CONNECTED) {
+          // Android reports a connection to the GATT server for links this app
+          // opened itself as a central. Taking that at face value invents a
+          // second Link over the one ACL which can never complete a handshake:
+          // it holds a slot, blocks re-dialling that address, and is eventually
+          // swept as a failure that never happened.
+          if (links.containsKey(linkKey(device.address, Role.CENTRAL))) return@post
           if (links[linkKey(device.address, Role.PERIPHERAL)] == null) {
             links[linkKey(device.address, Role.PERIPHERAL)] = Link(device, Role.PERIPHERAL)
             log("inbound connection from ${device.address}")
@@ -814,9 +826,18 @@ class MeshRadio(
     val peerNode = readId(idData)
     if (peerNode == 0 || peerNode == selfId) return
 
-    links.values.firstOrNull { it.identified && it.nodeId == peerNode }?.let {
-      it.rssi = result.rssi
-      return
+    val existing = links.values.firstOrNull { it.identified && it.nodeId == peerNode }
+    if (existing != null) {
+      // It is advertising, so it is powered, in range, and not talking to us.
+      // Believing the link over that evidence costs the entire silence budget,
+      // and every inbound link the peer builds meanwhile is refused as a
+      // duplicate of a connection that has already stopped existing.
+      if (System.currentTimeMillis() - existing.lastHeardAt > LINK_IDLE_MS) {
+        teardown(existing, "advertising again while its link stays silent")
+      } else {
+        existing.rssi = result.rssi
+        return
+      }
     }
 
     val address = result.device.address
@@ -1179,6 +1200,14 @@ class MeshRadio(
    *
    * Both ends run the same rule — the lower id keeps the central role — so both
    * pick the same survivor and the loser is closed once, not twice.
+   *
+   * That rule decides between two links that both work. It must never be asked
+   * to decide between a working link and a dead one, because it cannot see the
+   * difference: it would keep a link that stopped carrying anything half a
+   * minute ago purely because of its role, close the one the peer has just
+   * built to replace it, and go on closing every replacement the peer offers
+   * until the silence sweep finally collects the corpse. So the dead ones are
+   * reaped first and the tie-break only ever sees live candidates.
    */
   private fun identify(link: Link, nodeId: Int) {
     if (nodeId == 0 || nodeId == selfId) {
@@ -1195,6 +1224,14 @@ class MeshRadio(
     // The peer works. Anything held against it from an earlier failure is stale.
     dialFailures.remove(nodeId)
     dialBackoff.remove(nodeId)
+
+    val now = System.currentTimeMillis()
+    val rivals = links.values.filter { it !== link && it.identified && it.nodeId == nodeId }
+    for (dead in rivals) {
+      if (now - dead.lastHeardAt > LINK_IDLE_MS) {
+        teardown(dead, "superseded — nothing heard on it for ${(now - dead.lastHeardAt) / 1000}s")
+      }
+    }
 
     val duplicate = links.values.firstOrNull {
       it !== link && it.identified && it.nodeId == nodeId
