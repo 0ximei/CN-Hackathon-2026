@@ -18,7 +18,7 @@
  * change instantly spends a slow radio's entire budget reacting.
  */
 
-import type { AnnouncePayload, MetaEntry } from '@core/protocol/packet';
+import type { AnnouncePayload, HolderEntry, HoldersPayload, MetaEntry } from '@core/protocol/packet';
 import {
     META_REPLICAS,
     evictionOrder,
@@ -33,15 +33,51 @@ import {
 import type { MeshCatalog } from '../storage/MeshCatalog';
 import type { MetaRow, PeerStatRow, Provenance } from '../storage/types';
 
-/** How often to reconcile. Slow enough for BLE, fast enough to demo. */
+/**
+ * How often to reconcile.
+ *
+ * Cheap: this pass reads local state and decides what to pull or evict. Nothing
+ * here touches the radio except the pulls, which are separately bounded.
+ */
 const RECONCILE_MS = 8_000;
 /** Bodies pulled per pass, so a node joining an established mesh trickles in. */
 const MAX_PULLS_PER_PASS = 2;
 /** Chunks per ANNOUNCE packet. Each entry is ~660 bytes — two BLE frames. */
 const ENTRIES_PER_ANNOUNCE = 4;
-/** Ceiling on documents re-announced per pass; the burst bound, not the rate. */
-const MAX_REANNOUNCE_PER_PASS = 4;
-/** Fraction of the holder TTL a full re-announce cycle may take. */
+
+/**
+ * Chunks per HOLDERS packet.
+ *
+ * The reason this exists at all is a mistake worth recording. Refreshing holder
+ * claims by re-sending the ANNOUNCE that carried them means re-sending a
+ * 384-byte embedding and a 200-byte snippet — about 660 bytes per chunk — to
+ * carry roughly twenty bytes of news that actually changed. On the browser
+ * build that is invisible. Measured on the bundled corpus (6 documents, 34
+ * chunks, 23 KB to announce in full) driving that off the reconcile timer came
+ * to about 1 KB/s *flooded to every link*, and twice that through a node in the
+ * middle of a line. A BLE link with a 517-byte MTU does a few kB/s in total, so
+ * beacons ended up queued behind metadata — and a HELLO that misses
+ * PEER_TIMEOUT_MS makes a live peer look dead, which is how a mesh with working
+ * links reports zero peers.
+ *
+ * A HOLDERS entry is about 21 bytes, so the whole corpus fits in roughly 700
+ * bytes instead of 23 KB. That is what lets the refresh stay on the fast timer
+ * where replication needs it.
+ */
+const HOLDERS_PER_PACKET = 24;
+
+/**
+ * How often to re-announce one document in full.
+ *
+ * Anti-entropy backstop only, now that holder claims travel separately: a peer
+ * that was present but missed the original ANNOUNCE flood has no other way to
+ * learn the metadata, since CATALOG_REQ only fires on first contact. One
+ * document a minute is about 65 B/s on this corpus.
+ */
+const REANNOUNCE_MS = 60_000;
+/** Documents per re-announce tick. One, deliberately: the point is a trickle. */
+const REANNOUNCE_PER_TICK = 1;
+/** Fraction of the holder-refresh cycle a claim must outlive. */
 const REANNOUNCE_SAFETY = 0.5;
 /** Counter window before halving, so reliability can recover. */
 const STAT_WINDOW = 200;
@@ -101,6 +137,8 @@ export interface ReplicatorDeps {
     /** Live peers, from the mesh node's beacon table. */
     livePeers: () => { nodeId: number; freeBytes: number }[];
     announce: (payload: AnnouncePayload, dstId?: number) => void;
+    /** Sends a compact holder/popularity refresh. Always a flood. */
+    announceHolders: (payload: HoldersPayload) => void;
     /** Pulls one body from a specific peer. Resolves null on timeout. */
     fetchBody: (docId: number, fromNodeId: number) => Promise<string | null>;
     onStats?: (s: ReplicationStats) => void;
@@ -125,6 +163,7 @@ const EMPTY_STATS: ReplicationStats = {
 
 export class Replicator {
     private timer: ReturnType<typeof setInterval> | null = null;
+    private announceTimer: ReturnType<typeof setInterval> | null = null;
     private stats: ReplicationStats = { ...EMPTY_STATS };
     private reliabilityCache = new Map<number, number>();
     /**
@@ -142,14 +181,20 @@ export class Replicator {
     start(): void {
         if (this.timer !== null) return;
         this.timer = setInterval(() => void this.reconcile(), RECONCILE_MS);
+        this.announceTimer = setInterval(() => void this.reannounceSlice(), REANNOUNCE_MS);
         // One immediate pass so a fresh node does not wait a full interval
-        // before discovering what it should be holding.
+        // before discovering what it should be holding. Deliberately *not*
+        // accompanied by an immediate announcement: a node that has just come
+        // up has no links yet, and the first thing a new link should carry is a
+        // beacon, not a kilobyte of metadata the peer probably already has.
         void this.reconcile();
     }
 
     stop(): void {
         if (this.timer !== null) clearInterval(this.timer);
+        if (this.announceTimer !== null) clearInterval(this.announceTimer);
         this.timer = null;
+        this.announceTimer = null;
     }
 
     getStats(): ReplicationStats {
@@ -264,12 +309,6 @@ export class Replicator {
 
     /* ----------------------------- holders ------------------------- */
 
-    /** Documents to re-announce per pass so a full cycle beats the holder TTL. */
-    private reannouncePerPass(docCount: number): number {
-        const passes = Math.max(1, Math.floor((HOLDER_TTL_MS * REANNOUNCE_SAFETY) / RECONCILE_MS));
-        return Math.min(MAX_REANNOUNCE_PER_PASS, Math.max(1, Math.ceil(docCount / passes)));
-    }
-
     /**
      * How long a holder claim stays believable.
      *
@@ -278,11 +317,13 @@ export class Replicator {
      * every node's claims expire before they are refreshed, every node concludes
      * it holds the only copy, and nothing is ever evicted — bodies replicate
      * without bound no matter what MAX_BODY_REPLICAS says.
+     *
+     * With the trickle above, a bigger library buys itself a longer TTL rather
+     * than a faster radio, which is the trade a slow link forces.
      */
-    private holderTtlMs(docCount: number): number {
-        const perPass = this.reannouncePerPass(docCount);
-        const cycleMs = Math.ceil(docCount / perPass) * RECONCILE_MS;
-        return Math.max(HOLDER_TTL_MS, cycleMs * 2);
+    private holderTtlMs(chunkCount: number): number {
+        const cycleMs = Math.ceil(chunkCount / HOLDERS_PER_PACKET) * RECONCILE_MS;
+        return Math.max(HOLDER_TTL_MS, cycleMs / REANNOUNCE_SAFETY);
     }
 
     /**
@@ -294,8 +335,7 @@ export class Replicator {
      */
     private async holderMap(): Promise<Map<number, Set<number>>> {
         const catalog = this.deps.catalog;
-        const docCount = catalog.docRows().length;
-        const cutoff = Date.now() - this.holderTtlMs(docCount);
+        const cutoff = Date.now() - this.holderTtlMs(catalog.knownCount);
         const rows = await catalog.holderRows();
         const out = new Map<number, Set<number>>();
         const add = (docId: number, nodeId: number) => {
@@ -413,6 +453,70 @@ export class Replicator {
         await catalog.putHolders(holders);
 
         return added;
+    }
+
+    /**
+     * Applies a compact holder/popularity refresh from a peer.
+     *
+     * Deliberately cannot create a chunk: an entry for a docId this node has no
+     * metadata for is dropped, because a holder claim about a passage we cannot
+     * describe is unusable — search could not score it and replication could not
+     * budget for it. The metadata arrives on a real ANNOUNCE or not at all.
+     */
+    async onHolders(payload: HoldersPayload, fromNodeId: number): Promise<void> {
+        const catalog = this.deps.catalog;
+        const now = Date.now();
+        const rows: { docId: number; nodeId: number; seenAt: number }[] = [];
+
+        for (const entry of payload.entries) {
+            if (!catalog.getMeta(entry.docId)) continue;
+            for (const holder of entry.holders) {
+                // Never let a peer tell us what we hold — see onAnnounce.
+                if (holder === this.deps.selfId) continue;
+                rows.push({ docId: entry.docId, nodeId: holder, seenAt: now });
+            }
+            if (entry.hits > 0) await catalog.mergePop(entry.docId, fromNodeId, entry.hits);
+        }
+        await catalog.putHolders(rows);
+    }
+
+    /**
+     * Tells the mesh what this node holds, and how popular it has found things.
+     *
+     * One packet per slice of the catalog, flooded, on the reconcile timer. This
+     * is the fast path that makes eviction work: a node cannot shed a body until
+     * it can see that somebody else has one, and it learns that here.
+     */
+    private async refreshHolders(): Promise<void> {
+        if (!this.deps.livePeers().length) return;
+        const catalog = this.deps.catalog;
+        const holders = await this.holderMap();
+        const shares = new Map(
+            (await catalog.popOf(this.deps.selfId)).map((r) => [r.docId, r.hits]),
+        );
+
+        // Grouped by document because the packet is keyed on one, which keeps a
+        // receiver's lookup cheap and mirrors how ANNOUNCE is shaped.
+        const byDoc = new Map<number, HolderEntry[]>();
+        for (const meta of catalog.metas()) {
+            const claims = holders.get(meta.docId);
+            const hits = shares.get(meta.docId) ?? 0;
+            // Nothing to say about a chunk nobody is known to hold and nobody
+            // here has read.
+            if (!claims?.size && !hits) continue;
+            const list = byDoc.get(meta.docKey) ?? [];
+            list.push({ docId: meta.docId, holders: [...(claims ?? [])], hits });
+            byDoc.set(meta.docKey, list);
+        }
+
+        for (const [docKey, entries] of byDoc) {
+            for (let i = 0; i < entries.length; i += HOLDERS_PER_PACKET) {
+                this.deps.announceHolders({
+                    docKey,
+                    entries: entries.slice(i, i + HOLDERS_PER_PACKET),
+                });
+            }
+        }
     }
 
     /** Builds ANNOUNCE packets for a document and hands them to the sender. */
@@ -654,10 +758,10 @@ export class Replicator {
                 }
             }
 
-            // Refresh a rotating slice of our documents so holder claims and
-            // popularity shares stay live rather than ageing out of everyone's
-            // map.
-            await this.reannounceSlice();
+            // Publish what this node holds *after* acting on this pass, so a
+            // body pulled or shed a moment ago is claimed or disclaimed in the
+            // same breath rather than a cycle later.
+            await this.refreshHolders();
 
             const after = await catalog.usage();
             this.stats = {
@@ -680,11 +784,17 @@ export class Replicator {
         }
     }
 
+    /**
+     * Refreshes holder claims for one document, on its own slow schedule.
+     *
+     * Skipped entirely while nothing is listening: a flood with no links costs
+     * nothing but does advance the cursor, so a node that spent ten minutes
+     * alone would come back having "refreshed" everything to an empty room.
+     */
     private async reannounceSlice(): Promise<void> {
         const docs = this.deps.catalog.docRows();
-        if (!docs.length) return;
-        const perPass = this.reannouncePerPass(docs.length);
-        for (let i = 0; i < perPass; i++) {
+        if (!docs.length || !this.deps.livePeers().length) return;
+        for (let i = 0; i < REANNOUNCE_PER_TICK; i++) {
             const doc = docs[this.reannounceCursor % docs.length];
             this.reannounceCursor++;
             await this.announceDocument(doc.docKey);

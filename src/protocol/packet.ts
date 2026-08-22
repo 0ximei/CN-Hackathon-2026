@@ -36,6 +36,8 @@ export const PacketType = {
   /** "Prove you are the node id you are claiming." */
   IDENT_REQ: 9,
   IDENT_RES: 10,
+  /** Holder claims and popularity shares, without the metadata they describe. */
+  HOLDERS: 11,
 } as const;
 export type PacketType = (typeof PacketType)[keyof typeof PacketType];
 
@@ -51,6 +53,7 @@ export const PACKET_TYPE_NAME: Record<number, string> = {
   8: 'CATALOG_RES',
   9: 'IDENT_REQ',
   10: 'IDENT_RES',
+  11: 'HOLDERS',
 };
 
 export interface Packet {
@@ -597,4 +600,62 @@ function pad(a: Uint8Array, n: number): Uint8Array {
   const out = new Uint8Array(n);
   out.set(a.subarray(0, n));
   return out;
+}
+
+/* ---- HOLDERS: who has what, without re-sending what it is ---- */
+
+/**
+ * The cheap half of an ANNOUNCE.
+ *
+ * An ANNOUNCE entry is about 660 bytes, of which 384 is the embedding and 200
+ * is the snippet — and those never change. What changes is who holds the body
+ * and how often it has been read, which is a couple of dozen bytes. Re-sending
+ * the whole entry to refresh them is what a fast link lets you get away with;
+ * on a 517-byte MTU at a few kB/s it is the largest thing on the radio, and it
+ * pushes the beacons that keep peers alive out of the way.
+ *
+ * So this carries only the part that moves. A receiver that does not recognise
+ * a docId ignores it rather than inventing a chunk it cannot describe — it will
+ * hear about that chunk from a real ANNOUNCE, or ask for one.
+ */
+export interface HolderEntry {
+  docId: number;
+  /** Nodes the announcer believes hold the body. */
+  holders: number[];
+  /** The announcer's own access count for this chunk (a G-counter share). */
+  hits: number;
+}
+
+export interface HoldersPayload {
+  docKey: number;
+  entries: HolderEntry[];
+}
+
+/** Bounded so one entry cannot inflate a packet. Matches ANNOUNCE's cap. */
+const MAX_HOLDER_CLAIMS = 8;
+
+export function encodeHolders(p: HoldersPayload): Uint8Array {
+  const w = new Writer().u32(p.docKey).u8(Math.min(p.entries.length, 255));
+  for (const e of p.entries.slice(0, 255)) {
+    const holders = e.holders.slice(0, MAX_HOLDER_CLAIMS);
+    w.u32(e.docId).u32(e.hits).u8(holders.length);
+    for (const h of holders) w.u32(h);
+  }
+  return w.finish();
+}
+
+export function decodeHolders(b: Uint8Array): HoldersPayload {
+  const r = new Reader(b);
+  const docKey = r.u32();
+  const n = r.u8();
+  const entries: HolderEntry[] = [];
+  for (let i = 0; i < n; i++) {
+    const docId = r.u32();
+    const hits = r.u32();
+    const count = r.u8();
+    const holders: number[] = [];
+    for (let h = 0; h < count; h++) holders.push(r.u32());
+    entries.push({ docId, holders, hits });
+  }
+  return { docKey, entries };
 }

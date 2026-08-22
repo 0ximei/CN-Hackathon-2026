@@ -8,6 +8,7 @@ import {
     decodeDocReq,
     decodeDocRes,
     decodeHello,
+    decodeHolders,
     decodeIdentReq,
     decodeIdentRes,
     decodeQuery,
@@ -17,6 +18,7 @@ import {
     encodeDocReq,
     encodeDocRes,
     encodeHello,
+    encodeHolders,
     encodeIdentReq,
     encodeIdentRes,
     encodeQuery,
@@ -27,6 +29,7 @@ import {
     identChallengeBytes,
     type AnnouncePayload,
     type Hit,
+    type HoldersPayload,
     type Packet,
 } from '@core/protocol/packet';
 import { Router, type RouteEntry } from '@core/protocol/router';
@@ -133,8 +136,28 @@ const IDENT_TIMEOUT_MS = 10_000;
 const OUTBOX_TTL_MS = 5 * 60 * 1000;
 const OUTBOX_RETRY_MS = 5_000;
 const ACTIVITY_CAPACITY = 200;
-/** Chunk entries a CATALOG_REQ reply will send in one go. */
-const CATALOG_SYNC_MAX = 200;
+/**
+ * Chunk entries a CATALOG_REQ reply will send in one go.
+ *
+ * Two hundred, as the browser build uses, is 130 KB of metadata poured into a
+ * link that has existed for one second and moves a few kilobytes a second. This
+ * is a catch-up, not a transfer: it exists so a node that joined after an upload
+ * hears that the document exists at all. Whatever does not fit arrives over the
+ * next few minutes on the replicator's re-announce cycle.
+ */
+const CATALOG_SYNC_MAX = 16;
+
+/**
+ * How long to let a new link settle before asking it for anything.
+ *
+ * The first seconds of a BLE link are the expensive ones — MTU negotiation,
+ * service discovery, the subscribe — and the first thing that should cross it
+ * is a beacon, because a peer that cannot get a HELLO through inside
+ * PEER_TIMEOUT_MS is a peer this node will shortly declare dead. Sending a
+ * catalog request into that window puts kilobytes of reply ahead of the packet
+ * that keeps the peer alive.
+ */
+const CATALOG_SYNC_DELAY_MS = 5_000;
 
 export interface PeerState {
     nodeId: number;
@@ -320,6 +343,8 @@ export class MeshNode {
             livePeers: () =>
                 [...this.peers.values()].map((p) => ({ nodeId: p.nodeId, freeBytes: p.freeBytes })),
             announce: (payload, dstId) => this.sendAnnounce(payload, dstId),
+            announceHolders: (payload) =>
+                this.router.send(PacketType.HOLDERS, encodeHolders(payload), BROADCAST),
             fetchBody: (docId, from) => this.fetchBodyFrom(docId, from),
             onStats: (stats) => this.emit('replication', stats),
             onEvent: (e) =>
@@ -761,6 +786,9 @@ export class MeshNode {
             case PacketType.CATALOG_REQ:
                 await this.onCatalogReq(pkt);
                 break;
+            case PacketType.HOLDERS:
+                await this.onHolders(pkt);
+                break;
             case PacketType.IDENT_REQ:
                 this.onIdentReq(pkt);
                 break;
@@ -818,11 +846,20 @@ export class MeshNode {
 
             if (!this.syncedPeers.has(pkt.srcId)) {
                 this.syncedPeers.add(pkt.srcId);
-                this.router.send(
-                    PacketType.CATALOG_REQ,
-                    encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
-                    pkt.srcId,
-                );
+                const peerId = pkt.srcId;
+                setTimeout(() => {
+                    // Still there? A peer that dropped inside the settle window
+                    // has already been forgotten by expirePeers, and asking it
+                    // for a catalog would only park a packet for a node that
+                    // may never come back.
+                    if (this.peers.has(peerId)) {
+                        this.router.send(
+                            PacketType.CATALOG_REQ,
+                            encodeCatalogReq({ sinceSec: 0, max: CATALOG_SYNC_MAX }),
+                            peerId,
+                        );
+                    }
+                }, CATALOG_SYNC_DELAY_MS);
             }
         }
         this.emit('peers', this.peerList());
@@ -978,6 +1015,23 @@ export class MeshNode {
                 detail: `learned ${added} passage(s) of "${payload.title}"`,
             });
         }
+    }
+
+    /**
+     * A peer said what it holds.
+     *
+     * The same holder hints the query path reads are updated here as well as in
+     * the replicator's store, because this is now the packet that carries them
+     * most of the time — a full ANNOUNCE is comparatively rare.
+     */
+    private async onHolders(pkt: Packet): Promise<void> {
+        const payload = decodeHolders(pkt.payload);
+        for (const entry of payload.entries) {
+            for (const holder of entry.holders) {
+                if (holder !== this.identity.id) this.holderHints.set(entry.docId, holder);
+            }
+        }
+        await this.replicator.onHolders(payload, pkt.srcId);
     }
 
     private async onCatalogReq(pkt: Packet): Promise<void> {

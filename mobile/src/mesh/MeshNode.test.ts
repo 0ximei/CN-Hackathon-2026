@@ -348,9 +348,12 @@ describe('replication', () => {
         a.transport.link(b.transport);
         await startAll(b.node);
 
-        // A's next periodic beacon is what introduces it to B; that HELLO is
-        // what triggers B's one-shot catalog sync request back to A.
-        await vi.advanceTimersByTimeAsync(3_100);
+        // A's next periodic beacon introduces it to B; that HELLO is what
+        // schedules B's one-shot catalog sync request back to A. The request is
+        // deliberately held back a few seconds so a brand-new link carries
+        // beacons before it carries kilobytes of metadata, so the clock has to
+        // run past that too.
+        await vi.advanceTimersByTimeAsync(10_000);
 
         expect(b.catalog.knownCount, 'the pre-existing upload reached the late joiner').toBeGreaterThan(0);
 

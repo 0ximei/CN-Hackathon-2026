@@ -10,12 +10,14 @@ import {
   decodeIdentReq,
   decodeIdentRes,
   decodeHello,
+  decodeHolders,
   decodeQuery,
   decodeResult,
   encodeAnnounce,
   encodeCatalogReq,
   encodeDocRes,
   encodeHello,
+  encodeHolders,
   encodeIdentReq,
   encodeIdentRes,
   identChallengeBytes,
@@ -580,5 +582,44 @@ describe('identity packets', () => {
     expect(identChallengeBytes(nonce, 0x1235, 'Kamo')).not.toEqual(base);
     expect(identChallengeBytes(nonce, 0x1234, 'Miro')).not.toEqual(base);
     expect(identChallengeBytes(new Uint8Array(16).fill(4), 0x1234, 'Kamo')).not.toEqual(base);
+  });
+});
+
+describe('holder refresh', () => {
+  it('round-trips claims and popularity shares', () => {
+    const payload = {
+      docKey: 0xfeedface,
+      entries: [
+        { docId: 1, holders: [10, 20, 30], hits: 7 },
+        { docId: 2, holders: [], hits: 0 },
+      ],
+    };
+    expect(decodeHolders(encodeHolders(payload))).toEqual(payload);
+  });
+
+  /**
+   * The whole reason this packet exists. An ANNOUNCE entry is ~660 bytes,
+   * almost all of it a 384-byte embedding and a 200-byte snippet that never
+   * change; refreshing a holder claim with one costs a slow radio its entire
+   * budget. If this ever creeps back up, the phones stop seeing each other.
+   */
+  it('costs a small fraction of the ANNOUNCE it replaces', () => {
+    const entries = Array.from({ length: 24 }, (_, i) => ({
+      docId: i,
+      holders: [1, 2, 3],
+      hits: i,
+    }));
+    const bytes = encodeHolders({ docKey: 1, entries }).length;
+    expect(bytes / entries.length).toBeLessThan(32);
+    // Comfortably inside one negotiated BLE MTU, so no fragmentation either.
+    expect(bytes).toBeLessThan(517);
+  });
+
+  it('bounds the holders one entry may claim', () => {
+    const many = Array.from({ length: 40 }, (_, i) => i + 1);
+    const back = decodeHolders(
+      encodeHolders({ docKey: 1, entries: [{ docId: 9, holders: many, hits: 0 }] }),
+    );
+    expect(back.entries[0].holders).toHaveLength(8);
   });
 });

@@ -191,7 +191,7 @@ The Network controls panel exists to break things on stage:
 npm test
 ```
 
-116 tests, covering both builds — the Android app's portable half runs here
+121 tests, covering both builds — the Android app's portable half runs here
 too, since it imports the same protocol and policy rather than copying them.
 
 Packet round-trips including `ANNOUNCE` with a 384-byte embedding and the

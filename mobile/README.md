@@ -315,7 +315,7 @@ loop, the identity layer, and the shared protocol:
 npm test
 ```
 
-116 tests. Alongside the web build's packet round-trips, framing, routing
+121 tests. Alongside the web build's packet round-trips, framing, routing
 invariants and replication policy, the mobile half covers:
 
 - a three-node simulated mesh where a passage held only two hops away comes back
@@ -329,7 +329,9 @@ invariants and replication policy, the mobile half covers:
 - the relevance floor returning nothing for an out-of-corpus question;
 - identity: key derivation, signature verification, id-to-key binding, replayed
   and unsolicited responses, key-change detection, and the rule that in-person
-  trust is only ever granted on top of a proven key.
+  trust is only ever granted on top of a proven key;
+- airtime: a budget on steady-state gossip, and a check that a brand-new link
+  carries beacons before it carries anything large.
 
 The radio itself is not covered there — nothing short of two phones can exercise
 a BLE stack — so `MeshRadio.kt` is verified by the steps under *Proving it
@@ -345,8 +347,17 @@ works* above.
   `MeshRadio.MAX_CENTRAL_LINKS`.
 - **Foreground only.** There is no foreground service, so Android will suspend
   the radio when the app is backgrounded. Keep the screen on for a demo.
-- **A few kB/s per link.** BLE is slow. The collection window is six seconds for
-  that reason, and large documents take visible time to move.
+- **A few kB/s per link.** BLE is slow, and the mesh's own overhead has to fit
+  inside that alongside real traffic. Holder claims and popularity shares are
+  refreshed with a compact `HOLDERS` packet (~21 bytes a chunk) rather than by
+  re-sending the `ANNOUNCE` that carried them (~660 bytes a chunk, almost all of
+  it an embedding and a snippet that never change). Steady-state gossip is about
+  320 B/s; `src/mesh/airtime.test.ts` fails the build if it climbs past 400.
+  This is not a micro-optimisation — at ~1.8 kB/s the beacons queue behind the
+  metadata, miss the peer-liveness deadline, and the app reports zero peers over
+  links that are perfectly healthy.
+  The collection window is six seconds for the same reason, and large documents
+  take visible time to move.
 - **A small mesh converges to holding everything.** The replica target is at
   least two and rises with unreliability, so on two or three phones every node
   ends up ranking for every chunk and the initial 60% slice evens out. That is
