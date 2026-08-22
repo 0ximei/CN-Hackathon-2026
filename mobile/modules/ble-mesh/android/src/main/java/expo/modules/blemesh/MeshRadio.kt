@@ -90,6 +90,8 @@ class MeshRadio(
     var identified = false
     var rssi: Int = 0
     var retries = 0
+    /** Consecutive over-the-air write failures reported by the async GATT callback. */
+    var writeFailures = 0
     val openedAt: Long = System.currentTimeMillis()
     val outbox = ArrayDeque<ByteArray>()
     var busy = false
@@ -131,6 +133,14 @@ class MeshRadio(
     const val SCAN_REFRESH_MS = 240_000L
     const val DRAIN_RETRY_MS = 25L
     const val MAX_DRAIN_RETRIES = 40
+    /**
+     * A write the stack accepted but the async callback then reports as failed —
+     * distinct from `MAX_DRAIN_RETRIES`, which counts the stack refusing to
+     * accept a write in the first place. A handful of consecutive async
+     * failures means the link is dead under us; tear it down so scanning and
+     * dialling can replace it, instead of silently failing forever.
+     */
+    const val MAX_WRITE_FAILURES = 3
     const val PREFERRED_MTU = 517
 
     /**
@@ -587,7 +597,15 @@ class MeshRadio(
       post {
         val link = links[linkKey(gatt.device.address, Role.CENTRAL)] ?: return@post
         link.busy = false
-        if (status != BluetoothGatt.GATT_SUCCESS) log("write failed: status $status")
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+          log("write failed: status $status")
+          if (++link.writeFailures >= MAX_WRITE_FAILURES) {
+            teardown(link, "${link.writeFailures} consecutive write failures (status $status)")
+            return@post
+          }
+        } else {
+          link.writeFailures = 0
+        }
         drain(link)
       }
     }

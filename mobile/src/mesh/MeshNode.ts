@@ -798,6 +798,11 @@ export class MeshNode {
             const deadline = peer.hops <= 1 ? PEER_TIMEOUT_MS : DISTANT_PEER_TIMEOUT_MS;
             if (peer.lastSeen < now - deadline) {
                 this.peers.delete(id);
+                // Also forget that it was ever caught up: a peer that dropped
+                // before its CATALOG_REQ/CATALOG_RES round trip finished is
+                // otherwise marked "synced" forever and never retried, even
+                // after it reconnects.
+                this.syncedPeers.delete(id);
                 this.note('drop', `${peer.name} went quiet`);
                 changed = true;
             }
