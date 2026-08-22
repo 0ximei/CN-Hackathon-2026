@@ -1,0 +1,26 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+  <!--
+    neverForLocation is what lets a scan run on Android 12+ without the app
+    holding a location permission. The mesh only cares that a peer is in radio
+    range, never where it is, so the stronger grant would be asking for
+    something the feature does not use.
+  -->
+  <uses-permission
+    android:name="android.permission.BLUETOOTH_SCAN"
+    android:usesPermissionFlags="neverForLocation" />
+  <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+
+  <!-- Pre-12 devices have no split permissions: scanning implies location. -->
+  <uses-permission
+    android:name="android.permission.BLUETOOTH"
+    android:maxSdkVersion="30" />
+  <uses-permission
+    android:name="android.permission.BLUETOOTH_ADMIN"
+    android:maxSdkVersion="30" />
+  <uses-permission
+    android:name="android.permission.ACCESS_FINE_LOCATION"
+    android:maxSdkVersion="30" />
+
+  <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+</manifest>

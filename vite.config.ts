@@ -1,9 +1,17 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: {
+      // Mirrors mobile/metro.config.js so the React Native app's tests can run
+      // under this project's Vitest instead of needing a second runner.
+      '@core': fileURLToPath(new URL('./src', import.meta.url)),
+    },
+  },
   worker: { format: 'es' },
   build: {
     // The WebLLM engine is dynamically imported and lands in its own ~6MB
@@ -30,6 +38,9 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    // The mobile app shares this project's protocol layer, so its portable
+    // tests run here too. Anything of its own that needs a device is not
+    // tested here and says so.
+    include: ['src/**/*.test.ts', 'mobile/src/**/*.test.ts'],
   },
 } as never);

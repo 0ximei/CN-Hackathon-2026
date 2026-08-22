@@ -34,11 +34,18 @@ physical layer is an implementation:
 |---|---|---|---|
 | [`BroadcastTransport`](src/transport/BroadcastTransport.ts) | tabs on one machine | 64 KB | ships — the always-works demo |
 | [`WebRTCTransport`](src/transport/WebRTCTransport.ts) | LAN / hotspot, no server | 16 KB | ships — QR or copy-paste pairing |
-| `BleBridgeTransport` | phone → ESP32 → RF mesh | ~180 B | designed for, not built |
+| [`BleTransport`](mobile/src/transport/BleTransport.ts) | phone ↔ phone, real BLE | negotiated, ~517 B | ships — **Android app**, see [`mobile/`](mobile/README.md) |
 
-The BLE row is the honest version of the original idea: the phone is a central
-talking to *its own* ESP32 over GATT, and the ESP32s mesh with each other. The
-protocol already fragments to a 180-byte MTU, so that transport is a drop-in.
+The last row is the original idea, delivered — but it is not a PWA, and it could
+not have been. The gap is the *peripheral role*, not Bluetooth itself: Android
+exposes `BluetoothLeAdvertiser` and `BluetoothGattServer` as public API, so a
+native node can advertise, accept connections, scan and dial out all at once.
+That symmetry is what turns a star of client/server links into a mesh.
+
+[`mobile/`](mobile/README.md) is a React Native app that does exactly that, on
+two or more real Android phones with no router, no pairing and no internet. It
+imports the packet codec, router and framing from `src/` rather than copying
+them, so both builds speak the same protocol.
 
 ---
 

@@ -1,0 +1,144 @@
+import type { EventSubscription } from 'expo-modules-core';
+
+import { TransportEmitter, type Transport } from '@core/transport/Transport';
+import BleMesh, { type BleCapabilities, type BlePeer } from '../../modules/ble-mesh';
+import { fromBase64, toBase64 } from '../lib/base64';
+import { ensureBlePermissions } from '../lib/permissions';
+
+/**
+ * The radio the web app could not have.
+ *
+ * `BroadcastTransport` and `WebRTCTransport` in the web build both fake or
+ * sidestep the physical layer — one is same-machine tabs, the other needs an IP
+ * network. This one is Bluetooth LE with nothing underneath it: no router, no
+ * access point, no pairing, no internet. Two phones in a room with radios on
+ * find each other and route.
+ *
+ * The interface is unchanged from the browser's, so `Router` and the packet
+ * codec above it do not know or care which of the three is mounted.
+ */
+export class BleTransport extends TransportEmitter implements Transport {
+  readonly kind = 'ble' as const;
+
+  /**
+   * Network-layer MTU, not the ATT MTU.
+   *
+   * The native side already segments every frame against the MTU actually
+   * negotiated for each link, which varies per peer and is not known when this
+   * value is read. Declaring a small one here would fragment twice — once in
+   * `framing.ts` against a guess, again in Kotlin against the truth — and pay
+   * six bytes of frame header for each. So this is set well above any real
+   * packet and per-hop fragmentation is left to the layer that can measure.
+   */
+  readonly mtu = 4096;
+
+  private subscriptions: EventSubscription[] = [];
+  private current: BlePeer[] = [];
+  private started = false;
+
+  private logListeners = new Set<(line: string) => void>();
+  private stateListeners = new Set<(state: string, detail: string) => void>();
+
+  /** Radio-level lines, newest last. Bounded so a long session cannot grow it. */
+  readonly log: string[] = [];
+  private static readonly LOG_CAPACITY = 300;
+
+  private readonly nodeId: number;
+
+  constructor(nodeId: number) {
+    super();
+    // Node ids are unsigned 32-bit — `hash32` ends in `>>> 0` — but Kotlin's
+    // `Int` is signed, and anything above 2^31 does not survive the bridge as a
+    // number. Coercing to the signed representation of the same 32 bits is
+    // lossless: the native side only ever compares ids with
+    // `Integer.compareUnsigned` and formats them with `%08x`, both of which
+    // read the bit pattern rather than the sign.
+    this.nodeId = nodeId | 0;
+  }
+
+  static capabilities(): BleCapabilities {
+    return BleMesh.capabilities();
+  }
+
+  async start(): Promise<void> {
+    if (this.started) return;
+
+    const granted = await ensureBlePermissions();
+    if (!granted.ok) throw new Error(granted.reason);
+
+    this.subscriptions = [
+      BleMesh.addListener('onFrame', ({ peerId, data }) => {
+        this.emitFrame(peerId, fromBase64(data));
+      }),
+      BleMesh.addListener('onPeers', ({ peers }) => {
+        this.current = peers;
+        this.emitPeers(peers.map((p) => p.peerId));
+      }),
+      BleMesh.addListener('onLog', ({ message }) => this.note(message)),
+      BleMesh.addListener('onState', ({ state, detail }) => {
+        for (const cb of this.stateListeners) cb(state, detail);
+      }),
+    ];
+
+    const result = await BleMesh.start(this.nodeId);
+    if (!result.ok) {
+      this.teardownSubscriptions();
+      throw new Error(result.error ?? 'the Bluetooth radio refused to start');
+    }
+    this.started = true;
+  }
+
+  stop(): void {
+    if (!this.started) return;
+    this.started = false;
+    this.teardownSubscriptions();
+    this.current = [];
+    void BleMesh.stop();
+  }
+
+  peers(): string[] {
+    return this.current.map((p) => p.peerId);
+  }
+
+  /** Richer than `peers()` — role, MTU and signal, for the UI. */
+  peerDetails(): BlePeer[] {
+    return this.current;
+  }
+
+  send(peerId: string, frame: Uint8Array): void {
+    // Fire and forget by design: `Transport.send` is synchronous, and the
+    // native queue is what actually guarantees ordering and delivery. A false
+    // here only means the link closed between the router picking a next hop and
+    // the frame reaching the radio, which store-and-forward is there to absorb.
+    void BleMesh.send(peerId, toBase64(frame)).then((accepted) => {
+      if (!accepted) this.note(`no open link to ${peerId}, frame dropped`);
+    });
+  }
+
+  broadcast(frame: Uint8Array, except?: string): void {
+    void BleMesh.broadcast(toBase64(frame), except ?? null);
+  }
+
+  onLog(cb: (line: string) => void): () => void {
+    this.logListeners.add(cb);
+    return () => this.logListeners.delete(cb);
+  }
+
+  onStateChange(cb: (state: string, detail: string) => void): () => void {
+    this.stateListeners.add(cb);
+    return () => this.stateListeners.delete(cb);
+  }
+
+  private note(line: string): void {
+    this.log.push(line);
+    if (this.log.length > BleTransport.LOG_CAPACITY) {
+      this.log.splice(0, this.log.length - BleTransport.LOG_CAPACITY);
+    }
+    for (const cb of this.logListeners) cb(line);
+  }
+
+  private teardownSubscriptions(): void {
+    for (const sub of this.subscriptions) sub.remove();
+    this.subscriptions = [];
+  }
+}
