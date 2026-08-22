@@ -167,18 +167,62 @@ export function useMesh() {
     // bring the radio up.
     useEffect(() => {
         if (!session) return;
+        const catalog = catalogRef.current;
+        if (!catalog) return;
+
         let cancelled = false;
-        let node: MeshNode | null = null;
+
+        // Built synchronously, before anything is awaited.
+        //
+        // This used to happen inside the async body, which meant an effect torn
+        // down before the first await resolved ran a cleanup that had nothing
+        // to stop — and the node then came up orphaned, holding a live radio no
+        // one had a reference to. Two nodes beaconing one id over one radio is
+        // not a state the mesh can recover from, and a Fast Refresh was enough
+        // to enter it.
+        const transport = new BleTransport(session.identity.id);
+        const node = new MeshNode(session.identity, transport, catalog, {
+            publicKey: session.keys.publicKey,
+            sign: session.sign,
+        });
+        nodeRef.current = node;
+
+        const refreshDocuments = () => {
+            void node.replicator.documentReport().then((docs) => {
+                if (!cancelled) setDocuments(docs);
+            });
+        };
+
+        // MeshNode coalesces these, so each callback is at most a few a second
+        // and each payload is already a fresh object — copying again here would
+        // only make React work for nothing.
+        node.on('peers', setPeers);
+        node.on('identities', setIdentities);
+        node.on('routes', (r) => setRoutes(new Map(r)));
+        node.on('activity', setActivity);
+        node.on('stats', setStats);
+        node.on('outbox', setOutbox);
+        node.on('query', (state) => setQuery(state));
+        node.on('catalog', (next) => {
+            setCatalogStats(next);
+            refreshDocuments();
+        });
+        node.on('replication', (next) => {
+            setReplication(next);
+            refreshDocuments();
+        });
+        transport.onStateChange((state, detail) => {
+            if (!cancelled) setRadio({ state, detail });
+        });
 
         (async () => {
             try {
-                const catalog = catalogRef.current;
-                if (!catalog) return;
-
                 if (!(await hasSeeded(catalog))) {
                     setSeedReport(await seedCorpus(catalog, session.identity.id));
                 }
+                if (cancelled) return;
                 setCoverage(await coverageOf(catalog));
+                if (cancelled) return;
                 setCatalogStats(catalog.stats());
 
                 // Read capabilities before starting: a device that cannot
@@ -186,36 +230,6 @@ export function useMesh() {
                 // user should be told rather than left wondering why nobody
                 // finds them.
                 setCapabilities(BleTransport.capabilities());
-
-                const transport = new BleTransport(session.identity.id);
-                node = new MeshNode(session.identity, transport, catalog, {
-                    publicKey: session.keys.publicKey,
-                    sign: session.sign,
-                });
-                nodeRef.current = node;
-
-                const refreshDocuments = () => {
-                    void node?.replicator.documentReport().then((docs) => {
-                        if (!cancelled) setDocuments(docs);
-                    });
-                };
-
-                node.on('peers', setPeers);
-                node.on('identities', setIdentities);
-                node.on('routes', (r) => setRoutes(new Map(r)));
-                node.on('activity', (events) => setActivity([...events]));
-                node.on('stats', setStats);
-                node.on('outbox', setOutbox);
-                node.on('query', (state) => setQuery(state));
-                node.on('catalog', (next) => {
-                    setCatalogStats(next);
-                    refreshDocuments();
-                });
-                node.on('replication', (next) => {
-                    setReplication(next);
-                    refreshDocuments();
-                });
-                transport.onStateChange((state, detail) => setRadio({ state, detail }));
 
                 await node.start();
                 if (cancelled) return;
@@ -231,8 +245,8 @@ export function useMesh() {
 
         return () => {
             cancelled = true;
-            node?.stop();
-            nodeRef.current = null;
+            node.stop();
+            if (nodeRef.current === node) nodeRef.current = null;
         };
     }, [session]);
 

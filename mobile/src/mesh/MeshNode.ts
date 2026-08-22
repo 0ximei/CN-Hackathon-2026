@@ -136,6 +136,38 @@ const IDENT_TIMEOUT_MS = 10_000;
 const OUTBOX_TTL_MS = 5 * 60 * 1000;
 const OUTBOX_RETRY_MS = 5_000;
 const ACTIVITY_CAPACITY = 200;
+
+/**
+ * How often coalesced snapshots reach the UI.
+ *
+ * `peers`, `activity`, `stats`, `outbox` and `routes` are snapshots: each one
+ * carries the whole current value, so a later emission supersedes an earlier
+ * one completely and nothing is lost by skipping the ones in between. They are
+ * also the frequent ones — every packet produces at least three, a flooded
+ * HELLO produces one `sent` per link, and on this build the radio's own
+ * commentary arrives as activity too. Emitting each immediately meant a React
+ * render per packet, measured at a dozen a second on an idle three-node mesh
+ * and far more under load, on a phone that is simultaneously animating the
+ * topology view.
+ *
+ * Four a second still reads as live and is an order of magnitude below the
+ * packet rate. Events that carry a *decision* rather than a snapshot — a query
+ * result, a catalog change, an identity verdict — are not coalesced.
+ */
+const UI_COALESCE_MS = 250;
+
+/**
+ * Queries kept for late-arriving bodies.
+ *
+ * A DOC_RES can land long after its query window closed, and `fetchFullText`
+ * writes the passage back into every query still showing it. Keeping all of
+ * them forever made that a scan over the node's entire history and leaked a
+ * copy of every hit ever seen.
+ */
+const MAX_TRACKED_QUERIES = 8;
+
+/** The snapshot events, coalesced onto one timer. */
+type CoalescedEvent = 'peers' | 'activity' | 'stats' | 'outbox' | 'routes';
 /**
  * Chunk entries a CATALOG_REQ reply will send in one go.
  *
@@ -296,9 +328,32 @@ export class MeshNode {
 
     private helloTimer: ReturnType<typeof setInterval> | null = null;
     private outboxTimer: ReturnType<typeof setInterval> | null = null;
+    private flushTimer: ReturnType<typeof setTimeout> | null = null;
+    private dirty = new Set<CoalescedEvent>();
+    /**
+     * Set by `stop`, checked after every await in `start`.
+     *
+     * `start` is asynchronous and the thing that owns it — a React effect — can
+     * be torn down while it is still running. Without this the cleanup returns
+     * having stopped nothing, `start` finishes afterwards, and the node comes up
+     * anyway: a second node on the same radio, beaconing the same id and
+     * answering every query twice.
+     */
+    private stopped = false;
+    /** Challenge expiry timers, so teardown does not leave them armed. */
+    private challengeTimers = new Set<ReturnType<typeof setTimeout>>();
     private peers = new Map<number, PeerState>();
     private queries = new Map<number, QueryState>();
-    private pendingDocs = new Map<number, (payload: { text: string; source: string } | null) => void>();
+    /**
+     * Waiters per document, not one waiter per document.
+     *
+     * The user opening a hit and the replicator pulling the same body are
+     * independent requests that routinely overlap. A single-slot map meant the
+     * second overwrote the first, and the first then sat out its whole eight
+     * second timeout with the answer already in hand — and, for the
+     * replicator's half, marked a peer unreliable for a reply it did send.
+     */
+    private pendingDocs = new Map<number, Set<(payload: { text: string; source: string } | null) => void>>();
     /** Outstanding identity challenges, by the node they were sent to. */
     private challenges = new Map<number, { nonce: Uint8Array; sentAt: number }>();
     private identities = new Map<number, PeerIdentity>();
@@ -362,7 +417,14 @@ export class MeshNode {
     /* --------------------------- lifecycle --------------------------- */
 
     async start(): Promise<void> {
+        this.stopped = false;
         await this.transport.start();
+        if (this.stopped) {
+            // Torn down while the radio was coming up. It is running now, so it
+            // is ours to shut down; nothing above it was ever wired in.
+            this.transport.stop();
+            return;
+        }
         this.router.start();
 
         this.unsubscribes.push(
@@ -395,7 +457,7 @@ export class MeshNode {
                     peer: to,
                 }),
             ),
-            this.router.on('routesChanged', (routes) => this.emit('routes', routes)),
+            this.router.on('routesChanged', () => this.emitSoon('routes')),
         );
         const offLog = this.transport.onLog?.((line) =>
             this.note({
@@ -410,6 +472,14 @@ export class MeshNode {
         if (offLog) this.unsubscribes.push(offLog);
 
         await this.loadIdentities();
+        // Anything parked in a previous session is still owed. Reading the count
+        // once here is also what lets `flushOutbox` skip the database entirely
+        // while the queue is empty, which is almost always.
+        this.queued = await this.catalog.queuedCount();
+        if (this.stopped) {
+            this.stop();
+            return;
+        }
 
         this.sendHello();
         this.helloTimer = setInterval(() => {
@@ -426,15 +496,30 @@ export class MeshNode {
     }
 
     stop(): void {
+        this.stopped = true;
         if (this.helloTimer) clearInterval(this.helloTimer);
         if (this.outboxTimer) clearInterval(this.outboxTimer);
+        if (this.flushTimer) clearTimeout(this.flushTimer);
         this.helloTimer = null;
         this.outboxTimer = null;
+        this.flushTimer = null;
+        this.dirty.clear();
+        for (const timer of this.challengeTimers) clearTimeout(timer);
+        this.challengeTimers.clear();
         this.replicator.stop();
         for (const off of this.unsubscribes) off();
         this.unsubscribes = [];
         this.router.stop();
         this.transport.stop();
+
+        // Release anything still waiting on a reply that can no longer arrive,
+        // rather than leaving its caller to discover it by timeout.
+        for (const waiters of this.pendingDocs.values()) {
+            for (const resolve of waiters) resolve(null);
+        }
+        this.pendingDocs.clear();
+        this.challenges.clear();
+        this.queries.clear();
         this.peers.clear();
         this.emit('peers', []);
     }
@@ -518,6 +603,12 @@ export class MeshNode {
             respondedNodeIds: [],
         };
         this.queries.set(queryId, state);
+        // Oldest first, so dropping from the front drops the least useful.
+        while (this.queries.size > MAX_TRACKED_QUERIES) {
+            const oldest = this.queries.keys().next();
+            if (oldest.done) break;
+            this.queries.delete(oldest.value);
+        }
         this.emit('query', snapshot(state));
 
         const { q, scale } = quantize(vector);
@@ -653,17 +744,21 @@ export class MeshNode {
         target: number,
     ): Promise<{ text: string; source: string } | null> {
         return new Promise((resolve) => {
-            const timer = setTimeout(() => {
-                this.pendingDocs.delete(docId);
-                resolve(null);
-            }, DOC_FETCH_TIMEOUT_MS);
+            let waiters = this.pendingDocs.get(docId);
+            if (!waiters) {
+                waiters = new Set();
+                this.pendingDocs.set(docId, waiters);
+            }
 
-            this.pendingDocs.set(docId, (payload) => {
+            const settle = (payload: { text: string; source: string } | null) => {
                 clearTimeout(timer);
-                this.pendingDocs.delete(docId);
+                waiters!.delete(settle);
+                if (!waiters!.size) this.pendingDocs.delete(docId);
                 resolve(payload);
-            });
+            };
+            const timer = setTimeout(() => settle(null), DOC_FETCH_TIMEOUT_MS);
 
+            waiters.add(settle);
             this.router.send(PacketType.DOC_REQ, encodeDocReq(docId), target);
         });
     }
@@ -688,7 +783,8 @@ export class MeshNode {
 
         this.router.send(PacketType.IDENT_REQ, encodeIdentReq(nonce), nodeId);
 
-        setTimeout(() => {
+        const timer = setTimeout(() => {
+            this.challengeTimers.delete(timer);
             const pending = this.challenges.get(nodeId);
             if (!pending || pending.nonce !== nonce) return;
             this.challenges.delete(nodeId);
@@ -701,6 +797,7 @@ export class MeshNode {
                 });
             }
         }, IDENT_TIMEOUT_MS);
+        this.challengeTimers.add(timer);
     }
 
     /** Records that a person compared the safety number and it matched. */
@@ -742,7 +839,7 @@ export class MeshNode {
                 trust: peer.state,
                 verified: peer.state === 'verified' || peer.state === 'trusted',
             });
-            this.emit('peers', this.peerList());
+            this.emitSoon('peers');
         }
         this.emit('identities', this.peerIdentities());
     }
@@ -862,7 +959,7 @@ export class MeshNode {
                 }, CATALOG_SYNC_DELAY_MS);
             }
         }
-        this.emit('peers', this.peerList());
+        this.emitSoon('peers');
         // A beacon is proof of reachability, which is exactly the trigger
         // anything parked for that node has been waiting on.
         void this.flushOutbox(pkt.srcId);
@@ -976,7 +1073,10 @@ export class MeshNode {
 
     private onDocRes(pkt: Packet): void {
         const doc = decodeDocRes(pkt.payload);
-        this.pendingDocs.get(doc.docId)?.({ text: doc.text, source: doc.source });
+        const waiters = this.pendingDocs.get(doc.docId);
+        if (!waiters) return;
+        // Copied before calling, because each waiter removes itself from the set.
+        for (const settle of [...waiters]) settle({ text: doc.text, source: doc.source });
     }
 
     /**
@@ -1111,6 +1211,11 @@ export class MeshNode {
     }
 
     private async flushOutbox(dstId?: number): Promise<void> {
+        // Called on every beacon from every peer. `queued` is authoritative —
+        // it is read from the database at startup and maintained by `park` and
+        // by this method — so an empty queue costs nothing rather than two
+        // SQLite round trips per peer every three seconds.
+        if (this.queued === 0) return;
         const rows = await this.catalog.dueFor(dstId);
         let delivered = 0;
         for (const row of rows) {
@@ -1194,7 +1299,7 @@ export class MeshNode {
                 changed = true;
             }
         }
-        if (changed) this.emit('peers', this.peerList());
+        if (changed) this.emitSoon('peers');
     }
 
     /** Refreshes the observed reliability shown against each peer. */
@@ -1207,7 +1312,7 @@ export class MeshNode {
             this.peers.set(row.nodeId, { ...peer, reliability: row.reliability });
             changed = true;
         }
-        if (changed) this.emit('peers', this.peerList());
+        if (changed) this.emitSoon('peers');
     }
 
     /* ------------------------------ helpers -------------------------- */
@@ -1270,12 +1375,40 @@ export class MeshNode {
         if (this.activity.length > ACTIVITY_CAPACITY) {
             this.activity.splice(0, this.activity.length - ACTIVITY_CAPACITY);
         }
-        this.emit('activity', [...this.activity]);
+        this.emitSoon('activity');
     }
 
     private emitStats(): void {
-        this.emit('stats', { ...this.router.stats, queued: this.queued });
-        this.emit('outbox', this.queued);
+        this.emitSoon('stats');
+        this.emitSoon('outbox');
+    }
+
+    /**
+     * Mark a snapshot as stale and let the next flush publish it.
+     *
+     * The payload is deliberately *not* captured here — it is read at flush
+     * time, so a burst of twenty updates costs one traversal of the current
+     * state rather than twenty copies of intermediate states nobody will see.
+     */
+    private emitSoon(event: CoalescedEvent): void {
+        if (this.stopped) return;
+        this.dirty.add(event);
+        if (this.flushTimer) return;
+        this.flushTimer = setTimeout(() => {
+            this.flushTimer = null;
+            this.flushUi();
+        }, UI_COALESCE_MS);
+    }
+
+    private flushUi(): void {
+        if (!this.dirty.size) return;
+        const due = this.dirty;
+        this.dirty = new Set();
+        if (due.has('peers')) this.emit('peers', this.peerList());
+        if (due.has('routes')) this.emit('routes', this.router.getRoutes());
+        if (due.has('activity')) this.emit('activity', [...this.activity]);
+        if (due.has('stats')) this.emit('stats', { ...this.router.stats, queued: this.queued });
+        if (due.has('outbox')) this.emit('outbox', this.queued);
     }
 
     private emit<K extends keyof Events>(event: K, ...args: Parameters<Events[K]>): void {

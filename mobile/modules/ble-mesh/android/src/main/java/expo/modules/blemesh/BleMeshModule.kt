@@ -43,7 +43,18 @@ class BleMeshModule : Module() {
     }
 
     AsyncFunction("start") { nodeId: Int ->
-      if (radio != null) return@AsyncFunction mapOf("ok" to true, "error" to null)
+      val running = radio
+      if (running != null) {
+        // Idempotent for the same node, but only for the same node. The id is
+        // what peers key every route, holder record and dial tie-break on, so a
+        // radio still advertising a previous identity is worse than no radio:
+        // it is a node the mesh believes in and this app no longer is.
+        if (running.nodeId == nodeId) {
+          return@AsyncFunction mapOf("ok" to true, "error" to null)
+        }
+        running.stop()
+        radio = null
+      }
       val instance = MeshRadio(context, nodeId, radioEvents)
       val error = instance.start()
       if (error != null) {

@@ -35,6 +35,17 @@ export class BleTransport extends TransportEmitter implements Transport {
   private subscriptions: EventSubscription[] = [];
   private current: BlePeer[] = [];
   private started = false;
+  /**
+   * The in-flight `start`, so a second caller joins it rather than racing it.
+   *
+   * `started` only becomes true once the native call has resolved, so two
+   * overlapping starts both got past the guard and both subscribed — every
+   * frame then reached the router twice, which reads as a mesh that duplicates
+   * everything it hears.
+   */
+  private starting: Promise<void> | null = null;
+  /** Set by `stop`, so a start still in flight tears itself down on arrival. */
+  private stopping = false;
 
   private logListeners = new Set<(line: string) => void>();
   private stateListeners = new Set<(state: string, detail: string) => void>();
@@ -78,9 +89,18 @@ export class BleTransport extends TransportEmitter implements Transport {
 
   async start(): Promise<void> {
     if (this.started) return;
+    if (this.starting) return this.starting;
+    this.stopping = false;
+    this.starting = this.open().finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
+  }
 
+  private async open(): Promise<void> {
     const granted = await ensureBlePermissions();
     if (!granted.ok) throw new Error(granted.reason);
+    if (this.stopping) return;
 
     this.subscriptions = [
       BleMesh.addListener('onFrame', ({ peerId, data }) => {
@@ -103,13 +123,20 @@ export class BleTransport extends TransportEmitter implements Transport {
       throw new Error(result.error ?? 'the Bluetooth radio refused to start');
     }
     this.started = true;
+
+    // Stopped while the radio was coming up. It is running now, so shut it down
+    // rather than leave a radio nothing holds a reference to.
+    if (this.stopping) this.stop();
   }
 
   stop(): void {
-    if (!this.started) return;
-    this.started = false;
+    this.stopping = true;
+    // Deliberately not guarded on `started`: a stop that arrives mid-start still
+    // has to detach the subscriptions, whether or not the start ever finished.
     this.teardownSubscriptions();
     this.current = [];
+    if (!this.started) return;
+    this.started = false;
     void BleMesh.stop();
   }
 

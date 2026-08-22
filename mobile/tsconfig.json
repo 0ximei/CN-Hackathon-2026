@@ -19,14 +19,13 @@
     "baseUrl": ".",
     "paths": {
       "@core/*": [
-        "../src/*"
+        "./src/core/*"
       ]
     }
   },
   "include": [
     "**/*.ts",
-    "**/*.tsx",
-    "../src/**/*.ts"
+    "**/*.tsx"
   ],
   "exclude": [
     "node_modules",

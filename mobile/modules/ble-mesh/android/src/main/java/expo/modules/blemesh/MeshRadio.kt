@@ -63,6 +63,9 @@ class MeshRadio(
   private val events: RadioEvents,
 ) {
 
+  /** The identity this radio is advertising, so the bridge can spot a change. */
+  val nodeId: Int get() = selfId
+
   interface RadioEvents {
     fun onFrame(peerId: String, payload: ByteArray)
     fun onPeers(peers: List<PeerSnapshot>)
