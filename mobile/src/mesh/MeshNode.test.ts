@@ -120,9 +120,10 @@ describe('MeshNode over a simulated mesh', () => {
 
         expect(bravo, 'the direct neighbour').toBeDefined();
         expect(bravo!.hops).toBe(1);
-        // Zero, not its own id: a direct peer has no relay, and a view drawing
-        // "self -> via -> peer" would otherwise put a corner on a straight link.
-        expect(bravo!.via).toBe(0);
+        // Its own id, because the next hop toward a neighbour is the neighbour.
+        // Zero is reserved for "no route at all", which is a third state and
+        // not the same picture: unreachable, rather than one link away.
+        expect(bravo!.via).toBe(0x0b);
 
         expect(charlie, 'the peer two hops out').toBeDefined();
         expect(charlie!.hops).toBe(2);

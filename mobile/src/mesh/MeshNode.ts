@@ -223,7 +223,13 @@ export interface PeerState {
     lastSeen: number;
     hops: number;
     /**
-     * Node id of the next hop toward this peer, or 0 when it is a direct link.
+     * Node id of the next hop toward this peer. Its own id when direct, 0 when
+     * there is no route to it at all.
+     *
+     * Three states rather than two, and the third is the reason: a peer that
+     * has beaconed but whose route has aged out is neither directly linked nor
+     * reachable through anyone, and collapsing that into "direct" draws a radio
+     * link that is not there.
      *
      * Resolved here rather than in the UI for the same reason `peerNodeId` on
      * an activity event is: the router names the next hop by transport peer id,
@@ -1430,26 +1436,33 @@ export class MeshNode {
 
     /* ------------------------------ helpers -------------------------- */
 
+    /**
+     * Peers as the router sees them, not as their last beacon happened to land.
+     *
+     * `hops` is taken from the route table rather than from the stored peer,
+     * and the two genuinely disagree. A peer record takes the hop count off
+     * whichever HELLO arrived, while the router keeps the *best* route it has
+     * seen and drops duplicates — so when a relayed copy of a neighbour's
+     * beacon wins the race to the deduplicator, the peer record says two hops
+     * about a phone the router has a direct link to. That inconsistency reached
+     * the topology view as a peer drawn bent through a relay it does not need,
+     * which is the same class of wrong as drawing a line where there is no
+     * link. The router decides how a packet actually travels, so it is the
+     * authority on how the path is drawn.
+     */
     peerList(): PeerState[] {
         const routes = this.router.getRoutes();
         return [...this.peers.values()]
-            .map((peer) => ({ ...peer, via: this.relayTo(peer.nodeId, routes) }))
+            .map((peer) => {
+                const route = routes.get(peer.nodeId);
+                if (!route) return { ...peer, via: 0 };
+                return {
+                    ...peer,
+                    hops: route.hops,
+                    via: this.nodeIdOfPeer(route.peerId),
+                };
+            })
             .sort((a, b) => a.name.localeCompare(b.name));
-    }
-
-    /**
-     * The node this one would hand a packet to on the way to `nodeId`.
-     *
-     * Zero for a direct neighbour, where the next hop is the destination, and
-     * zero when there is no route — a peer that has beaconed through someone
-     * but whose route has since aged out is better drawn as unreachable than
-     * as reachable through a relay that is no longer there.
-     */
-    private relayTo(nodeId: number, routes: Map<number, RouteEntry>): number {
-        const route = routes.get(nodeId);
-        if (!route) return 0;
-        const via = this.nodeIdOfPeer(route.peerId);
-        return via === nodeId ? 0 : via;
     }
 
     routes(): Map<number, RouteEntry> {

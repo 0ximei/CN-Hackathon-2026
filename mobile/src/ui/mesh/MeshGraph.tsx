@@ -6,7 +6,15 @@ import type { Identity } from '@core/lib/ids';
 import type { ActivityEvent, PeerState } from '../../mesh/MeshNode';
 import { useTheme } from '../ThemeProvider';
 import { typography } from '../theme';
-import { cutPath, pathLength, stopsAlong, type Point } from './graphGeometry';
+import {
+    PEER_R,
+    SELF_R,
+    computeLayout,
+    cutPath,
+    pathLength,
+    stopsAlong,
+    type Point,
+} from './graphGeometry';
 
 /**
  * The topology view.
@@ -34,16 +42,17 @@ import { cutPath, pathLength, stopsAlong, type Point } from './graphGeometry';
  * driving a translation, which runs on the UI thread with the native driver
  * instead of re-rendering React sixty times a second.
  *
- * The layout is a deterministic ring rather than a force simulation. On stage
- * you want the same node in the same place every run; a force layout re-settles
- * differently on every render and makes the demo hard to narrate.
+ * Where everything goes is [`graphGeometry`](graphGeometry.ts), which is pure
+ * arithmetic and therefore testable off a phone — the ring is deterministic
+ * rather than a force simulation, because on stage you want the same node in
+ * the same place every run. That split earns its keep: the sizing bug that made
+ * this look broken (labels clipped off the bottom and sides, because the ring
+ * was sized as though a node were just a disc) is invisible to a type and to a
+ * render test, and is one assertion once the geometry can be called directly.
  */
 
-const HEIGHT = 300;
 const FLIGHT_MS = 700;
 const MAX_FLIGHTS = 18;
-const SELF_R = 26;
-const PEER_R = 20;
 
 interface Flight {
     key: number;
@@ -51,14 +60,6 @@ interface Flight {
     points: Point[];
     color: string;
     dropped: boolean;
-}
-
-/** One segment of a route. `known` is false where it stands in for hops we cannot see. */
-interface Segment {
-    key: string;
-    from: Point;
-    to: Point;
-    known: boolean;
 }
 
 interface Props {
@@ -154,7 +155,7 @@ export function MeshGraph({
 
     return (
         <View>
-            <View style={[styles.graph, { width: boardWidth, height: HEIGHT }]}>
+            <View style={[styles.graph, { width: boardWidth, height: layout.height }]}>
                 {layout.segments.map((seg) => (
                     <Edge key={seg.key} from={seg.from} to={seg.to} known={seg.known} />
                 ))}
@@ -361,133 +362,4 @@ function Node({
             <Text style={styles.graphSub}>{sub}</Text>
         </View>
     );
-}
-
-/* ------------------------------- layout -------------------------------- */
-
-interface Layout {
-    self: Point;
-    nodes: { peer: PeerState; at: Point }[];
-    positions: Map<number, Point>;
-    /** Every link to draw, once — a shared relay leg is not drawn twice. */
-    segments: Segment[];
-    /** Node id -> the corners of the route from this node to it. */
-    routes: Map<number, Point[]>;
-    directIds: number[];
-}
-
-/**
- * Deterministic ring layout, arranged around the routes rather than the ids.
- *
- * Direct neighbours sit on an inner ring in id order, so a given phone lands in
- * the same place on every launch of the demo. Anything further out sits on an
- * outer ring *beside the relay it is reached through*, which is what makes the
- * path readable: a chain of three nodes looks like a chain. Sorting the outer
- * ring by id instead — which is what this did first — regularly put a peer on
- * the far side of the board from the only node that could reach it, and drew
- * the route as a line straight across the middle of the graph.
- */
-function computeLayout(width: number, peers: PeerState[]): Layout {
-    const self = { x: width / 2, y: HEIGHT / 2 - 8 };
-    const positions = new Map<number, Point>();
-    const angles = new Map<number, number>();
-    const rInner = Math.min(width, HEIGHT) * 0.28;
-    const rOuter = Math.min(width, HEIGHT) * 0.44;
-
-    const ordered = [...peers].sort((a, b) => a.nodeId - b.nodeId);
-    const direct = ordered.filter((p) => p.hops <= 1);
-    const distant = ordered.filter((p) => p.hops > 1);
-
-    const place = (peer: PeerState, angle: number, radius: number) => {
-        angles.set(peer.nodeId, angle);
-        positions.set(peer.nodeId, {
-            x: self.x + Math.cos(angle) * radius,
-            y: self.y + Math.sin(angle) * radius,
-        });
-    };
-
-    // Start at the top and go round. The half-step offset keeps a lone peer off
-    // the vertical axis, where its label would sit on the self node's.
-    direct.forEach((peer, i) => {
-        place(peer, -Math.PI / 2 + ((i + 0.5) * 2 * Math.PI) / Math.max(direct.length, 1), rInner);
-    });
-
-    // Grouped by relay so siblings fan out around it instead of stacking, and
-    // walked nearest-first: on a chain of four, the three-hop node hangs off a
-    // two-hop node, so the relay has to be on the board before anything can be
-    // placed beside it. Grouping in id order — which is what this did first —
-    // put that at the mercy of which phone happened to have the lower id.
-    const byRelay = new Map<number, PeerState[]>();
-    for (const peer of [...distant].sort((a, b) => a.hops - b.hops)) {
-        const group = byRelay.get(peer.via);
-        if (group) group.push(peer);
-        else byRelay.set(peer.via, [peer]);
-    }
-
-    // Counted from the peer list rather than from what has been placed so far,
-    // so the spread does not depend on where in the walk an orphan turns up.
-    const known = new Set(ordered.map((p) => p.nodeId));
-    let orphan = 0;
-    const orphans = distant.filter((p) => !known.has(p.via)).length;
-    for (const [relay, group] of byRelay) {
-        const base = angles.get(relay);
-        group.forEach((peer, i) => {
-            // A quarter-turn between siblings, centred on the relay's bearing.
-            const offset = (i - (group.length - 1) / 2) * 0.42;
-            if (base === undefined) {
-                // No relay on screen — the route aged out, or the peer arrived
-                // before its relay did. Spread these on their own so they do
-                // not all pile onto one bearing.
-                place(peer, -Math.PI / 2 + ((orphan++ + 0.5) * 2 * Math.PI) / Math.max(orphans, 1), rOuter);
-            } else {
-                place(peer, base + offset, rOuter);
-            }
-        });
-    }
-
-    // Routes, then the segments they imply. Keyed by the pair so a relay leg
-    // shared by three distant peers is one line rather than three stacked.
-    const routes = new Map<number, Point[]>();
-    const segments: Segment[] = [];
-    const drawn = new Set<string>();
-
-    const addSegment = (key: string, from: Point, to: Point, known: boolean) => {
-        if (drawn.has(key)) return;
-        drawn.add(key);
-        segments.push({ key, from, to, known });
-    };
-
-    for (const peer of ordered) {
-        const at = positions.get(peer.nodeId);
-        if (!at) continue;
-        const relay = peer.hops > 1 ? positions.get(peer.via) : undefined;
-
-        if (!relay) {
-            // Direct, or distant with no relay to point at — the honest drawing
-            // of the second case is still a single line, but a faint one, since
-            // this node cannot say what it goes through.
-            const known = peer.hops <= 1;
-            routes.set(peer.nodeId, [self, at]);
-            addSegment(`self-${peer.nodeId}`, self, at, known);
-            continue;
-        }
-
-        routes.set(peer.nodeId, [self, relay, at]);
-        addSegment(`self-${peer.via}`, self, relay, true);
-        // Exactly two hops means the far leg is one real link the relay holds.
-        // Further than that and it stands in for hops this node cannot see.
-        addSegment(`${peer.via}-${peer.nodeId}`, relay, at, peer.hops === 2);
-    }
-
-    return {
-        self,
-        nodes: ordered.flatMap((peer) => {
-            const at = positions.get(peer.nodeId);
-            return at ? [{ peer, at }] : [];
-        }),
-        positions,
-        segments,
-        routes,
-        directIds: direct.map((p) => p.nodeId),
-    };
 }
