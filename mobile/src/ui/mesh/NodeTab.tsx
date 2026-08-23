@@ -1,5 +1,6 @@
-import React from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
+
+import { Pressable } from 'react-native';
 
 import type { useMesh } from '../useMesh';
 import { useTheme } from '../ThemeProvider';
