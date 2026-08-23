@@ -7,6 +7,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { llm, type Answer, type LlmStatus } from '../llm/engine';
 import { DEFAULT_MODEL, type ModelSpec } from '../llm/models';
 import { BleTransport } from '../transport/BleTransport';
+import { acquire, release, setKeepAlive } from '../mesh/liveNode';
 import { LocalCatalog, type CatalogStats } from '../storage/store';
 import {
     createIdentity,
@@ -68,6 +69,9 @@ const EMPTY_CATALOG: CatalogStats = {
     bodyBytes: 0,
 };
 
+/** Persisted, so the preference survives a restart. */
+const BACKGROUND_KEY = 'radio.background';
+
 const IDLE_UPLOAD: UploadState = { busy: false, label: '', done: 0, total: 0 };
 
 /**
@@ -111,6 +115,7 @@ export function useMesh() {
     const [answering, setAnswering] = useState(false);
     const [upload, setUpload] = useState<UploadState>(IDLE_UPLOAD);
     const [outbox, setOutbox] = useState(0);
+    const [background, setBackgroundState] = useState(false);
     const [dev, setDev] = useState<DevSettings>({ ttl: 4, packetLoss: 0, cutLinks: [] });
     /**
      * Display name after a rename.
@@ -202,11 +207,20 @@ export function useMesh() {
         // one had a reference to. Two nodes beaconing one id over one radio is
         // not a state the mesh can recover from, and a Fast Refresh was enough
         // to enter it.
-        const transport = new BleTransport(session.identity.id);
-        const node = new MeshNode(session.identity, transport, catalog, {
-            publicKey: session.keys.publicKey,
-            sign: session.sign,
-        });
+        // Acquired rather than constructed: with background mode on, a node
+        // for this identity may already be running with no screen attached, and
+        // building a second one would put two nodes on one radio.
+        const { node, fresh } = acquire(
+            session.identity.id,
+            () =>
+                new MeshNode(
+                    session.identity,
+                    new BleTransport(session.identity.id),
+                    catalog,
+                    { publicKey: session.keys.publicKey, sign: session.sign },
+                ),
+        );
+        const transport = node.transport as BleTransport;
         nodeRef.current = node;
 
         const refreshDocuments = () => {
@@ -218,24 +232,29 @@ export function useMesh() {
         // MeshNode coalesces these, so each callback is at most a few a second
         // and each payload is already a fresh object — copying again here would
         // only make React work for nothing.
-        node.on('peers', setPeers);
-        node.on('identities', setIdentities);
-        node.on('routes', (r) => setRoutes(new Map(r)));
-        node.on('activity', setActivity);
-        node.on('stats', setStats);
-        node.on('outbox', setOutbox);
-        node.on('query', (state) => setQuery(state));
-        node.on('catalog', (next) => {
-            setCatalogStats(next);
-            refreshDocuments();
-        });
-        node.on('replication', (next) => {
-            setReplication(next);
-            refreshDocuments();
-        });
-        transport.onStateChange((state, detail) => {
-            if (!cancelled) setRadio({ state, detail });
-        });
+        // Collected, because a node that outlives this screen would otherwise
+        // accumulate a set of dead listeners on every remount, each holding a
+        // setState for a component that no longer exists.
+        const off: (() => void)[] = [
+            node.on('peers', setPeers),
+            node.on('identities', setIdentities),
+            node.on('routes', (r) => setRoutes(new Map(r))),
+            node.on('activity', setActivity),
+            node.on('stats', setStats),
+            node.on('outbox', setOutbox),
+            node.on('query', (state) => setQuery(state)),
+            node.on('catalog', (next) => {
+                setCatalogStats(next);
+                refreshDocuments();
+            }),
+            node.on('replication', (next) => {
+                setReplication(next);
+                refreshDocuments();
+            }),
+            transport.onStateChange((state, detail) => {
+                if (!cancelled) setRadio({ state, detail });
+            }),
+        ];
 
         (async () => {
             try {
@@ -247,9 +266,23 @@ export function useMesh() {
                 // finds them.
                 setCapabilities(BleTransport.capabilities());
 
-                await node.start();
+                // Restore the background preference before the radio comes up,
+                // so a phone that was carrying the mesh yesterday is carrying
+                // it again without anyone opening a settings screen.
+                const wanted = (await catalog.kvGet(BACKGROUND_KEY)) === '1';
                 if (cancelled) return;
-                node.startReplication();
+                setKeepAlive(wanted);
+                setBackgroundState(wanted);
+                await transport.setBackground(wanted);
+
+                // A reused node is already running. Starting it again would
+                // double every interval it owns.
+                if (fresh) {
+                    await node.start();
+                    if (cancelled) return;
+                    node.startReplication();
+                }
+                setPeers(node.peerList());
                 refreshDocuments();
                 setPhase('ready');
             } catch (e) {
@@ -261,7 +294,8 @@ export function useMesh() {
 
         return () => {
             cancelled = true;
-            node.stop();
+            for (const cancel of off) cancel();
+            release(node);
             if (nodeRef.current === node) nodeRef.current = null;
         };
     }, [session]);
@@ -449,6 +483,22 @@ export function useMesh() {
         [settleLlm],
     );
 
+    /**
+     * Whether the mesh keeps running once the app is closed.
+     *
+     * Two halves, and both are needed. The native half raises a foreground
+     * service so Android stops reclaiming the process; the JavaScript half
+     * stops tearing the node down when the screen goes away. Either alone
+     * leaves a node that looks alive and is not.
+     */
+    const setBackgroundMode = useCallback(async (on: boolean) => {
+        setKeepAlive(on);
+        setBackgroundState(on);
+        await catalogRef.current?.kvSet(BACKGROUND_KEY, on ? '1' : '0');
+        const transport = nodeRef.current?.transport as BleTransport | undefined;
+        await transport?.setBackground(on);
+    }, []);
+
     const challengePeer = useCallback((nodeId: number) => {
         nodeRef.current?.challenge(nodeId);
     }, []);
@@ -511,6 +561,7 @@ export function useMesh() {
         answering,
         upload,
         outbox,
+        background,
         dev,
         create,
         rename,
@@ -519,6 +570,7 @@ export function useMesh() {
         addFiles,
         forget,
         setBudget,
+        setBackgroundMode,
         llmModels,
         loadLlm,
         fetchLlm,

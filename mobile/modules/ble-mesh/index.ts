@@ -17,6 +17,14 @@ declare class BleMeshNativeModule extends NativeModule<BleMeshEvents> {
    */
   start(nodeId: number): Promise<StartResult>;
   stop(): Promise<void>;
+  /**
+   * Runs the radio under a foreground service, so it survives the app closing.
+   *
+   * A permanent notification is the price and the disclosure: Android will not
+   * let a process keep a radio open once the user leaves without one, and the
+   * user should be able to see — and stop — a mesh running behind their back.
+   */
+  setBackground(on: boolean): Promise<void>;
   /** Base64 payload. Resolves false when no link to that peer is open. */
   send(peerId: string, data: string): Promise<boolean>;
   /** Base64 payload. Resolves with the number of links it went out on. */
