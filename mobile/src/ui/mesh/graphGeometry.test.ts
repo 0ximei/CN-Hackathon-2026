@@ -209,6 +209,30 @@ describe('graph layout', () => {
         }
     });
 
+    /**
+     * A mesh of one is still a picture, and the subject of it goes in the
+     * middle.
+     *
+     * This node sits at the top of the board because things hang below it. With
+     * no peers nothing does, and leaving it pinned there put a single disc
+     * against the top edge of an otherwise empty box, which reads as a layout
+     * that has failed rather than as a phone waiting for company.
+     */
+    it('centres this node when it is the only one', () => {
+        for (const width of WIDTHS) {
+            const layout = computeLayout(width, []);
+            expect(layout.nodes).toEqual([]);
+            expect(layout.segments).toEqual([]);
+
+            // Centred by its painted box, not by its point: the label hangs
+            // below the disc, so centring the point leaves it sitting high.
+            const top = layout.self.y - SELF_R;
+            const bottom = layout.self.y + SELF_R + LABEL_H;
+            expect(top, `top margin at ${width}px`).toBeCloseTo(layout.height - bottom, 5);
+            expect(layout.self.x).toBeCloseTo(width / 2, 5);
+        }
+    });
+
     /** A name needs room to be a name. Another band is better than a sliver. */
     it('never narrows a label past legibility', () => {
         for (const width of WIDTHS) {

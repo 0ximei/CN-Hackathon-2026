@@ -30,6 +30,8 @@ export const NODE_W_MAX = 92;
 export const NODE_W_MIN = 56;
 /** Clear space between one band of nodes and the next. */
 const BAND_PAD = 12;
+/** Above this node's disc, when something hangs below it. */
+const TOP_PAD = 4;
 /** Short graphs still want some presence on the page. */
 const MIN_HEIGHT = 200;
 
@@ -182,8 +184,19 @@ export function computeLayout(width: number, peers: PeerState[]): Layout {
     const widest = Math.max(1, ...bands.map((b) => b.length));
     const nodeW = Math.max(NODE_W_MIN, Math.min(NODE_W_MAX, width / widest));
 
+    // Alone on the board, this node is the whole picture and belongs in the
+    // middle of it. Sitting at the top is only right when it is the root of
+    // something: with no peers there is nothing below to be the root of, and a
+    // node pinned to the top edge of an otherwise empty box reads as a layout
+    // that has failed rather than as a mesh of one.
+    const alone = bands.length === 0;
+    const selfBox = SELF_R * 2 + LABEL_H;
+
     const positions = new Map<number, Point>();
-    const self = { x: width / 2, y: SELF_R + 4 };
+    const self = {
+        x: width / 2,
+        y: alone ? (MIN_HEIGHT - selfBox) / 2 + SELF_R : SELF_R + TOP_PAD,
+    };
     let y = self.y + SELF_R + LABEL_H + BAND_PAD + PEER_R;
 
     for (const band of bands) {
@@ -192,7 +205,7 @@ export function computeLayout(width: number, peers: PeerState[]): Layout {
         y += PEER_R + LABEL_H + BAND_PAD + PEER_R;
     }
     // `y` has run one band past the last, so take the pad and half-band back.
-    const height = Math.max(MIN_HEIGHT, y - BAND_PAD - PEER_R + 6);
+    const height = alone ? MIN_HEIGHT : Math.max(MIN_HEIGHT, y - BAND_PAD - PEER_R + 6);
 
     // Routes, then the segments they imply. Keyed by the pair so a relay leg
     // shared by three peers behind it is one line rather than three stacked.
