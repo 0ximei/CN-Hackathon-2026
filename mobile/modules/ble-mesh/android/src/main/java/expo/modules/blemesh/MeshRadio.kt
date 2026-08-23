@@ -144,6 +144,14 @@ class MeshRadio(
     var lastProgressAt: Long = System.currentTimeMillis()
     /** Last native keepalive, so the tick does not send one every three seconds. */
     var lastPingAt: Long = 0L
+    /**
+     * Last keepalive *answered*, which is what bounds the exchange.
+     *
+     * Both ends answer a probe, so without a limit an answer would be answered
+     * in turn forever. One reply per idle period per link means a probe costs
+     * at most two small messages and then goes quiet again.
+     */
+    var lastPongAt: Long = 0L
     val outbox = ArrayDeque<ByteArray>()
     var busy = false
     val reassembler = Reassembler()
@@ -321,6 +329,17 @@ class MeshRadio(
      */
     const val LINK_IDLE_MS = 10_000L
     const val LINK_SILENCE_MS = 25_000L
+
+    /**
+     * How long a keepalive may go unanswered before the peer's advertisement is
+     * believed over its link.
+     *
+     * Two ticks: one for the probe to leave a queue that may be draining
+     * something larger, one for the answer to come back. Short enough that this
+     * still beats the full silence budget, which is the whole point of using an
+     * advertisement as evidence at all.
+     */
+    const val UNANSWERED_MS = 2 * TICK_MS
   }
 
   /* ------------------------------------------------------------------ */
@@ -875,8 +894,20 @@ class MeshRadio(
       // Believing the link over that evidence costs the entire silence budget,
       // and every inbound link the peer builds meanwhile is refused as a
       // duplicate of a connection that has already stopped existing.
-      if (System.currentTimeMillis() - existing.lastHeardAt > LINK_IDLE_MS) {
-        teardown(existing, "advertising again while its link stays silent")
+      //
+      // But silence alone is not that evidence, because the keepalive lives in
+      // the same window: the tick only probes *after* silence passes
+      // LINK_IDLE_MS, so every healthy link spends a few seconds of every cycle
+      // over the line with its answer still in flight. Tearing down on a scan
+      // result that landed in that gap killed working links at random — the
+      // peer redialled, linked, and was killed again on the next pass.
+      //
+      // So the test is a probe that went unanswered, not a link that is quiet.
+      val now = System.currentTimeMillis()
+      val probedAndIgnored =
+        existing.lastPingAt > existing.lastHeardAt && now - existing.lastPingAt > UNANSWERED_MS
+      if (now - existing.lastHeardAt > LINK_IDLE_MS && probedAndIgnored) {
+        teardown(existing, "advertising again while ignoring a keepalive")
       } else {
         existing.rssi = result.rssi
         return
@@ -1278,7 +1309,23 @@ class MeshRadio(
     // A HELLO on a link that is already bound to this peer is a keepalive.
     // `receive` has already recorded it; re-running the duplicate resolution
     // and re-announcing the peer would only churn the UI.
-    if (link.identified && link.nodeId == nodeId) return
+    //
+    // It does have to be answered, though, and for a long time it was not. A
+    // probe that draws no reply can only ever confirm silence: the prober's own
+    // `lastHeardAt` keeps ageing, so any peer whose app layer had gone quiet —
+    // backgrounded without the daemon, timers suspended, phone dozing — was
+    // torn down at LINK_SILENCE_MS and immediately redialled, over and over,
+    // while the radio on both sides was working perfectly. Answering is what
+    // makes the keepalive a measurement of the link rather than of the peer's
+    // JavaScript.
+    if (link.identified && link.nodeId == nodeId) {
+      val now = System.currentTimeMillis()
+      if (now - link.lastPongAt > LINK_IDLE_MS) {
+        link.lastPongAt = now
+        enqueue(link, MeshWire.KIND_HELLO, idBytes(selfId))
+      }
+      return
+    }
     link.nodeId = nodeId
     link.identified = true
     awaitingInbound.remove(nodeId)
