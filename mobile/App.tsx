@@ -4,16 +4,36 @@ import { StatusBar } from 'expo-status-bar';
 
 import { MeshScreen } from './src/ui/MeshScreen';
 import { OnboardingScreen } from './src/ui/OnboardingScreen';
-import { theme } from './src/ui/theme';
+import { ThemeProvider, useTheme } from './src/ui/ThemeProvider';
+import { space, typography } from './src/ui/theme';
 import { useMesh } from './src/ui/useMesh';
 
 export default function App() {
   const mesh = useMesh();
 
   return (
-    <SafeAreaProvider>
-      <StatusBar style="light" />
-      <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
+    <ThemeProvider preference={mesh.scheme} onPreferenceChange={mesh.chooseScheme}>
+      <SafeAreaProvider>
+        <Shell mesh={mesh} />
+      </SafeAreaProvider>
+    </ThemeProvider>
+  );
+}
+
+/**
+ * Split from `App` only so it sits *inside* the provider — the status bar and
+ * the safe area both need to know which paper is in force, and a component
+ * cannot read a context it is itself rendering.
+ */
+function Shell({ mesh }: { mesh: ReturnType<typeof useMesh> }) {
+  const { theme } = useTheme();
+
+  return (
+    <>
+      {/* Inverted against the paper, not pinned: light text on a cream
+          background is invisible. */}
+      <StatusBar style={theme.scheme === 'dark' ? 'light' : 'dark'} />
+      <SafeAreaView style={[styles.safe, { backgroundColor: theme.bg }]} edges={['top', 'bottom']}>
         {mesh.phase === 'booting' && <Booting />}
         {mesh.phase === 'onboarding' && (
           <OnboardingScreen suggestedName={mesh.suggestedName} onCreate={mesh.create} />
@@ -21,15 +41,16 @@ export default function App() {
         {mesh.phase === 'error' && <Failed reason={mesh.error} />}
         {mesh.phase === 'ready' && <MeshScreen mesh={mesh} />}
       </SafeAreaView>
-    </SafeAreaProvider>
+    </>
   );
 }
 
 function Booting() {
+  const { theme, accent } = useTheme();
   return (
     <View style={styles.centre}>
-      <ActivityIndicator color={theme.accent} />
-      <Text style={styles.centreText}>Opening the radio…</Text>
+      <ActivityIndicator color={accent} />
+      <Text style={[styles.centreText, { color: theme.dim }]}>Opening the radio…</Text>
     </View>
   );
 }
@@ -40,17 +61,24 @@ function Booting() {
  * verbatim rather than collapsed into "something went wrong".
  */
 function Failed({ reason }: { reason: string }) {
+  const { theme } = useTheme();
   return (
     <View style={styles.centre}>
-      <Text style={styles.failTitle}>MeshNet could not start</Text>
-      <Text style={styles.centreText}>{reason}</Text>
+      <Text style={[styles.failTitle, { color: theme.danger }]}>MeshNet could not start</Text>
+      <Text style={[styles.centreText, { color: theme.dim }]}>{reason}</Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: theme.bg },
-  centre: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: 12 },
-  centreText: { color: theme.dim, fontSize: 14, textAlign: 'center', lineHeight: 20 },
-  failTitle: { color: theme.danger, fontSize: 17, fontWeight: '700' },
+  safe: { flex: 1 },
+  centre: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: space.xxl,
+    gap: space.md,
+  },
+  centreText: { ...typography.body, textAlign: 'center' },
+  failTitle: { ...typography.title, textAlign: 'center' },
 });

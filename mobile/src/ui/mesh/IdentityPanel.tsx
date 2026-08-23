@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
-import { Pressable, Text, TextInput, View } from 'react-native';
+import { Text, TextInput, View } from 'react-native';
 
 import type { PeerIdentity } from '../../identity/trust';
 import type { useMesh } from '../useMesh';
-import { styles } from './styles';
-import { theme, trustColor, trustLabel } from '../theme';
+import { useTheme } from '../ThemeProvider';
+import { space, trustLabel } from '../theme';
+import { Button, Chip, Empty } from './Controls';
 
 type Mesh = ReturnType<typeof useMesh>;
 
@@ -24,6 +25,7 @@ type Mesh = ReturnType<typeof useMesh>;
  * is never awarded by software.
  */
 export function IdentityPanel({ mesh }: { mesh: Mesh }) {
+  const { styles, theme } = useTheme();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
 
@@ -35,7 +37,7 @@ export function IdentityPanel({ mesh }: { mesh: Mesh }) {
       <Text style={styles.sectionTitle}>THIS NODE'S IDENTITY</Text>
       <View style={styles.card}>
         {editing ? (
-          <View style={{ gap: 8 }}>
+          <View style={{ gap: space.sm }}>
             <TextInput
               value={draft}
               onChangeText={setDraft}
@@ -45,36 +47,35 @@ export function IdentityPanel({ mesh }: { mesh: Mesh }) {
               placeholderTextColor={theme.faint}
               style={styles.input}
             />
-            <View style={{ flexDirection: 'row', gap: 8 }}>
-              <Pressable
-                style={[styles.button, { flex: 1 }]}
+            <View style={{ flexDirection: 'row', gap: space.sm }}>
+              <Button
+                label="Save"
+                style={{ flex: 1 }}
                 onPress={() => {
                   void mesh.rename(draft);
                   setEditing(false);
                 }}
-              >
-                <Text style={styles.buttonText}>SAVE</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.buttonGhost, { flex: 1 }]}
+              />
+              <Button
+                label="Cancel"
+                variant="ghost"
+                style={{ flex: 1 }}
                 onPress={() => setEditing(false)}
-              >
-                <Text style={styles.buttonGhostText}>CANCEL</Text>
-              </Pressable>
+              />
             </View>
           </View>
         ) : (
           <View style={styles.hitTop}>
             <Text style={styles.hitTitle}>{identity.name}</Text>
-            <Pressable
+            <Button
+              label="Rename"
+              variant="ghost"
+              compact
               onPress={() => {
                 setDraft(identity.name);
                 setEditing(true);
               }}
-              style={styles.buttonGhost}
-            >
-              <Text style={styles.buttonGhostText}>RENAME</Text>
-            </Pressable>
+            />
           </View>
         )}
 
@@ -99,10 +100,10 @@ export function IdentityPanel({ mesh }: { mesh: Mesh }) {
 
       <Text style={styles.sectionTitle}>VERIFYING OTHER NODES</Text>
       {mesh.identities.length === 0 ? (
-        <Text style={styles.empty}>
+        <Empty icon="people-outline">
           Nobody met yet. Every node is challenged to prove its id the moment its first beacon
           arrives.
-        </Text>
+        </Empty>
       ) : (
         mesh.identities.map((peer) => <PeerIdentityRow key={peer.nodeId} peer={peer} mesh={mesh} />)
       )}
@@ -111,8 +112,10 @@ export function IdentityPanel({ mesh }: { mesh: Mesh }) {
 }
 
 function PeerIdentityRow({ peer, mesh }: { peer: PeerIdentity; mesh: Mesh }) {
+  const { styles, theme } = useTheme();
   const [showSafety, setShowSafety] = useState(false);
-  const colour = trustColor[peer.state] ?? theme.faint;
+  // Fixed trust colours, never the tab accent — see the note in `theme.ts`.
+  const colour = theme.trust[peer.state] ?? theme.faint;
   const safety = showSafety ? mesh.safetyFor(peer.nodeId) : null;
   const online = mesh.peers.some((p) => p.nodeId === peer.nodeId);
 
@@ -147,8 +150,11 @@ function PeerIdentityRow({ peer, mesh }: { peer: PeerIdentity; mesh: Mesh }) {
       )}
 
       {safety && (
-        <View style={{ marginTop: 8 }}>
-          <Text style={styles.hint}>
+        // Set on its own panel: this is the one number in the app two people
+        // read off two screens to each other, so it has to survive being held
+        // at arm's length in bad light.
+        <View style={styles.safetyPanel}>
+          <Text style={[styles.hint, { marginTop: 0 }]}>
             Both phones should show exactly this. Read it aloud, or hold the screens together.
           </Text>
           <Text style={styles.safety}>{safety.digits}</Text>
@@ -156,31 +162,22 @@ function PeerIdentityRow({ peer, mesh }: { peer: PeerIdentity; mesh: Mesh }) {
         </View>
       )}
 
-      <View style={[styles.chipRow, { marginTop: 10 }]}>
+      <View style={[styles.chipRow, { marginTop: space.md }]}>
         {online && (
-          <Pressable onPress={() => mesh.challengePeer(peer.nodeId)} style={styles.chip}>
-            <Text style={styles.chipText}>re-challenge</Text>
-          </Pressable>
+          <Chip label="re-challenge" onPress={() => mesh.challengePeer(peer.nodeId)} />
         )}
         {peer.publicKeyHex ? (
-          <Pressable onPress={() => setShowSafety((v) => !v)} style={styles.chip}>
-            <Text style={styles.chipText}>
-              {showSafety ? 'hide safety number' : 'safety number'}
-            </Text>
-          </Pressable>
+          <Chip
+            label={showSafety ? 'hide safety number' : 'safety number'}
+            on={showSafety}
+            onPress={() => setShowSafety((v) => !v)}
+          />
         ) : null}
         {peer.state === 'verified' && (
-          <Pressable
-            onPress={() => void mesh.trustPeer(peer.nodeId)}
-            style={[styles.chip, styles.chipOn]}
-          >
-            <Text style={[styles.chipText, styles.chipTextOn]}>it matches</Text>
-          </Pressable>
+          <Chip label="it matches" on onPress={() => void mesh.trustPeer(peer.nodeId)} />
         )}
         {peer.state === 'trusted' && (
-          <Pressable onPress={() => void mesh.untrustPeer(peer.nodeId)} style={styles.chip}>
-            <Text style={styles.chipText}>undo</Text>
-          </Pressable>
+          <Chip label="undo" onPress={() => void mesh.untrustPeer(peer.nodeId)} />
         )}
       </View>
     </View>

@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, Easing, FlatList, Pressable, Text, TextInput, View } from 'react-native';
+import { Animated, FlatList, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import type { useMesh } from '../useMesh';
-import { styles } from './styles';
-import { theme } from '../theme';
+import { useTheme } from '../ThemeProvider';
+import { motion, space, typography } from '../theme';
+import { Chip, Empty } from './Controls';
 import { HitRow } from './HitRow';
 
 type Mesh = ReturnType<typeof useMesh>;
@@ -17,7 +18,9 @@ const EXAMPLES = [
 ];
 
 export function SearchTab({ mesh }: { mesh: Mesh }) {
+  const { styles, theme, accent } = useTheme();
   const [text, setText] = useState('');
+  const [focused, setFocused] = useState(false);
   const hits = mesh.query?.hits ?? [];
 
   const summary = useMemo(() => {
@@ -41,52 +44,68 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
     void mesh.search(q);
   };
 
+  // Two different unavailables, shown differently on purpose: nothing typed yet
+  // is a dead control and looks it, whereas a search already in flight is very
+  // much alive and only needs to refuse a second tap.
+  const empty = !text.trim();
+  const cannotSearch = mesh.searching || empty;
+
   return (
     <View style={{ flex: 1 }}>
-      <View style={{ paddingHorizontal: 16, paddingTop: 10, paddingBottom: 12, gap: 12 }}>
+      <View
+        style={{
+          paddingHorizontal: space.lg,
+          paddingTop: space.md,
+          paddingBottom: space.md,
+          gap: space.md,
+        }}
+      >
         <Text style={styles.heroLede}>You&rsquo;re offline — but not without help.</Text>
 
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm }}>
           <TextInput
             value={text}
             onChangeText={setText}
             placeholder="how do I treat a burn"
             placeholderTextColor={theme.faint}
-            style={styles.input}
+            style={[styles.input, focused && { borderColor: accent }]}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
             returnKeyType="search"
             onSubmitEditing={() => void mesh.search(text)}
           />
+          {/* Square, because it is the input's own action rather than a
+              statement in its own right — a labelled slab beside a field reads
+              as a second, competing control. */}
           <Pressable
             onPress={() => void mesh.search(text)}
-            disabled={mesh.searching || !text.trim()}
-            style={[
+            disabled={cannotSearch}
+            accessibilityRole="button"
+            accessibilityLabel="search the mesh"
+            accessibilityState={{ disabled: cannotSearch, busy: mesh.searching }}
+            android_ripple={
+              cannotSearch ? undefined : { color: `${theme.onAccent}33`, borderless: false }
+            }
+            style={({ pressed }) => [
               styles.button,
-              (mesh.searching || !text.trim()) && styles.buttonBusy,
-              { paddingVertical: 13 },
+              { backgroundColor: accent, paddingHorizontal: space.lg, minWidth: 52 },
+              empty && styles.buttonDisabled,
+              pressed && !cannotSearch && { opacity: 0.7, transform: [{ scale: 0.98 }] },
             ]}
           >
             {mesh.searching ? (
               <PulseIcon>
-                <Ionicons name="search-outline" size={18} color={theme.dim} />
+                <Ionicons name="search-outline" size={18} color={theme.onAccent} />
               </PulseIcon>
             ) : (
-              <Ionicons name="search-outline" size={18} color={theme.bg} />
+              <Ionicons name="search-outline" size={18} color={theme.onAccent} />
             )}
           </Pressable>
         </View>
 
         <View style={[styles.chipRow, { marginTop: 0 }]}>
           {EXAMPLES.map((ex) => (
-            <Pressable
-              key={ex}
-              onPress={() => ask(ex)}
-              disabled={mesh.searching}
-              style={styles.chip}
-            >
-              <Text style={styles.chipText} numberOfLines={1}>
-                {ex}
-              </Text>
-            </Pressable>
+            <Chip key={ex} label={ex} onPress={() => ask(ex)} disabled={mesh.searching} />
           ))}
         </View>
       </View>
@@ -96,18 +115,19 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
       <FlatList
         data={hits}
         keyExtractor={(h) => String(h.docId)}
-        contentContainerStyle={[styles.listPad, { paddingHorizontal: 16 }]}
+        contentContainerStyle={[styles.listPad, { paddingHorizontal: space.lg }]}
         ListHeaderComponent={<AnswerCard mesh={mesh} />}
         renderItem={({ item }) => (
           <HitRow hit={item} onOpen={() => mesh.openHit(item.docId)} />
         )}
         ListEmptyComponent={
           mesh.searching || mesh.query ? null : (
-            <Text style={styles.empty}>
+            <Empty icon="chatbubble-ellipses-outline">
               Ask something. Passages this phone holds answer instantly; the rest of the mesh
-              answers over Bluetooth, and a passage it only knows *about* comes back with the name
-              of whoever has it.
-            </Text>
+              answers over Bluetooth, and a passage it only knows{' '}
+              <Text style={{ color: theme.dim, fontStyle: 'italic' }}>about</Text> comes back with
+              the name of whoever has it.
+            </Empty>
           )
         }
       />
@@ -115,7 +135,13 @@ export function SearchTab({ mesh }: { mesh: Mesh }) {
   );
 }
 
-/** Gentle breathing scale, for anything that should read as "working on it." */
+/**
+ * Gentle breathing scale, for anything that should read as "working on it."
+ *
+ * On the shared easing rather than `Easing.ease` — the React Native default is
+ * the same curve every generated interface reaches for, and the point of having
+ * three named easings is that nothing falls through to it.
+ */
 function PulseIcon({ children }: { children: React.ReactNode }) {
   const scale = useRef(new Animated.Value(1)).current;
 
@@ -123,15 +149,15 @@ function PulseIcon({ children }: { children: React.ReactNode }) {
     const loop = Animated.loop(
       Animated.sequence([
         Animated.timing(scale, {
-          toValue: 1.2,
+          toValue: 1.18,
           duration: 650,
-          easing: Easing.inOut(Easing.ease),
+          easing: motion.easeInOut,
           useNativeDriver: true,
         }),
         Animated.timing(scale, {
           toValue: 1,
           duration: 650,
-          easing: Easing.inOut(Easing.ease),
+          easing: motion.easeInOut,
           useNativeDriver: true,
         }),
       ]),
@@ -155,16 +181,23 @@ type Mode = 'extractive' | 'generating' | 'generated';
  * sparkles for a model's own paraphrase of them.
  */
 function ModeBadge({ mode }: { mode: Mode }) {
-  const config: Record<Mode, { icon: React.ComponentProps<typeof Ionicons>['name']; label: string; color: string; bg: string }> = {
-    extractive: { icon: 'search-outline', label: 'verbatim passages', color: theme.link, bg: 'rgba(124,134,245,0.16)' },
-    generating: { icon: 'sparkles', label: 'thinking…', color: theme.accent, bg: theme.accentDim },
-    generated: { icon: 'sparkles', label: 'AI-written', color: theme.accent, bg: theme.accentDim },
+  const { styles, theme, accent } = useTheme();
+
+  // `info` for extractive, the tab's own hue for generated. The two have to be
+  // told apart at a glance, and the pairing is deliberate: a verbatim passage
+  // is a fact the mesh reported, so it takes the fixed informational colour,
+  // while a generated answer is this app's own output and wears this app's
+  // current colour.
+  const config: Record<Mode, { icon: React.ComponentProps<typeof Ionicons>['name']; label: string; color: string }> = {
+    extractive: { icon: 'search-outline', label: 'verbatim passages', color: theme.info },
+    generating: { icon: 'sparkles', label: 'thinking…', color: accent },
+    generated: { icon: 'sparkles', label: 'AI-written', color: accent },
   };
-  const { icon, label, color, bg } = config[mode];
+  const { icon, label, color } = config[mode];
   const iconEl = <Ionicons name={icon} size={13} color={color} />;
 
   return (
-    <View style={[styles.modeBadge, { backgroundColor: bg }]}>
+    <View style={[styles.modeBadge, { backgroundColor: `${color}22` }]}>
       {mode === 'generating' ? <PulseIcon>{iconEl}</PulseIcon> : iconEl}
       <Text style={[styles.modeBadgeText, { color }]}>{label}</Text>
     </View>
@@ -180,16 +213,18 @@ function ModeBadge({ mode }: { mode: Mode }) {
  * is stated rather than implied.
  */
 function AnswerCard({ mesh }: { mesh: Mesh }) {
+  const { styles, theme, accent } = useTheme();
+
   if (mesh.searching) {
     return (
-      <View style={[styles.card, { marginBottom: 10 }]}>
-        <View style={[styles.hitTop, { marginBottom: 8 }]}>
+      <View style={[styles.card, { marginBottom: space.md }]}>
+        <View style={[styles.hitTop, { marginBottom: space.sm }]}>
           <Text style={styles.cardTitle}>Answer</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm }}>
             <PulseIcon>
               <Ionicons name="search-outline" size={14} color={theme.dim} />
             </PulseIcon>
-            <Text style={styles.hitBadge}>flooding query</Text>
+            <Text style={[styles.hitBadge, { marginTop: 0 }]}>flooding query</Text>
           </View>
         </View>
         <Text style={styles.cardBody}>
@@ -207,18 +242,24 @@ function AnswerCard({ mesh }: { mesh: Mesh }) {
     mesh.answer?.mode === 'generated' ? 'generated' : mesh.answering ? 'generating' : 'extractive';
 
   return (
-    <View style={{ gap: 10, marginBottom: 10 }}>
-      <View style={[styles.card, mode !== 'extractive' && styles.cardAccent]}>
-        <View style={[styles.hitTop, { marginBottom: 8 }]}>
+    <View style={{ marginBottom: space.md }}>
+      <View
+        style={[styles.card, mode !== 'extractive' && [styles.cardAccent, { borderColor: accent }]]}
+      >
+        <View style={[styles.hitTop, { marginBottom: space.sm }]}>
           <Text style={styles.cardTitle}>Answer</Text>
           <ModeBadge mode={mode} />
         </View>
-        <Text style={styles.cardBody}>{text}</Text>
+
+        {/* The answer is what the whole app exists to put on screen, so it is
+            set at reading size rather than at the 13px the supporting cards
+            use. */}
+        <Text style={[styles.cardBody, typography.body, { color: theme.text }]}>{text}</Text>
 
         {mesh.answer?.passages.length ? (
-          <View style={{ marginTop: 10, gap: 4 }}>
+          <View style={{ marginTop: space.md, gap: space.xs }}>
             {mesh.answer.passages.map((p, i) => (
-              <Text key={p.hit.docId} style={styles.hitBadge}>
+              <Text key={p.hit.docId} style={[styles.hitBadge, { marginTop: 0 }]}>
                 [{i + 1}] {p.hit.title}
                 {p.hit.section ? ` — ${p.hit.section}` : ''} ·{' '}
                 {p.hit.local ? 'local' : `${p.hit.fromNodeName} · ${p.hit.hops}h`}
@@ -227,10 +268,25 @@ function AnswerCard({ mesh }: { mesh: Mesh }) {
           </View>
         ) : null}
 
-        <Text style={[styles.hint, { color: theme.faint }]}>
-          Reference material for emergencies without connectivity. Not a substitute for
-          professional medical care.
-        </Text>
+        {/* Ruled off rather than dropped in as one more grey hint. It is the
+            only sentence on this screen that is a caution rather than an
+            explanation, and it should not be scannable as the same thing. */}
+        <View
+          style={{
+            marginTop: space.md,
+            paddingTop: space.md,
+            borderTopWidth: StyleSheet.hairlineWidth,
+            borderTopColor: theme.hairline,
+            flexDirection: 'row',
+            gap: space.sm,
+          }}
+        >
+          <Ionicons name="alert-circle-outline" size={14} color={theme.warn} />
+          <Text style={[styles.hint, { marginTop: 0, flex: 1 }]}>
+            Reference material for emergencies without connectivity. Not a substitute for
+            professional medical care.
+          </Text>
+        </View>
       </View>
     </View>
   );

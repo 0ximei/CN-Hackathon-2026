@@ -1,217 +1,294 @@
 import { StyleSheet } from 'react-native';
-import { theme } from '../theme';
+import { type Palette, radius, space, typography } from '../theme';
 
-export const styles = StyleSheet.create({
-    root: { flex: 1, backgroundColor: theme.bg },
+/**
+ * The stylesheet, as a function of the palette.
+ *
+ * Two sheets are built once at startup (see `ThemeProvider`) rather than being
+ * rebuilt per render: `StyleSheet.create` is not free, and there are only ever
+ * two possible answers. What is *not* baked in here is the accent — that is the
+ * one colour that changes per tab, so it arrives at the call site from context.
+ */
+export function makeStyles(theme: Palette) {
+    return StyleSheet.create({
+        root: { flex: 1, backgroundColor: theme.bg },
 
-    header: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        paddingHorizontal: 16,
-        paddingVertical: 10,
-        borderBottomWidth: 1,
-        borderBottomColor: theme.border,
-    },
-    headerRight: { alignItems: 'flex-end', maxWidth: '46%' },
-    nodeName: { color: theme.text, fontSize: 19, fontWeight: '700' },
-    nodeId: { color: theme.faint, fontSize: 11, fontFamily: theme.mono, marginTop: 2 },
-    radioRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-    dot: { width: 8, height: 8, borderRadius: 4 },
-    radioText: { color: theme.dim, fontSize: 13 },
-    radioDetail: { color: theme.faint, fontSize: 10, marginTop: 2 },
+        /* masthead — two rows, so the radio state gets room instead of truncating */
+        header: {
+            paddingHorizontal: space.lg,
+            paddingTop: space.md,
+            paddingBottom: space.md,
+            borderBottomWidth: StyleSheet.hairlineWidth,
+            borderBottomColor: theme.hairline,
+            gap: space.xs,
+        },
+        headerRow: { flexDirection: 'row', alignItems: 'center', gap: space.md },
+        nodeName: { ...typography.title, color: theme.text, flexShrink: 1 },
+        nodeId: { ...typography.mono, color: theme.faint, flexShrink: 1 },
+        /** Status as a bordered pill: a naked 8px dot is not a legible state. */
+        statusPill: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: space.sm,
+            paddingHorizontal: space.md,
+            paddingVertical: space.xs,
+            borderRadius: radius.pill,
+            borderWidth: 1,
+        },
+        statusText: { ...typography.label, letterSpacing: 0 },
+        dot: { width: 7, height: 7, borderRadius: radius.pill },
+        radioDetail: { ...typography.micro, color: theme.faint, flex: 1, textAlign: 'right' },
 
-    tabs: { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: theme.border },
-    tab: { flex: 1, paddingVertical: 10, alignItems: 'center' },
-    tabOn: { borderBottomWidth: 2, borderBottomColor: theme.accent },
-    tabText: { color: theme.faint, fontSize: 11, letterSpacing: 1 },
-    tabTextOn: { color: theme.text },
+        /* tab strip — icon over label, and a short indicator that tracks the swipe.
+           Anchored to the bottom, so the rule and the indicator both sit above
+           the row: the indicator points back at the content it belongs to
+           rather than at the gesture bar. */
+        tabBar: {
+            borderTopWidth: StyleSheet.hairlineWidth,
+            borderTopColor: theme.hairline,
+            backgroundColor: theme.bg,
+        },
+        tabs: { flexDirection: 'row' },
+        tab: {
+            flex: 1,
+            paddingTop: space.md,
+            paddingBottom: space.md,
+            alignItems: 'center',
+            gap: 3,
+        },
+        tabText: { ...typography.micro, color: theme.faint, letterSpacing: 0.6 },
+        tabIndicatorTrack: { height: 2, backgroundColor: 'transparent' },
+        tabIndicator: { height: 2, borderRadius: radius.pill },
 
-    searchBar: { flexDirection: 'row', padding: 12, gap: 8 },
-    input: {
-        flex: 1,
-        backgroundColor: theme.panel,
-        borderWidth: 1,
-        borderColor: theme.border,
-        borderRadius: 16,
-        paddingHorizontal: 16,
-        paddingVertical: 12,
-        color: theme.text,
-        fontSize: 15,
-    },
-    button: {
-        backgroundColor: theme.accent,
-        borderRadius: 16,
-        paddingHorizontal: 20,
-        paddingVertical: 12,
-        justifyContent: 'center',
-        minWidth: 64,
-        alignItems: 'center',
-    },
-    buttonBusy: { backgroundColor: theme.accentDim },
-    buttonText: { color: theme.bg, fontWeight: '700', letterSpacing: 1 },
-    buttonGhost: {
-        backgroundColor: 'transparent',
-        borderWidth: 1,
-        borderColor: theme.border,
-        borderRadius: 16,
-        paddingHorizontal: 14,
-        paddingVertical: 9,
-        alignItems: 'center',
-    },
-    buttonGhostText: { color: theme.dim, fontSize: 12, letterSpacing: 0.6 },
-    summary: { color: theme.dim, fontSize: 12, paddingHorizontal: 16, paddingBottom: 6 },
+        input: {
+            flex: 1,
+            backgroundColor: theme.panel,
+            borderWidth: 1,
+            borderColor: theme.hairline,
+            borderRadius: radius.control,
+            paddingHorizontal: space.lg,
+            paddingVertical: space.md,
+            color: theme.text,
+            ...typography.body,
+        },
 
-    listPad: { padding: 12, gap: 10, paddingBottom: 48 },
-    empty: { color: theme.faint, fontSize: 14, textAlign: 'center', padding: 24, lineHeight: 20 },
-    lede: { color: theme.dim, fontSize: 12, lineHeight: 18, marginBottom: 8 },
-    heroLede: { color: theme.text, fontSize: 15, lineHeight: 21, fontWeight: '600' },
+        summary: {
+            ...typography.micro,
+            color: theme.dim,
+            paddingHorizontal: space.lg,
+            paddingBottom: space.sm,
+        },
 
-    hit: {
-        backgroundColor: theme.panel,
-        borderWidth: 1,
-        borderColor: theme.border,
-        borderRadius: 16,
-        padding: 14,
-    },
-    hitTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-    hitTitle: { color: theme.text, fontSize: 15, fontWeight: '600', flex: 1 },
-    hitScore: { color: theme.accent, fontSize: 12, fontFamily: theme.mono },
-    hitBadge: { color: theme.faint, fontSize: 11, marginTop: 4, fontFamily: theme.mono },
-    hitText: { color: theme.dim, fontSize: 13, marginTop: 8, lineHeight: 19 },
+        listPad: { padding: space.md, gap: space.md, paddingBottom: space.huge },
+        empty: {
+            ...typography.body,
+            color: theme.faint,
+            textAlign: 'center',
+            paddingHorizontal: space.xl,
+            paddingVertical: space.xxl,
+        },
+        emptyWrap: { alignItems: 'center', gap: space.sm, paddingVertical: space.xl },
+        lede: { ...typography.bodySm, color: theme.dim, marginBottom: space.sm },
+        heroLede: { ...typography.body, color: theme.text, fontWeight: '600' },
 
-    sectionTitle: {
-        color: theme.faint,
-        fontSize: 11,
-        letterSpacing: 1.5,
-        marginTop: 14,
-        marginBottom: 2,
-    },
-    card: {
-        backgroundColor: theme.panel,
-        borderWidth: 1,
-        borderColor: theme.border,
-        borderRadius: 16,
-        padding: 16,
-    },
-    /** A card that got a result worth trusting more, without a glow — a flat accent edge instead. */
-    cardAccent: { borderColor: theme.accent, borderLeftWidth: 3 },
-    cardWarn: { borderColor: theme.warn },
-    cardDanger: { borderColor: theme.danger },
-    cardTitle: { color: theme.text, fontWeight: '600', fontSize: 14, marginBottom: 4 },
-    cardBody: { color: theme.dim, fontSize: 13, lineHeight: 19 },
+        hit: {
+            backgroundColor: theme.panel,
+            borderWidth: 1,
+            borderColor: theme.hairline,
+            borderRadius: radius.card,
+            padding: space.md,
+        },
+        hitTop: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: space.sm,
+        },
+        hitTitle: { ...typography.heading, color: theme.text, flex: 1 },
+        hitScore: { ...typography.mono },
+        hitBadge: {
+            ...typography.micro,
+            color: theme.faint,
+            marginTop: space.xs,
+            fontFamily: theme.mono,
+        },
+        hitText: { ...typography.bodySm, color: theme.dim, marginTop: space.sm },
 
-    statRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 3 },
-    statLabel: { color: theme.dim, fontSize: 13 },
-    statValue: { color: theme.text, fontSize: 13, fontFamily: theme.mono },
+        sectionTitle: {
+            ...typography.micro,
+            fontWeight: '600',
+            color: theme.faint,
+            letterSpacing: 1.2,
+            marginTop: space.md,
+            marginBottom: 2,
+        },
+        card: {
+            backgroundColor: theme.panel,
+            borderWidth: 1,
+            borderColor: theme.hairline,
+            borderRadius: radius.card,
+            padding: space.lg,
+        },
+        /** A card that got a result worth trusting more, without a glow — a flat accent edge instead. */
+        cardAccent: { borderLeftWidth: 3 },
+        cardWarn: { borderColor: theme.warn },
+        cardDanger: { borderColor: theme.danger },
+        cardTitle: { ...typography.heading, color: theme.text, marginBottom: space.xs },
+        cardBody: { ...typography.bodySm, color: theme.dim },
 
-    chipRow: { flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' },
-    chip: {
-        borderWidth: 1,
-        borderColor: theme.border,
-        backgroundColor: theme.panel,
-        borderRadius: 999,
-        paddingHorizontal: 14,
-        paddingVertical: 9,
-    },
-    chipOn: { borderColor: theme.accent, backgroundColor: theme.accentDim },
-    chipCut: { borderColor: theme.danger },
-    chipText: { color: theme.dim, fontSize: 12 },
-    chipTextOn: { color: theme.text },
+        statRow: {
+            flexDirection: 'row',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: space.md,
+            paddingVertical: space.xs,
+        },
+        statLabel: { ...typography.bodySm, color: theme.dim, flexShrink: 1 },
+        statValue: { ...typography.mono, color: theme.text },
 
-    modeBadge: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: 6,
-        paddingHorizontal: 12,
-        paddingVertical: 7,
-        borderRadius: 999,
-    },
-    modeBadgeText: { fontSize: 11, fontWeight: '700', letterSpacing: 0.3 },
+        /* controls */
+        chipRow: { flexDirection: 'row', gap: space.sm, marginTop: space.md, flexWrap: 'wrap' },
+        chip: {
+            borderWidth: 1,
+            borderColor: theme.hairline,
+            backgroundColor: theme.panelAlt,
+            borderRadius: radius.pill,
+            paddingHorizontal: space.md,
+            paddingVertical: space.md,
+            minHeight: 36,
+            justifyContent: 'center',
+        },
+        chipCut: { borderColor: theme.danger },
+        chipText: { ...typography.label, color: theme.dim },
 
-    /* two-tier storage meter */
-    tierRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 },
-    tierLabel: { color: theme.faint, fontSize: 11, fontFamily: theme.mono, width: 46 },
-    tierBar: {
-        flex: 1,
-        height: 8,
-        borderRadius: 4,
-        backgroundColor: theme.panelAlt,
-        overflow: 'hidden',
-    },
-    tierFillMeta: { height: 8, backgroundColor: theme.link },
-    tierFillBody: { height: 8, backgroundColor: theme.accent },
-    tierValue: { color: theme.dim, fontSize: 11, fontFamily: theme.mono, width: 108, textAlign: 'right' },
+        button: {
+            flexDirection: 'row',
+            gap: space.sm,
+            borderRadius: radius.control,
+            paddingHorizontal: space.xl,
+            paddingVertical: space.md,
+            minHeight: 44,
+            justifyContent: 'center',
+            alignItems: 'center',
+        },
+        buttonGhost: { backgroundColor: 'transparent', borderWidth: 1 },
+        /**
+         * A disabled control is dimmed, never recoloured. Swapping the fill for
+         * a muted tint used to make "busy" and "nothing typed yet" look like two
+         * different kinds of unavailable when they are the same one.
+         */
+        buttonDisabled: { opacity: 0.45 },
+        buttonText: { ...typography.label, letterSpacing: 0.3 },
+        /** Small inline action — sits inside a row, not under it. */
+        buttonCompact: { paddingHorizontal: space.md, paddingVertical: space.sm, minHeight: 36 },
 
-    progress: {
-        height: 6,
-        borderRadius: 3,
-        backgroundColor: theme.panelAlt,
-        overflow: 'hidden',
-        marginTop: 8,
-    },
-    progressFill: { height: 6, backgroundColor: theme.accent },
-    hint: { color: theme.faint, fontSize: 11, fontFamily: theme.mono, marginTop: 6 },
+        /* two-tier storage meter */
+        tierRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, marginTop: space.sm },
+        tierLabel: { ...typography.monoSm, color: theme.faint, width: 46 },
+        tierBar: {
+            flex: 1,
+            height: 8,
+            borderRadius: radius.pill,
+            backgroundColor: theme.panelAlt,
+            overflow: 'hidden',
+        },
+        tierFill: { height: 8, borderRadius: radius.pill },
+        tierValue: { ...typography.monoSm, color: theme.dim, width: 108, textAlign: 'right' },
 
-    /* replica meter: one pip per possible copy */
-    pips: { flexDirection: 'row', gap: 3, marginTop: 8 },
-    pip: { flex: 1, height: 5, borderRadius: 3, backgroundColor: theme.panelAlt },
-    pipHeld: { backgroundColor: theme.accent },
-    pipWanted: { backgroundColor: theme.accentDim },
+        progress: {
+            height: 6,
+            borderRadius: radius.pill,
+            backgroundColor: theme.panelAlt,
+            overflow: 'hidden',
+            marginTop: space.sm,
+        },
+        progressFill: { height: 6, borderRadius: radius.pill },
 
-    /* wire log */
-    logRow: { flexDirection: 'row', gap: 6, alignItems: 'flex-start' },
-    logKind: { fontSize: 9, fontFamily: theme.mono, width: 54, textTransform: 'uppercase' },
-    logType: { fontSize: 10, fontFamily: theme.mono, width: 78 },
-    logPeer: { color: theme.dim, fontSize: 10, fontFamily: theme.mono, width: 56 },
-    logDetail: { color: theme.faint, fontSize: 10, fontFamily: theme.mono, flex: 1 },
+        /** Explanatory prose. Sans, not the 11px monospace this used to be. */
+        hint: { ...typography.micro, color: theme.faint, marginTop: space.sm },
 
-    /* identity */
-    fingerprint: {
-        color: theme.text,
-        fontSize: 15,
-        fontFamily: theme.mono,
-        letterSpacing: 1,
-        marginTop: 4,
-    },
-    emojiRow: { fontSize: 22, letterSpacing: 4, marginTop: 6 },
-    safety: {
-        color: theme.text,
-        fontSize: 17,
-        fontFamily: theme.mono,
-        letterSpacing: 1.5,
-        lineHeight: 26,
-        marginTop: 6,
-    },
-    badge: {
-        borderRadius: 999,
-        paddingHorizontal: 8,
-        paddingVertical: 2,
-        borderWidth: 1,
-    },
-    badgeText: { fontSize: 10, letterSpacing: 0.5 },
+        /* replica meter: one pip per possible copy */
+        pips: { flexDirection: 'row', gap: 3, marginTop: space.sm },
+        pip: { flex: 1, height: 5, borderRadius: radius.pill, backgroundColor: theme.panelAlt },
 
-    /* onboarding */
-    onboard: { flex: 1, padding: 24, justifyContent: 'center', gap: 14 },
-    onboardTitle: { color: theme.text, fontSize: 26, fontWeight: '700' },
-    onboardBody: { color: theme.dim, fontSize: 14, lineHeight: 21 },
+        /* wire log */
+        logRow: { flexDirection: 'row', gap: space.sm, alignItems: 'flex-start' },
+        logKind: { ...typography.monoNano, width: 54, textTransform: 'uppercase' },
+        logType: { ...typography.monoNano, width: 78 },
+        logPeer: { ...typography.monoNano, color: theme.dim, width: 56 },
+        logDetail: { ...typography.monoNano, color: theme.faint, flex: 1 },
 
-    /* topology view */
-    graph: { backgroundColor: theme.panel, borderRadius: 12, borderWidth: 1, borderColor: theme.border },
-    graphNode: {
-        position: 'absolute',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    graphDisc: {
-        borderWidth: 1.5,
-        alignItems: 'center',
-        justifyContent: 'center',
-        backgroundColor: theme.bg,
-    },
-    graphLabel: { color: theme.dim, fontSize: 10, marginTop: 3, fontFamily: theme.mono },
-    graphSub: { color: theme.faint, fontSize: 9, fontFamily: theme.mono },
-    legend: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 8 },
-    legendItem: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-    legendSwatch: { width: 8, height: 8, borderRadius: 4 },
-    legendText: { color: theme.faint, fontSize: 10, fontFamily: theme.mono },
-});
+        /* identity */
+        fingerprint: {
+            ...typography.readAloud,
+            color: theme.text,
+            letterSpacing: 1,
+            marginTop: space.xs,
+        },
+        /** The same key, quoted inline beside an author's name rather than displayed. */
+        authorLine: { ...typography.mono, color: theme.text },
+        /** Glyph sizing, not a type role — these are pictures that happen to be text. */
+        emojiRow: { fontSize: 22, lineHeight: 30, letterSpacing: 4, marginTop: space.sm },
+        safety: {
+            ...typography.readAloudLg,
+            color: theme.text,
+            letterSpacing: 1.5,
+            marginTop: space.sm,
+        },
+        /** Where a safety number is set for two people to compare, screen to screen. */
+        safetyPanel: {
+            marginTop: space.sm,
+            padding: space.md,
+            borderRadius: radius.control,
+            backgroundColor: theme.bg,
+            borderWidth: 1,
+            borderColor: theme.hairline,
+        },
+        badge: {
+            borderRadius: radius.pill,
+            paddingHorizontal: space.sm,
+            paddingVertical: 2,
+            borderWidth: 1,
+        },
+        badgeText: { ...typography.micro, letterSpacing: 0.4, fontWeight: '600' },
+
+        modeBadge: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: space.sm,
+            paddingHorizontal: space.md,
+            paddingVertical: space.sm,
+            borderRadius: radius.pill,
+        },
+        modeBadgeText: { ...typography.micro, fontWeight: '700', letterSpacing: 0.3 },
+
+        /* onboarding — flexGrow, not flex: a ScrollView content box that cannot
+           grow past the viewport will not scroll when the keyboard is up */
+        onboard: { flexGrow: 1, padding: space.xxl, justifyContent: 'center', gap: space.md },
+        onboardTitle: { ...typography.display, color: theme.text },
+        onboardBody: { ...typography.body, color: theme.dim },
+
+        /* topology view */
+        graph: {
+            backgroundColor: theme.panel,
+            borderRadius: radius.card,
+            borderWidth: 1,
+            borderColor: theme.hairline,
+        },
+        graphNode: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
+        graphDisc: {
+            borderWidth: 1.5,
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: theme.bg,
+        },
+        graphLabel: { ...typography.monoSm, color: theme.dim, marginTop: 3 },
+        graphSub: { ...typography.monoNano, color: theme.faint },
+        legend: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm, marginTop: space.sm },
+        legendItem: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
+        legendSwatch: { width: 8, height: 8, borderRadius: radius.pill },
+        legendText: { ...typography.monoNano, color: theme.faint },
+    });
+}
+
+export type Styles = ReturnType<typeof makeStyles>;

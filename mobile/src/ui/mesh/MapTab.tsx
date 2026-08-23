@@ -1,9 +1,9 @@
 import React from 'react';
-import { Pressable, ScrollView, Text, View } from 'react-native';
+import { ScrollView, Text, View } from 'react-native';
 
 import type { useMesh } from '../useMesh';
-import { styles } from './styles';
-import { theme } from '../theme';
+import { useTheme } from '../ThemeProvider';
+import { Chip, Empty } from './Controls';
 import { MeshGraph } from './MeshGraph';
 import { PeerRow } from './PeerRow';
 import { Stat } from './Stat';
@@ -15,6 +15,7 @@ const TTLS = [1, 2, 4, 8];
 const LOSSES = [0, 0.15, 0.3, 0.6];
 
 export function MapTab({ mesh }: { mesh: Mesh }) {
+  const { styles } = useTheme();
   const caps = mesh.capabilities;
 
   return (
@@ -48,10 +49,10 @@ export function MapTab({ mesh }: { mesh: Mesh }) {
 
       <Text style={styles.sectionTitle}>REACHABLE NODES</Text>
       {mesh.peers.length === 0 ? (
-        <Text style={styles.empty}>
+        <Empty icon="radio-outline">
           No peers yet. Open MeshNet on a second Android phone within a few metres — discovery
           usually takes five to fifteen seconds.
-        </Text>
+        </Empty>
       ) : (
         mesh.peers.map((peer) => (
           <PeerRow
@@ -85,6 +86,7 @@ export function MapTab({ mesh }: { mesh: Mesh }) {
  * anyone actually demonstrates.
  */
 function NetworkControls({ mesh }: { mesh: Mesh }) {
+  const { styles, theme } = useTheme();
   const patch = (next: Partial<typeof mesh.dev>) => mesh.setDev((d) => ({ ...d, ...next }));
 
   const directPeers = mesh.peers.filter((p) => p.hops <= 1);
@@ -110,32 +112,24 @@ function NetworkControls({ mesh }: { mesh: Mesh }) {
         <Text style={styles.hint}>HOP LIMIT · TTL {mesh.dev.ttl}</Text>
         <View style={styles.chipRow}>
           {TTLS.map((ttl) => (
-            <Pressable
+            <Chip
               key={ttl}
+              label={String(ttl)}
+              on={mesh.dev.ttl === ttl}
               onPress={() => patch({ ttl })}
-              style={[styles.chip, mesh.dev.ttl === ttl && styles.chipOn]}
-            >
-              <Text style={[styles.chipText, mesh.dev.ttl === ttl && styles.chipTextOn]}>
-                {ttl}
-              </Text>
-            </Pressable>
+            />
           ))}
         </View>
 
         <Text style={styles.hint}>PACKET LOSS · {Math.round(mesh.dev.packetLoss * 100)}%</Text>
         <View style={styles.chipRow}>
           {LOSSES.map((loss) => (
-            <Pressable
+            <Chip
               key={loss}
+              label={`${Math.round(loss * 100)}%`}
+              on={mesh.dev.packetLoss === loss}
               onPress={() => patch({ packetLoss: loss })}
-              style={[styles.chip, mesh.dev.packetLoss === loss && styles.chipOn]}
-            >
-              <Text
-                style={[styles.chipText, mesh.dev.packetLoss === loss && styles.chipTextOn]}
-              >
-                {Math.round(loss * 100)}%
-              </Text>
-            </Pressable>
+            />
           ))}
         </View>
 
@@ -152,15 +146,12 @@ function NetworkControls({ mesh }: { mesh: Mesh }) {
             const peerId = (peer.nodeId >>> 0).toString(16).padStart(8, '0');
             const cut = mesh.dev.cutLinks.includes(peerId);
             return (
-              <Pressable
+              <Chip
                 key={peer.nodeId}
+                label={`${peer.name} ${cut ? '· severed' : '· up'}`}
+                cut={cut}
                 onPress={() => toggleLink(peerId)}
-                style={[styles.chip, cut && styles.chipCut]}
-              >
-                <Text style={[styles.chipText, cut && { color: theme.danger }]}>
-                  {peer.name} {cut ? '· severed' : '· up'}
-                </Text>
-              </Pressable>
+              />
             );
           })}
         </View>

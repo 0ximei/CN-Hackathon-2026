@@ -1,7 +1,7 @@
 import React from 'react';
 import { Text, View } from 'react-native';
 
-import { styles } from './styles';
+import { useTheme } from '../ThemeProvider';
 
 export function Stat({
   label,
@@ -13,6 +13,7 @@ export function Stat({
   /** Overrides the number, for rows whose value is not one. */
   render?: string;
 }) {
+  const { styles } = useTheme();
   return (
     <View style={styles.statRow}>
       <Text style={styles.statLabel}>{label}</Text>

@@ -4,8 +4,8 @@ import { Animated, Easing, Text, View, useWindowDimensions } from 'react-native'
 import type { Identity } from '@core/lib/ids';
 
 import type { ActivityEvent, PeerState } from '../../mesh/MeshNode';
-import { styles } from './styles';
-import { theme, trustColor, wireColor } from '../theme';
+import { useTheme } from '../ThemeProvider';
+import { typography } from '../theme';
 
 /**
  * The topology view.
@@ -66,6 +66,7 @@ export function MeshGraph({
     activity,
     respondedNodeIds,
 }: Props) {
+    const { styles, theme, accent } = useTheme();
     const { width } = useWindowDimensions();
     const boardWidth = Math.max(240, width - 24);
 
@@ -102,7 +103,7 @@ export function MeshGraph({
 
         for (const ev of fresh) {
             if (ev.kind === 'radio' || ev.kind === 'replicated' || ev.kind === 'evicted') continue;
-            const color = ev.kind === 'dropped' ? theme.danger : (wireColor[ev.type] ?? theme.faint);
+            const color = ev.kind === 'dropped' ? theme.danger : (theme.wire[ev.type] ?? theme.faint);
 
             if (ev.kind === 'received') {
                 const from = layout.positions.get(ev.srcId);
@@ -141,7 +142,7 @@ export function MeshGraph({
                 <Node
                     at={layout.self}
                     radius={SELF_R}
-                    color={theme.accent}
+                    color={accent}
                     label={identity.name}
                     sub={`${selfStored}/${selfKnown}`}
                 />
@@ -151,7 +152,7 @@ export function MeshGraph({
                         key={peer.nodeId}
                         at={at}
                         radius={PEER_R}
-                        color={trustColor[peer.trust] ?? theme.faint}
+                        color={theme.trust[peer.trust] ?? theme.faint}
                         label={peer.name}
                         sub={`${peer.stored}/${peer.known} · ${peer.hops}h`}
                         highlighted={respondedNodeIds.includes(peer.nodeId)}
@@ -173,7 +174,7 @@ export function MeshGraph({
             <View style={styles.legend}>
                 {['HELLO', 'QUERY', 'RESULT', 'DOC_RES', 'ANNOUNCE', 'IDENT_RES'].map((type) => (
                     <View key={type} style={styles.legendItem}>
-                        <View style={[styles.legendSwatch, { backgroundColor: wireColor[type] }]} />
+                        <View style={[styles.legendSwatch, { backgroundColor: theme.wire[type] }]} />
                         <Text style={styles.legendText}>{type.toLowerCase()}</Text>
                     </View>
                 ))}
@@ -194,6 +195,7 @@ export function MeshGraph({
  * real radio link would claim a connection that does not exist.
  */
 function Edge({ from, to, direct }: { from: Point; to: Point; direct: boolean }) {
+    const { theme } = useTheme();
     const dx = to.x - from.x;
     const dy = to.y - from.y;
     const length = Math.sqrt(dx * dx + dy * dy);
@@ -285,6 +287,7 @@ function Node({
     sub: string;
     highlighted?: boolean;
 }) {
+    const { styles, theme } = useTheme();
     return (
         <View
             pointerEvents="none"
@@ -302,7 +305,15 @@ function Node({
                     },
                 ]}
             >
-                <Text style={{ color: highlighted ? theme.bg : color, fontSize: 11, fontWeight: '700' }}>
+                {/* A highlighted node is filled, so its initials take the
+                    ink-on-accent colour rather than the page ground — cream
+                    letters on a cream-adjacent fill would vanish in light. */}
+                <Text
+                    style={[
+                        typography.micro,
+                        { color: highlighted ? theme.onAccent : color, fontWeight: '700' },
+                    ]}
+                >
                     {label.slice(0, 2).toUpperCase()}
                 </Text>
             </View>

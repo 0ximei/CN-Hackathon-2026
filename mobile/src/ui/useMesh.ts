@@ -18,6 +18,10 @@ import {
 } from '../identity/identity';
 import { safetyEmoji, safetyNumber } from '../identity/fingerprint';
 import { peerPublicKey, type PeerIdentity } from '../identity/trust';
+import type { SchemePreference } from './theme';
+
+/** Where the light/dark override lives in the catalog's key/value table. */
+const SCHEME_KEY = 'ui.scheme';
 import {
     MeshNode,
     type ActivityEvent,
@@ -121,6 +125,20 @@ export function useMesh() {
      */
     const [nameOverride, setNameOverride] = useState<string | null>(null);
 
+    /**
+     * Light/dark override, or `null` to follow the system.
+     *
+     * Persisted through the catalog's existing `kv` table rather than a second
+     * storage mechanism — the database is already open by the time anyone can
+     * reach the control that changes this.
+     */
+    const [scheme, setScheme] = useState<SchemePreference>(null);
+
+    const chooseScheme = useCallback((next: SchemePreference) => {
+        setScheme(next);
+        void catalogRef.current?.kvSet(SCHEME_KEY, next ?? 'system');
+    }, []);
+
     useEffect(() => {
         llm.onStatus = (next) => setLlmStatus({ ...next });
         return () => {
@@ -162,6 +180,13 @@ export function useMesh() {
                 if (cancelled) return;
                 catalogRef.current = catalog;
                 setCatalogStats(catalog.stats());
+
+                // Read before the identity check: the appearance choice applies
+                // to the onboarding screen too, and that branch never reaches
+                // the code below.
+                const stored = await catalog.kvGet(SCHEME_KEY);
+                if (cancelled) return;
+                if (stored === 'light' || stored === 'dark') setScheme(stored);
 
                 const existing = await loadIdentity(catalog);
                 if (cancelled) return;
@@ -490,6 +515,8 @@ export function useMesh() {
     return {
         phase,
         error,
+        scheme,
+        chooseScheme,
         identity,
         fingerprint: sessionRef.current?.fingerprint ?? null,
         suggestedName,

@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { ScrollView, Text, TextInput, View } from 'react-native';
 
 import { cleanName } from '../identity/identity';
-import { styles } from './mesh/styles';
-import { theme } from './theme';
+import { Button } from './mesh/Controls';
+import { useTheme } from './ThemeProvider';
+import { space } from './theme';
 
 /**
  * First launch: create this device's identity.
@@ -24,7 +25,9 @@ export function OnboardingScreen({
   suggestedName: string;
   onCreate: (name: string) => void;
 }) {
+  const { styles, theme, accent } = useTheme();
   const [name, setName] = useState('');
+  const [focused, setFocused] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -46,12 +49,12 @@ export function OnboardingScreen({
         the public half.
       </Text>
       <Text style={styles.onboardBody}>
-        That makes the id self-certifying: any node can challenge this one to sign a random
-        number, and only the phone holding the private key can answer. Nobody can route under your
-        id or attribute a passage to you without it.
+        That makes the id self-certifying: any node can challenge this one to sign a random number,
+        and only the phone holding the private key can answer. Nobody can route under your id or
+        attribute a passage to you without it.
       </Text>
 
-      <Text style={[styles.sectionTitle, { marginTop: 18 }]}>DISPLAY NAME</Text>
+      <Text style={[styles.sectionTitle, { marginTop: space.xl }]}>DISPLAY NAME</Text>
       <TextInput
         value={name}
         onChangeText={setName}
@@ -60,7 +63,9 @@ export function OnboardingScreen({
         autoCorrect={false}
         placeholder={suggestedName || 'Kamo'}
         placeholderTextColor={theme.faint}
-        style={styles.input}
+        style={[styles.input, focused && { borderColor: accent }]}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
         returnKeyType="go"
         onSubmitEditing={submit}
       />
@@ -70,23 +75,19 @@ export function OnboardingScreen({
         anything on its own. Two phones compare fingerprints for that.
       </Text>
 
-      <Pressable
+      <Button
+        label="Generate keypair"
+        icon="key-outline"
+        busy={busy}
         onPress={submit}
-        disabled={busy}
-        style={[styles.button, { marginTop: 18 }, busy && styles.buttonBusy]}
-      >
-        {busy ? (
-          <ActivityIndicator color={theme.bg} size="small" />
-        ) : (
-          <Text style={styles.buttonText}>GENERATE KEYPAIR</Text>
-        )}
-      </Pressable>
+        style={{ marginTop: space.xl }}
+      />
 
-      <View style={[styles.card, { marginTop: 18 }]}>
+      <View style={[styles.card, { marginTop: space.xl }]}>
         <Text style={styles.cardTitle}>Where the key lives</Text>
         <Text style={styles.cardBody}>
-          In this app's own SQLite file, in private app storage. The Android Keystore is where it
-          belongs and would keep it off the JS heap entirely; signing happens in JavaScript here,
+          In this app&rsquo;s own SQLite file, in private app storage. The Android Keystore is where
+          it belongs and would keep it off the JS heap entirely; signing happens in JavaScript here,
           so it cannot. Treat this as a demo credential, not a durable one.
         </Text>
       </View>

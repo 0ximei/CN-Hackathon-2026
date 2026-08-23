@@ -1,9 +1,10 @@
 import React from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
 
 import type { PeerState } from '../../mesh/MeshNode';
-import { styles } from './styles';
-import { bytes, theme, trustColor, trustLabel } from '../theme';
+import { useTheme } from '../ThemeProvider';
+import { bytes, space, trustLabel } from '../theme';
+import { Button } from './Controls';
 
 /**
  * One reachable node, with the inputs that decide where replicas go.
@@ -12,14 +13,12 @@ import { bytes, theme, trustColor, trustLabel } from '../theme';
  * to be dependable is not evidence of anything. Free space is the opposite: it
  * is the one signal a node is the only authority on, so it is taken at its word.
  */
-export function PeerRow({
-  peer,
-  onVerify,
-}: {
-  peer: PeerState;
-  onVerify?: () => void;
-}) {
-  const colour = trustColor[peer.trust] ?? theme.faint;
+export function PeerRow({ peer, onVerify }: { peer: PeerState; onVerify?: () => void }) {
+  const { styles, theme, accent } = useTheme();
+
+  // Trust colours come from the palette, never from the tab accent: a peer that
+  // is trusted has to look the same on every screen it appears on.
+  const colour = theme.trust[peer.trust] ?? theme.faint;
   const suspicious = peer.trust === 'failed' || peer.trust === 'mismatch';
 
   return (
@@ -28,19 +27,19 @@ export function PeerRow({
         <Text style={styles.hitTitle} numberOfLines={1}>
           {peer.name}
         </Text>
-        <Text style={styles.hitScore}>{peer.hops <= 1 ? 'direct' : `${peer.hops} hops`}</Text>
+        <Text style={[styles.hitScore, { color: accent }]}>
+          {peer.hops <= 1 ? 'direct' : `${peer.hops} hops`}
+        </Text>
       </View>
 
-      <View style={[styles.hitTop, { marginTop: 6 }]}>
+      <View style={[styles.hitTop, { marginTop: space.sm }]}>
         <View style={[styles.badge, { borderColor: colour }]}>
           <Text style={[styles.badgeText, { color: colour }]}>
             {trustLabel[peer.trust] ?? peer.trust}
           </Text>
         </View>
         {onVerify && (peer.trust === 'unknown' || suspicious) ? (
-          <Pressable onPress={onVerify} style={styles.buttonGhost}>
-            <Text style={styles.buttonGhostText}>CHALLENGE</Text>
-          </Pressable>
+          <Button label="Challenge" variant="ghost" compact onPress={onVerify} />
         ) : null}
       </View>
 
@@ -56,7 +55,7 @@ export function PeerRow({
         <View style={styles.tierBar}>
           <View
             style={[
-              styles.tierFillMeta,
+              styles.tierFill,
               { width: `${Math.round(peer.reliability * 100)}%`, backgroundColor: colour },
             ]}
           />
