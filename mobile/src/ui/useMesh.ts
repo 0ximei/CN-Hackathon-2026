@@ -423,15 +423,27 @@ export function useMesh() {
         [query],
     );
 
+    /**
+     * Puts documents into the mesh, whoever wrote them.
+     *
+     * `title` is present when the author typed the document here rather than
+     * importing a file, and it is what the progress line names: a typed note's
+     * synthesised filename is an implementation detail nobody should watch
+     * scroll past.
+     */
     const addFiles = useCallback(
-        async (files: Array<{ name: string; text: string }>) => {
+        async (files: Array<{ name: string; text: string; title?: string }>) => {
             const node = nodeRef.current;
             if (!node) return;
             for (const file of files) {
-                setUpload({ busy: true, label: file.name, done: 0, total: 0 });
+                const label = file.title ?? file.name;
+                setUpload({ busy: true, label, done: 0, total: 0 });
                 try {
-                    await node.upload(file.name, file.text, (done, total) =>
-                        setUpload({ busy: true, label: file.name, done, total }),
+                    await node.upload(
+                        file.name,
+                        file.text,
+                        (done, total) => setUpload({ busy: true, label, done, total }),
+                        file.title,
                     );
                 } finally {
                     setUpload(IDLE_UPLOAD);

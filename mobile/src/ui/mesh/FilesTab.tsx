@@ -1,6 +1,5 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { FlatList, Text, View } from 'react-native';
-import * as DocumentPicker from 'expo-document-picker';
 
 import type { Authorship } from '../../identity/authorship';
 
@@ -20,41 +19,20 @@ const PROVENANCE_LABEL: Record<Provenance, string> = {
   mesh: 'FROM THE MESH',
 };
 
-async function readAssetText(uri: string): Promise<string> {
-  const response = await fetch(uri);
-  if (!response.ok) throw new Error(`could not read document: ${response.status}`);
-  return response.text();
-}
-
-export function FilesTab({ mesh }: { mesh: Mesh }) {
-  const { styles, theme, accent } = useTheme();
-  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
-
-  const handleUpload = async () => {
-    const result = await DocumentPicker.getDocumentAsync({
-      multiple: true,
-      copyToCacheDirectory: true,
-      type: ['text/plain', 'text/markdown', 'text/*'],
-    });
-    if (result.canceled || !result.assets?.length) return;
-
-    setNote(null);
-    try {
-      const files = await Promise.all(
-        result.assets.map(async (asset: { name?: string; uri: string }, i: number) => ({
-          name: asset.name ?? `uploaded-${i}.txt`,
-          text: await readAssetText(asset.uri),
-        })),
-      );
-      await mesh.addFiles(files);
-      setNote({
-        ok: true,
-        text: `Added ${files.length} file${files.length === 1 ? '' : 's'}. Metadata is on its way to the mesh; bodies follow where the policy places them.`,
-      });
-    } catch (e) {
-      setNote({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    }
-  };
+/**
+ * What this node knows, and how safely it knows it.
+ *
+ * There is one way in rather than two. Typing a document and importing one are
+ * the same act — text this node is about to put its name and signature on — and
+ * they differ only in where the first draft came from, so both go through the
+ * composer (see `Composer.tsx`) and both get read before they are published.
+ *
+ * Nothing here reports success in prose. A published document arrives at the
+ * top of this list a moment later with its own replica meter, which is a truer
+ * account of what happened than a sentence saying it went well.
+ */
+export function FilesTab({ mesh, onCompose }: { mesh: Mesh; onCompose: () => void }) {
+  const { styles } = useTheme();
 
   return (
     <FlatList
@@ -64,52 +42,12 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
       ListHeaderComponent={
         <View style={{ marginBottom: space.xs, gap: space.sm }}>
           <Text style={styles.lede}>
-            Upload a document and it enters the mesh here, then spreads by itself — metadata to
-            everyone that ranks for it, full text to the nodes the policy picks.
+            Write something down or import a .txt or .md, and it enters the mesh here — then
+            spreads by itself: metadata to everyone that ranks for it, full text to the nodes the
+            policy picks.
           </Text>
 
-          <Button
-            label="Upload .txt or .md"
-            icon="cloud-upload-outline"
-            busy={mesh.upload.busy}
-            onPress={() => void handleUpload()}
-          />
-
-          {mesh.upload.busy && (
-            <View>
-              <View style={styles.progress}>
-                <View
-                  style={[
-                    styles.progressFill,
-                    {
-                      width: `${
-                        mesh.upload.total ? (mesh.upload.done / mesh.upload.total) * 100 : 0
-                      }%`,
-                      backgroundColor: accent,
-                    },
-                  ]}
-                />
-              </View>
-              <Text style={styles.hint}>
-                {mesh.upload.label}
-                {mesh.upload.total
-                  ? ` — ${mesh.upload.done}/${mesh.upload.total} passages embedded`
-                  : ''}
-              </Text>
-            </View>
-          )}
-
-          {note && (
-            <Text
-              style={[
-                styles.summary,
-                { paddingHorizontal: 0 },
-                !note.ok && { color: theme.warn },
-              ]}
-            >
-              {note.text}
-            </Text>
-          )}
+          <Button label="Add a document" icon="add" onPress={onCompose} />
         </View>
       }
       renderItem={({ item }) => (
@@ -121,7 +59,10 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
         />
       )}
       ListEmptyComponent={
-        <Empty icon="document-outline">No documents yet. Upload one above.</Empty>
+        <Empty icon="document-outline">
+          Nothing here yet. Everything this phone can answer offline starts as a document on this
+          screen.
+        </Empty>
       }
     />
   );

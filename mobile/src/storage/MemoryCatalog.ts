@@ -235,10 +235,16 @@ export class MemoryCatalog implements MeshCatalog {
 
     /* ------------------------------- writes ----------------------------- */
 
-    async upload(filename: string, raw: string, originId: number, onProgress?: (d: number, t: number) => void) {
+    async upload(
+        filename: string,
+        raw: string,
+        originId: number,
+        onProgress?: (d: number, t: number) => void,
+        title?: string,
+    ) {
         const text = normalizeUploadedText(raw);
         if (!text) throw new Error(`${filename} has no readable text`);
-        const parsed = parseDocument(filename, text);
+        const parsed = parseDocument(filename, text, title);
         if (!parsed.chunks.length) throw new Error(`${filename} has no readable text`);
         return this.ingestParsed(parsed, originId, 'local', undefined, onProgress);
     }

@@ -51,11 +51,17 @@ export interface MeshCatalog {
     searchLocal(queryVec: Float32Array, queryText: string, k: number): LocalHit[];
 
     /* writes */
+    /**
+     * `title` is set when an author typed the document here rather than
+     * picking a file: the name is then stated, not inferred, and headings in
+     * the body do not get to override it.
+     */
     upload(
         filename: string,
         raw: string,
         originId: number,
         onProgress?: (done: number, total: number) => void,
+        title?: string,
     ): Promise<{ doc: DocRow; metas: MetaRow[] }>;
     ingestParsed(
         parsed: ParsedDoc,
