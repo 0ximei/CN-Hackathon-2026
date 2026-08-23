@@ -45,5 +45,12 @@ android {
 // segment two bytes over the attribute ceiling is invisible to every check
 // short of two phones in a room.
 dependencies {
+  // React Native's own classes, for the headless-task handle in
+  // `BleMeshModule` that keeps the JS clock running with the app closed.
+  // expo-modules-core depends on this too, but with `implementation`, so it
+  // does not reach this module's compile classpath. Version-less on purpose:
+  // the React Native gradle plugin resolves it to the app's own version.
+  implementation 'com.facebook.react:react-android'
+
   testImplementation 'junit:junit:4.13.2'
 }

@@ -1,50 +1,75 @@
 package expo.modules.blemesh
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.os.IBinder
+import android.os.SystemClock
+
+import com.facebook.react.HeadlessJsTaskService
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.jstasks.HeadlessJsTaskConfig
 
 /**
- * Keeps the mesh alive after the user leaves the app.
+ * Keeps the mesh on the air after the user leaves, and after the user kills it.
  *
- * Android kills an app's process when it is swiped out of recents, and starves
- * it of CPU well before that. A radio is not something that can be resumed
- * afterwards — links are torn down, the node stops advertising, and every peer
- * that was routing through it has to relearn the mesh without it. The only
- * supported way to say "this process is doing something the user asked for and
- * must keep running" is a foreground service, which is this.
+ * Three separate things have to be true for that, and the first version of this
+ * service only managed one of them.
  *
- * **What this does not do is run the mesh natively.** Routing, deduplication,
- * replication, the catalogue and the store-and-forward outbox are all
- * TypeScript, and a radio without them is a phone holding open connections it
- * cannot answer on. So the job here is not to take the mesh over — it is to
- * keep the *process* alive, and with it the JavaScript that is the mesh. The
- * Activity can be destroyed and the app can vanish from recents; as long as
- * this service is up, the runtime underneath it is not reclaimed.
+ * **The process has to survive the app closing.** Android starves a background
+ * process of CPU and reclaims it outright when the app is swiped from recents.
+ * A foreground service with a visible notification is the only supported way to
+ * say the user asked for this. That much was always here.
  *
- * The notification is not a formality either. It is the honest disclosure that
- * a radio is running with the app closed, and the only place a user can turn it
- * off without launching the app again.
+ * **The runtime has to keep working, not merely exist.** React Native stops
+ * delivering timers when the Activity pauses and does not resume them when it
+ * is destroyed, and the mesh is entirely timers. Extending
+ * [HeadlessJsTaskService] is what fixes that: a headless task is the one state
+ * in which React Native leaves the clock running, and it also knows how to
+ * *create* a React context from a service, which is the next problem.
+ *
+ * **And it has to come back from being killed.** Swiping the app away destroys
+ * the task, and on plenty of devices — anything with an aggressive memory
+ * manager, which is most Android phones people actually own — takes the process
+ * with it regardless of the notification. So the service is sticky and it
+ * re-arms itself on task removal, and when it restarts it boots JavaScript with
+ * no Activity behind it. What it does *not* do is carry any mesh state across
+ * that restart: the identity, the preference and the catalog are all in SQLite
+ * already, so `startDaemon` in `src/mesh/daemon.ts` rebuilds the node from disk
+ * without the native side having to remember a node id and keep it in sync.
+ *
+ * That last part is what changed the answer on stickiness. A sticky service
+ * that could not restart the radio would come back as a notification claiming a
+ * mesh that was not there; one that can is just the daemon doing its job.
  */
-class MeshService : Service() {
+class MeshService : HeadlessJsTaskService() {
 
-  override fun onBind(intent: Intent?): IBinder? = null
+  /**
+   * Whether a task is already holding the runtime open.
+   *
+   * `onStartCommand` is called again for every notification update — a peer
+   * joining is enough — and each one would otherwise start another task on top
+   * of the last, each with its own wakelock and its own `startDaemon`.
+   */
+  private var holding = false
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     if (intent?.action == ACTION_STOP) {
       // Asked to stop from the notification, with the app possibly not running.
       onStopRequested?.invoke()
+      cancelRestart(this)
       stopSelf()
       return START_NOT_STICKY
     }
 
+    // Before anything that can block: from Android 8 the system gives a service
+    // started with `startForegroundService` a few seconds to post a
+    // notification and kills the process if it does not.
     val detail = intent?.getStringExtra(EXTRA_DETAIL) ?: "starting"
     val notification = build(detail)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -56,18 +81,48 @@ class MeshService : Service() {
       startForeground(NOTIFICATION_ID, notification)
     }
 
-    // Deliberately not sticky. Being a foreground service is what stops the
-    // process being reclaimed; restarting after it happens anyway is a separate
-    // question, and the answer here is no. The radio is started from JavaScript
-    // with a node id this service does not have, so a resurrected service would
-    // come back with a notification, no radio behind it, and no way to get one
-    // — telling the user the mesh is up when it is not. If the system takes the
-    // process, the mesh is down until the app is opened, and the missing
-    // notification says exactly that.
-    return START_NOT_STICKY
+    if (!holding) {
+      holding = true
+      // Creates the React context if there is not one — the restart path — and
+      // starts the task on it once it is ready.
+      super.onStartCommand(intent, flags, startId)
+    }
+
+    // Sticky, so the system brings the service back after killing the process.
+    // Safe to be, now that a restarted service can rebuild the node from disk;
+    // it was not when the node id lived only in JavaScript. The restart arrives
+    // with a null intent, which is why `detail` has a fallback.
+    return START_STICKY
+  }
+
+  /**
+   * The config for the task that holds the runtime open.
+   *
+   * Timeout 0 means no deadline: this ends when the service does, not on a
+   * clock. Allowed in the foreground because switching background mode on is
+   * something someone does while looking at the screen, and `startTask` throws
+   * rather than waits if the app happens to be resumed.
+   */
+  override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig =
+    HeadlessJsTaskConfig(AWAKE_TASK, Arguments.createMap(), 0L, true)
+
+  /**
+   * The app was swiped out of recents.
+   *
+   * `stopWithTask` is false so the service itself is not stopped, but on many
+   * devices the process is killed anyway a moment later, and a killed process
+   * cannot schedule its own recovery. So the alarm is set here, while there is
+   * still something running to set it: if the process survives, the alarm
+   * arrives at a service that is already up and does nothing but redraw a
+   * notification; if it does not, the alarm is what brings the mesh back.
+   */
+  override fun onTaskRemoved(rootIntent: Intent?) {
+    scheduleRestart(this)
+    super.onTaskRemoved(rootIntent)
   }
 
   override fun onDestroy() {
+    holding = false
     runCatching {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
       else @Suppress("DEPRECATION") stopForeground(true)
@@ -129,7 +184,20 @@ class MeshService : Service() {
     private const val CHANNEL_ID = "meshnet.radio"
     private const val NOTIFICATION_ID = 0x4d45
     private const val ACTION_STOP = "expo.modules.blemesh.STOP"
+    private const val ACTION_RESTART = "expo.modules.blemesh.RESTART"
     private const val EXTRA_DETAIL = "detail"
+
+    /** Must match `BACKGROUND_TASK` in `src/mesh/backgroundTask.ts`. */
+    private const val AWAKE_TASK = "MeshNetBackground"
+
+    /**
+     * How long after the task is swiped away to check the mesh is still up.
+     *
+     * Long enough that the kill, if there is going to be one, has happened —
+     * restarting into a process the system is still tearing down just gets the
+     * new one killed as well.
+     */
+    private const val RESTART_DELAY_MS = 3_000L
 
     /**
      * Invoked when the user taps Stop on the notification.
@@ -155,7 +223,48 @@ class MeshService : Service() {
 
     fun stop(context: Context) {
       onStopRequested = null
+      cancelRestart(context)
       context.stopService(Intent(context, MeshService::class.java))
+    }
+
+    /**
+     * An inexact alarm on purpose.
+     *
+     * Exact alarms need `SCHEDULE_EXACT_ALARM` from Android 12, which is a
+     * permission users are asked to grant in Settings and which Google Play
+     * restricts to alarm clocks and calendars. A mesh coming back a minute
+     * later than it might have is not worth that; a mesh not coming back at all
+     * is what this is for.
+     */
+    private fun restartIntent(context: Context): PendingIntent {
+      val intent = Intent(context, MeshService::class.java).setAction(ACTION_RESTART)
+      val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
+      return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        PendingIntent.getForegroundService(context, 2, intent, flags)
+      } else {
+        // Below 26 there is no distinction, and no five-second deadline either.
+        PendingIntent.getService(context, 2, intent, flags)
+      }
+    }
+
+    private fun scheduleRestart(context: Context) {
+      val alarms = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+      runCatching {
+        alarms.set(
+          AlarmManager.ELAPSED_REALTIME_WAKEUP,
+          SystemClock.elapsedRealtime() + RESTART_DELAY_MS,
+          restartIntent(context),
+        )
+      }
+    }
+
+    private fun cancelRestart(context: Context) {
+      val alarms = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+      // Stopping means stopping. Leaving the alarm armed would bring the mesh
+      // back a few seconds after the user turned it off, which is the kind of
+      // thing that makes people uninstall an app rather than file a bug.
+      runCatching { alarms.cancel(restartIntent(context)) }
     }
   }
 }

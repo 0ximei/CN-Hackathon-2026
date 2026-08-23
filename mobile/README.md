@@ -490,17 +490,45 @@ outright when the app is swiped from recents. A radio does not survive that and
 cannot be resumed afterwards: links drop, the node stops advertising, and every
 peer routing through it has to rebuild the mesh without it.
 
-Turning on **KEEP THE MESH RUNNING** in the Node tab raises a foreground service
+**KEEP THE MESH RUNNING** in the Node tab raises a foreground service
 (`MeshService`, type `connectedDevice`) with a permanent notification showing
-the live peer count and a Stop action. Off by default — it costs a notification
-and a radio's battery, and that should be someone's decision rather than a
-default.
+the live peer count and a Stop action. It is on by default and the tab turns it
+off.
+
+That default was the other way round first, on the reasoning that a permanent
+notification and a wakelock are an imposition nobody asked for. The reasoning
+was wrong for what this app is. A mesh of one node is not a mesh, and a phone
+that only relays while someone is looking at it is not carrying anything — so
+the setting is really a decision about *other people's* connectivity, and
+leaving it off by default meant the common case was a mesh that dissolved every
+time somebody pocketed their phone. Unset and explicitly-off are kept distinct
+for that reason: a phone that has never been asked gets the default, a phone
+that said no keeps saying no.
 
 **It is not a native daemon, and the distinction matters.** Routing,
 deduplication, replication, the catalogue and the store-and-forward outbox are
 all TypeScript. A radio without them is a phone holding connections it cannot
 answer on. So the service's job is to keep the *process* alive, and with it the
 JavaScript that is actually the mesh.
+
+Keeping the process is not the same as keeping it working, and the first version
+of this only did the first. React Native stops the clock when the Activity
+pauses: `JavaTimerManager.onHostPause` drops the choreographer callback that
+fires expired timers, and `onHostDestroy` — which is what swiping the app out of
+recents reaches — leaves it dropped. Every `setTimeout` and `setInterval` in the
+app simply stops being delivered. Most apps never notice. This one is nothing
+*but* those intervals, so a closed app sat there advertising over a radio that
+had gone mute above it: peers saw the hardware, got no HELLO, and dropped the
+node inside the liveness deadline. The notification claimed a mesh nobody could
+see.
+
+The one exception React Native makes is a headless task — `clearFrameCallback`
+leaves the clock alone whenever `hasActiveTasks()` is true. So `MeshService`
+extends `HeadlessJsTaskService` and starts a task
+([`backgroundTask.ts`](src/mesh/backgroundTask.ts)) that does nothing except
+refuse to finish, and the timers that are the mesh keep firing with the app
+closed. The task key spans two languages with nothing to catch a rename, so
+[a test](src/mesh/backgroundTask.test.ts) compares the two spellings.
 
 That has a consequence in the app itself. A `MeshNode` used to be created and
 destroyed by a React effect, which is right for something that only exists while
@@ -513,12 +541,42 @@ than about rendering. It is keyed by identity, so an Activity recreation
 re-acquires the running node instead of building a second one onto the same
 radio.
 
-Two limits worth knowing. If the system reclaims the process anyway — real
-memory pressure — the service does not resurrect itself: it would come back
-with a notification, no radio behind it, and no node id to start one with, which
-would be a lie. The mesh is down until the app is opened, and the missing
-notification says so. And on Android 13+ the notification needs consent; refused,
-the service still runs and the disclosure is what disappears.
+### Coming back from a kill
+
+Keeping a running process running covers the app being closed. It does not cover
+the app being *killed* — memory pressure, a crash, or one of the aggressive task
+killers that ship on most Android phones people actually own, several of which
+will take a foreground service with the swipe regardless of what the manifest
+says. The process then comes back empty: no Activity, no React tree, no node.
+
+So `MeshService` is `START_STICKY`, and it re-arms itself from `onTaskRemoved`
+with an alarm three seconds out — set while there is still something alive to
+set it, because a killed process cannot schedule its own recovery. If the
+process survived, the alarm reaches a service that is already up and costs a
+redrawn notification; if it did not, the alarm is what brings the mesh back.
+(Inexact, deliberately: exact alarms need `SCHEDULE_EXACT_ALARM`, which Play
+restricts to alarm clocks and calendars.)
+
+Stickiness used to be the wrong answer, and the thing that changed is
+[`daemon.ts`](src/mesh/daemon.ts). The old service had no way to restart a radio
+— the node id lived in JavaScript — so a restarted service would have been a
+notification with nothing behind it, claiming a mesh that was not there. But
+everything needed is already on disk: the identity is a keypair in SQLite, the
+preference is a row beside it, and the catalog is the database itself. So
+`startDaemon` rebuilds the node from storage with no user and no screen, and the
+native side never has to remember a node id or keep it in sync. A restarted
+service is now just the daemon doing its job.
+
+One consequence worth naming: the catalog can now be opened from two places —
+the daemon with no UI, and the screen when someone finally launches the app.
+`LocalCatalog.open` is memoised for that reason. Two instances is not a slow
+path but a wrong one, since each holds its own vector matrix and lexical index
+over the same file, and the node keeps whichever it was built with.
+
+Two limits remain. On Android 13+ the notification needs consent; refused, the
+service still runs and the disclosure is what disappears. And none of this
+survives a reboot — there is no `BOOT_COMPLETED` receiver, so a phone that has
+been restarted carries no mesh until someone opens the app once.
 
 ## Testing the radio
 
@@ -611,8 +669,9 @@ works* above.
 - **Four outbound links per node.** Android stacks vary between about four and
   seven concurrent GATT connections; the cap is deliberate and set in
   `MeshRadio.MAX_CENTRAL_LINKS`.
-- **Foreground only.** There is no foreground service, so Android will suspend
-  the radio when the app is backgrounded. Keep the screen on for a demo.
+- **Background mode is opt-in.** Left off, Android suspends the radio when the
+  app is backgrounded and kills it when the app is swiped away. Turn on **KEEP
+  THE MESH RUNNING** in the Node tab, or keep the screen on for a demo.
 - **Two copies of the protocol.** `src/core` is this project's own copy of the
   radio-agnostic modules the web build also has. The codec tests travel with it,
   so a divergence fails the build rather than reaching two devices — but keeping

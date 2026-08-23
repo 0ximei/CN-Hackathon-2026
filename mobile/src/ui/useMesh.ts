@@ -8,6 +8,10 @@ import { llm, type Answer, type LlmStatus } from '../llm/engine';
 import { DEFAULT_MODEL, type ModelSpec } from '../llm/models';
 import { BleTransport } from '../transport/BleTransport';
 import { acquire, release, setKeepAlive } from '../mesh/liveNode';
+// Shared with the background daemon, which reads the same preference from the
+// same row with no screen running. Two spellings of this key would be a mesh
+// that stops when the app does on exactly the phones that asked it not to.
+import { BACKGROUND_KEY, backgroundWanted } from '../mesh/daemon';
 import { LocalCatalog, type CatalogStats } from '../storage/store';
 import {
     createIdentity,
@@ -68,9 +72,6 @@ const EMPTY_CATALOG: CatalogStats = {
     metaBytes: 0,
     bodyBytes: 0,
 };
-
-/** Persisted, so the preference survives a restart. */
-const BACKGROUND_KEY = 'radio.background';
 
 const IDLE_UPLOAD: UploadState = { busy: false, label: '', done: 0, total: 0 };
 
@@ -269,7 +270,7 @@ export function useMesh() {
                 // Restore the background preference before the radio comes up,
                 // so a phone that was carrying the mesh yesterday is carrying
                 // it again without anyone opening a settings screen.
-                const wanted = (await catalog.kvGet(BACKGROUND_KEY)) === '1';
+                const wanted = await backgroundWanted(catalog);
                 if (cancelled) return;
                 setKeepAlive(wanted);
                 setBackgroundState(wanted);

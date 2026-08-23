@@ -136,11 +136,12 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
           render={mesh.background ? 'the mesh keeps running' : 'the radio stops'}
         />
         <Text style={styles.hint}>
-          Android reclaims a process the moment its app leaves the screen, and kills it outright
-          when the app is swiped out of recents. A radio cannot be resumed afterwards — links
-          drop, this node stops advertising, and every peer routing through it has to rebuild the
-          mesh without it. Keeping it alive means a permanent notification, which is also the only
-          place to stop it without opening the app again.
+          On by default. Android reclaims a process the moment its app leaves the screen, and
+          kills it outright when the app is swiped out of recents — links drop, this node stops
+          advertising, and every peer routing through it has to rebuild the mesh without it. So
+          this phone keeps carrying the mesh with the app closed, and comes back on its own if
+          the system kills it. The cost is a permanent notification, which is also the only place
+          to stop it without opening the app again, and a phone that does not sleep as deeply.
         </Text>
         <Pressable
           onPress={() => void mesh.setBackgroundMode(!mesh.background)}
