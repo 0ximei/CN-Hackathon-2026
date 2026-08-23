@@ -6,10 +6,12 @@ vi.mock('expo-sqlite', () => import('./__testshim__/expo-sqlite'));
  * A budget on how many GATT segments one metadata packet may need.
  *
  * `BleTransport` reports a 4 KB MTU, which is true of the interface and not of
- * the link. Underneath, the native radio cuts every packet into 514-byte
- * segments, and its reassembler resets on the first gap — so a packet is
- * all-or-nothing across however many segments it takes. Nothing retransmits: a
- * link that drops mid-message clears its queue silently.
+ * the link. Underneath, the native radio cuts every packet into segments capped
+ * at 512 bytes — Bluetooth's ceiling on a single attribute value, which does
+ * not move however large the negotiated MTU gets — and its reassembler resets
+ * on the first gap, so a packet is all-or-nothing across however many segments
+ * it takes. Nothing retransmits: a link that drops mid-message clears its queue
+ * silently.
  *
  * Measured on the signed worst case: the authorship attestation adds 128 bytes
  * to every announcement of a document somebody actually wrote.
@@ -20,7 +22,10 @@ vi.mock('expo-sqlite', () => import('./__testshim__/expo-sqlite'));
  * the embedding width, and the budget is what tells you what it cost.
  */
 const ATT_MTU = 517;
-const SEGMENT_BYTES = ATT_MTU - 3 /* ATT overhead */ - 1 /* segment header */;
+/** Mirrors `MeshWire.payloadCapacity`, ceiling included. */
+const GATT_MAX_ATTR_LEN = 512;
+const SEGMENT_BYTES =
+    Math.min(ATT_MTU - 3 /* ATT overhead */, GATT_MAX_ATTR_LEN) - 1 /* segment header */;
 const MAX_SEGMENTS = 4;
 
 it('keeps one metadata packet inside its segment budget', async () => {

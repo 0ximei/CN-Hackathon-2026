@@ -304,9 +304,16 @@ works in a room, and each is commented at the code:
   you watch two nodes trade catalogues five seconds after meeting — tens of
   kilobytes into one link in a single tick, both directions at once, while both
   radios are still advertising and scanning.
-- **Segmentation against the negotiated MTU**, not a guess. Each link asks for
-  517 bytes, gets what the peer allows, and frames are cut to fit with a
-  one-byte header carrying a sequence number — not for ordering, which GATT
+- **Segmentation against the negotiated MTU and the attribute ceiling**, not a
+  guess and not the MTU alone. Bluetooth caps a single attribute value at 512
+  octets however large the ATT MTU grows, and Android enforces it by *throwing*
+  rather than returning a status — so sizing segments from a 517-byte MTU gives
+  514-byte values and every write and every notify of every multi-segment
+  message fails, while a one-segment beacon sails through. Peers find each
+  other, link, identify and beacon perfectly, and not one byte of content ever
+  crosses. `MeshWireTest` asserts the arithmetic at every MTU, because nothing
+  short of two phones in a room could see it otherwise. Frames are cut to fit
+  with a one-byte header carrying a sequence number — not for ordering, which GATT
   already guarantees, but so a truncated message is *detected* rather than
   silently concatenated into the next one. Detected, and then dropped: a
   message is all-or-nothing across its segments, nothing retransmits, and a
@@ -472,6 +479,22 @@ else — but note that embeddings travel the wire inside `QUERY` packets, so
 embedders will route packets happily and return nonsense.
 
 ---
+
+## Testing the radio
+
+The Kotlin in `modules/ble-mesh` is mostly untestable off-device — a GATT stack
+is the thing being driven — with one exception that earns its keep. `MeshWire.kt`
+is pure: segment arithmetic, splitting, reassembly, no Android in it. That runs
+on the JVM:
+
+```bash
+cd android && ./gradlew :ble-mesh:testDebugUnitTest
+```
+
+Everything else about the radio is verified by two phones and a log, and the
+teardown reasons are written to name the layer at fault — `congested for 6s`,
+`silent for Ns`, `stack rejected a NNNB segment outright`, or a raw `status N`
+straight from the stack.
 
 ## Testing
 

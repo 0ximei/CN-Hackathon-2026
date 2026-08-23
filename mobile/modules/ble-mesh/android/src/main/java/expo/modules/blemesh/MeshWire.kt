@@ -51,8 +51,27 @@ object MeshWire {
   /** Every stack supports 23; anything less is a broken negotiation. */
   const val MIN_MTU = 23
 
-  fun payloadCapacity(mtu: Int): Int =
-    (mtu.coerceAtLeast(MIN_MTU) - ATT_OVERHEAD - SEGMENT_HEADER).coerceAtLeast(1)
+  /**
+   * The ceiling on a single attribute value, which is not the ceiling on the MTU.
+   *
+   * Bluetooth caps an attribute value at 512 octets no matter how large the ATT
+   * MTU grows, and Android enforces it: `writeCharacteristic` and
+   * `notifyCharacteristicChanged` both throw `IllegalArgumentException` above
+   * it rather than returning a status. Sizing segments from the MTU alone gives
+   * 517 - 3 - 1 = 513 bytes of payload and a 514-byte value, two over, so
+   * *every* segment of *every* multi-segment message throws — while a HELLO,
+   * which fits in one small segment, sails through.
+   *
+   * That is the shape of the bug this constant exists to prevent: peers find
+   * each other, link, identify and beacon perfectly, and not one byte of
+   * content ever crosses.
+   */
+  const val GATT_MAX_ATTR_LEN = 512
+
+  fun payloadCapacity(mtu: Int): Int {
+    val usable = minOf(mtu.coerceAtLeast(MIN_MTU) - ATT_OVERHEAD, GATT_MAX_ATTR_LEN)
+    return (usable - SEGMENT_HEADER).coerceAtLeast(1)
+  }
 }
 
 /**
