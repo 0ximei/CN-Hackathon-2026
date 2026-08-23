@@ -292,14 +292,15 @@ export function useMesh() {
                 // finds them.
                 setCapabilities(BleTransport.capabilities());
 
-                // Restore the background preference before the radio comes up,
-                // so a phone that was carrying the mesh yesterday is carrying
-                // it again without anyone opening a settings screen.
+                // Restore the background preference, so a phone that was
+                // carrying the mesh yesterday is carrying it again without
+                // anyone opening a settings screen. Only the JavaScript half is
+                // applied here — it decides whether this node outlives the
+                // screen, and owns no radio and no service.
                 const wanted = await backgroundWanted(catalog);
                 if (cancelled) return;
                 setKeepAlive(wanted);
                 setBackgroundState(wanted);
-                await transport.setBackground(wanted);
 
                 // A reused node is already running. Starting it again would
                 // double every interval it owns.
@@ -308,6 +309,20 @@ export function useMesh() {
                     if (cancelled) return;
                     node.startReplication();
                 }
+
+                // The native half, and it has to come after `start`, which is
+                // where the nearby-devices permission is asked for.
+                //
+                // Background mode is on by default, so on a first launch this
+                // ran before anything had been granted — and from Android 14 a
+                // `connectedDevice` foreground service raised without a
+                // Bluetooth permission is killed with a SecurityException as it
+                // goes foreground, taking the process with it. That is the
+                // whole of the "crashes until you grant it in Settings" bug:
+                // afterwards the permission was there, so the same call
+                // succeeded. Ordering is the fix; the native side refuses the
+                // start independently in case this ever slips again.
+                await transport.setBackground(wanted);
                 setPeers(node.peerList());
                 refreshDocuments();
                 setPhase('ready');
