@@ -129,6 +129,16 @@ export class BleTransport extends TransportEmitter implements Transport {
     if (this.stopping) this.stop();
   }
 
+  /**
+   * Keeps the radio alive with the app closed, behind a foreground service.
+   *
+   * Safe to call before `start`: the native side records the preference and
+   * raises the service when there is a radio to announce.
+   */
+  async setBackground(on: boolean): Promise<void> {
+    await BleMesh.setBackground(on);
+  }
+
   stop(): void {
     this.stopping = true;
     // Deliberately not guarded on `started`: a stop that arrives mid-start still

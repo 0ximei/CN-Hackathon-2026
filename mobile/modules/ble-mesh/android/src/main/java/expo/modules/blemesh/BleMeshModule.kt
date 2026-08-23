@@ -20,6 +20,22 @@ import expo.modules.kotlin.modules.ModuleDefinition
 class BleMeshModule : Module() {
   private var radio: MeshRadio? = null
 
+  /**
+   * Last line shown on the service notification, so it is only rewritten when
+   * it would actually differ. `onPeers` fires on every link change and posting
+   * an identical notification each time is work for nothing.
+   */
+  private var notified: String? = null
+
+  /**
+   * Whether the user asked the mesh to keep running with the app closed.
+   *
+   * Off by default. The foreground service is what survives the app being
+   * swiped away, and it costs a permanent notification — worth it when someone
+   * has asked for it, and an imposition when they have not.
+   */
+  private var background = false
+
   private val context: Context
     get() = appContext.reactContext ?: throw Exceptions.ReactContextLost()
 
@@ -61,13 +77,41 @@ class BleMeshModule : Module() {
         mapOf("ok" to false, "error" to error)
       } else {
         radio = instance
+        // The radio is up, so the process now has a reason to survive the user
+        // leaving. Stopping from the notification has to reach the radio, not
+        // just the service, or the app comes back to a node still on air.
+        MeshService.onStopRequested = {
+          radio?.stop()
+          radio = null
+          notified = null
+          background = false
+        }
+        if (background) announce("no peers yet")
         mapOf("ok" to true, "error" to null)
+      }
+    }
+
+    /**
+     * Turns the background daemon on or off while the radio is running.
+     *
+     * Separate from `start` because it is a preference rather than a property
+     * of the radio, and someone changing their mind should not cost every link.
+     */
+    AsyncFunction("setBackground") { on: Boolean ->
+      background = on
+      if (!on) {
+        notified = null
+        MeshService.stop(context)
+      } else if (radio != null) {
+        announce(peerLine(radio?.peers()?.size ?: 0))
       }
     }
 
     AsyncFunction("stop") {
       radio?.stop()
       radio = null
+      notified = null
+      MeshService.stop(context)
     }
 
     /** @return false when no link to that peer is open, so the caller can queue. */
@@ -85,8 +129,15 @@ class BleMeshModule : Module() {
     }
 
     OnDestroy {
+      // Reached when the React instance is torn down, which with the service
+      // running should not happen while the app is merely closed. If it does —
+      // the system reclaimed the process anyway — the radio goes with the
+      // JavaScript that was the only thing able to answer on it, rather than
+      // being left holding links nothing can route over.
       radio?.stop()
       radio = null
+      notified = null
+      MeshService.stop(context)
     }
   }
 
@@ -97,6 +148,19 @@ class BleMeshModule : Module() {
     "mtu" to mtu,
     "rssi" to rssi,
   )
+
+  /** Keeps the notification honest about what the radio is currently doing. */
+  private fun announce(detail: String) {
+    if (!background || detail == notified) return
+    notified = detail
+    runCatching { MeshService.start(context, detail) }
+  }
+
+  private fun peerLine(n: Int) = when (n) {
+    0 -> "no peers in range"
+    1 -> "linked to 1 peer"
+    else -> "linked to $n peers"
+  }
 
   private val radioEvents = object : MeshRadio.RadioEvents {
     override fun onFrame(peerId: String, payload: ByteArray) {
@@ -111,6 +175,7 @@ class BleMeshModule : Module() {
 
     override fun onPeers(peers: List<MeshRadio.PeerSnapshot>) {
       sendEvent("onPeers", mapOf("peers" to peers.map { it.toMap() }))
+      announce(peerLine(peers.size))
     }
 
     override fun onLog(message: String) {

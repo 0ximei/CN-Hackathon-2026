@@ -23,4 +23,27 @@
     android:maxSdkVersion="30" />
 
   <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+  <!--
+    Keeping the radio up after the user leaves the app. A process that is not
+    foreground is starved of CPU and killed outright when the app is swiped from
+    recents, and a radio cannot be resumed afterwards — links drop, the node
+    stops advertising, and every peer routing through it has to relearn the mesh.
+  -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <!-- Required from Android 14 to declare the `connectedDevice` type below. -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+  <!--
+    From Android 13 a notification needs the user's consent. The service still
+    runs if it is refused; the disclosure is what disappears, which is worth
+    saying in the UI rather than silently accepting.
+  -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+  <application>
+    <service
+      android:name=".MeshService"
+      android:exported="false"
+      android:foregroundServiceType="connectedDevice" />
+  </application>
 </manifest>

@@ -483,6 +483,43 @@ embedders will route packets happily and return nonsense.
 
 ---
 
+## Staying on the air
+
+Android reclaims a process the moment its app leaves the screen and kills it
+outright when the app is swiped from recents. A radio does not survive that and
+cannot be resumed afterwards: links drop, the node stops advertising, and every
+peer routing through it has to rebuild the mesh without it.
+
+Turning on **KEEP THE MESH RUNNING** in the Node tab raises a foreground service
+(`MeshService`, type `connectedDevice`) with a permanent notification showing
+the live peer count and a Stop action. Off by default — it costs a notification
+and a radio's battery, and that should be someone's decision rather than a
+default.
+
+**It is not a native daemon, and the distinction matters.** Routing,
+deduplication, replication, the catalogue and the store-and-forward outbox are
+all TypeScript. A radio without them is a phone holding connections it cannot
+answer on. So the service's job is to keep the *process* alive, and with it the
+JavaScript that is actually the mesh.
+
+That has a consequence in the app itself. A `MeshNode` used to be created and
+destroyed by a React effect, which is right for something that only exists while
+it is on screen and wrong for a radio — Android stops the surface when the
+Activity is destroyed, React unmounts, and the effect's cleanup would stop the
+very node the service was keeping alive. Ownership moved to
+[`liveNode.ts`](src/mesh/liveNode.ts): the effect acquires a node and releases
+it, and whether releasing stops it is a question about background mode rather
+than about rendering. It is keyed by identity, so an Activity recreation
+re-acquires the running node instead of building a second one onto the same
+radio.
+
+Two limits worth knowing. If the system reclaims the process anyway — real
+memory pressure — the service does not resurrect itself: it would come back
+with a notification, no radio behind it, and no node id to start one with, which
+would be a lie. The mesh is down until the app is opened, and the missing
+notification says so. And on Android 13+ the notification needs consent; refused,
+the service still runs and the disclosure is what disappears.
+
 ## Testing the radio
 
 The Kotlin in `modules/ble-mesh` is mostly untestable off-device — a GATT stack

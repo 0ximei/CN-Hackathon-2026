@@ -136,6 +136,30 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
         )}
       </View>
 
+      <Text style={styles.sectionTitle}>RUNNING IN THE BACKGROUND</Text>
+      <View style={styles.card}>
+        <Stat
+          label="when the app is closed"
+          value={0}
+          render={mesh.background ? 'the mesh keeps running' : 'the radio stops'}
+        />
+        <Text style={styles.hint}>
+          Android reclaims a process the moment its app leaves the screen, and kills it outright
+          when the app is swiped out of recents. A radio cannot be resumed afterwards — links
+          drop, this node stops advertising, and every peer routing through it has to rebuild the
+          mesh without it. Keeping it alive means a permanent notification, which is also the only
+          place to stop it without opening the app again.
+        </Text>
+        <Pressable
+          onPress={() => void mesh.setBackgroundMode(!mesh.background)}
+          style={[styles.buttonGhost, { marginTop: 10 }]}
+        >
+          <Text style={styles.buttonGhostText}>
+            {mesh.background ? 'STOP WHEN I CLOSE THE APP' : 'KEEP THE MESH RUNNING'}
+          </Text>
+        </Pressable>
+      </View>
+
       <Text style={styles.sectionTitle}>SEARCH AND ANSWERS</Text>
       <View style={styles.card}>
         <Stat label="embedder" value={0} render="hashing · 384d · no download" />

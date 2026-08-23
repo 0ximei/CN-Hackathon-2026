@@ -33,6 +33,19 @@ export async function ensureBlePermissions(): Promise<PermissionOutcome> {
 
   const results = await PermissionsAndroid.requestMultiple(needed);
   const denied = needed.filter((p) => results[p] !== PermissionsAndroid.RESULTS.GRANTED);
+
+  // Asked separately, and its refusal is not fatal. From Android 13 a
+  // notification needs consent, and the foreground service keeping the radio
+  // alive is required to post one. Refusing it does not stop the service — it
+  // removes the only visible sign that a radio is running with the app closed,
+  // which is a worse outcome for the user than for the mesh, and not a reason
+  // to refuse to start.
+  if (Platform.Version >= 33) {
+    await PermissionsAndroid.request(
+      'android.permission.POST_NOTIFICATIONS' as Parameters<typeof PermissionsAndroid.request>[0],
+    ).catch(() => undefined);
+  }
+
   if (!denied.length) return { ok: true, reason: '' };
 
   const permanently = denied.some(
