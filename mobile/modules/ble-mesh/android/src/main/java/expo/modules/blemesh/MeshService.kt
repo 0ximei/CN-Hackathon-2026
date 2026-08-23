@@ -1,5 +1,6 @@
 package expo.modules.blemesh
 
+import android.Manifest
 import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -70,6 +71,24 @@ class MeshService : HeadlessJsTaskService() {
       return START_NOT_STICKY
     }
 
+    // The gate that keeps a first launch from dying on the spot.
+    //
+    // From Android 14 a `connectedDevice` service may only go foreground while
+    // the app holds one of the Bluetooth runtime permissions, and the platform
+    // enforces that by throwing SecurityException out of `startForeground` —
+    // here, on the main thread, where nothing catches it and the process goes
+    // down. A phone that has just installed the app has granted nothing yet,
+    // which is exactly the state this used to crash in.
+    //
+    // Refusing is also the honest answer rather than merely the safe one:
+    // without the radio permission there is no radio, so there is nothing for
+    // this service to keep alive.
+    if (!mayRun(this)) {
+      cancelRestart(this)
+      stopSelf()
+      return START_NOT_STICKY
+    }
+
     // Before anything that can block: from Android 8 the system gives a service
     // started with `startForegroundService` a few seconds to post a
     // notification and kills the process if it does not.
@@ -93,13 +112,25 @@ class MeshService : HeadlessJsTaskService() {
 
     val detail = intent?.getStringExtra(EXTRA_DETAIL) ?: "starting"
     val notification = build(detail)
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      // Declared as `connectedDevice` rather than a generic service: from
-      // Android 14 the type is mandatory and is what exempts the process from
-      // the background restrictions that would otherwise throttle the radio.
-      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-    } else {
-      startForeground(NOTIFICATION_ID, notification)
+    val foreground = runCatching {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        // Declared as `connectedDevice` rather than a generic service: from
+        // Android 14 the type is mandatory and is what exempts the process from
+        // the background restrictions that would otherwise throttle the radio.
+        startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+      } else {
+        startForeground(NOTIFICATION_ID, notification)
+      }
+    }
+    if (foreground.isFailure) {
+      // Belt to [mayRun]'s braces, and not paranoia: the permission can be
+      // revoked between the check and the call, and OEM builds refuse
+      // foreground starts for reasons of their own. Stopping from inside the
+      // same call is what releases the `startForegroundService` deadline, so
+      // this ends as a service that never ran instead of as a crash.
+      cancelRestart(this)
+      stopSelf()
+      return START_NOT_STICKY
     }
 
     if (!holding) {
@@ -250,6 +281,32 @@ class MeshService : HeadlessJsTaskService() {
      */
     @Volatile
     var onStopRequested: (() -> Unit)? = null
+
+    /**
+     * The Bluetooth permissions that satisfy the `connectedDevice` service type.
+     *
+     * The radio needs all three; the *service* needs any one of them, because
+     * that is the rule the platform itself applies. Checking for all three here
+     * would refuse starts the system would have allowed.
+     */
+    private val CONNECTED_DEVICE_PERMISSIONS = arrayOf(
+      Manifest.permission.BLUETOOTH_CONNECT,
+      Manifest.permission.BLUETOOTH_SCAN,
+      Manifest.permission.BLUETOOTH_ADVERTISE,
+    )
+
+    /**
+     * Whether this process may raise the foreground service right now.
+     *
+     * Below Android 12 there are no runtime Bluetooth permissions to hold, and
+     * no foreground-service type enforcement to satisfy either.
+     */
+    fun mayRun(context: Context): Boolean {
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+      return CONNECTED_DEVICE_PERMISSIONS.any {
+        context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+      }
+    }
 
     fun start(context: Context, detail: String) {
       val intent = Intent(context, MeshService::class.java).putExtra(EXTRA_DETAIL, detail)

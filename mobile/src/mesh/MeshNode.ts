@@ -222,6 +222,26 @@ export interface PeerState {
     reliability: number;
     lastSeen: number;
     hops: number;
+    /**
+     * Node id of the next hop toward this peer. Its own id when direct, 0 when
+     * there is no route to it at all.
+     *
+     * Three states rather than two, and the third is the reason: a peer that
+     * has beaconed but whose route has aged out is neither directly linked nor
+     * reachable through anyone, and collapsing that into "direct" draws a radio
+     * link that is not there.
+     *
+     * Resolved here rather than in the UI for the same reason `peerNodeId` on
+     * an activity event is: the router names the next hop by transport peer id,
+     * and turning one back into a node id means consulting the route table. A
+     * view that tried would have to guess at the peer-id format, which differs
+     * between radios.
+     *
+     * The topology view needs it because without it a two-hop peer is drawn on
+     * a line straight to this node, which is a claim that there is a radio link
+     * between them. There is not — there is a relay, and it is on the screen.
+     */
+    via: number;
     trust: TrustState;
     /** Whether this peer has proven the id it is using. */
     verified: boolean;
@@ -972,6 +992,10 @@ export class MeshNode {
             reliability: known?.reliability ?? 0.5,
             lastSeen: Date.now(),
             hops: hopsTravelled(pkt),
+            // Filled in by `peerList`, from the route table rather than from
+            // this packet: the relay can change without this peer's beacon
+            // changing at all.
+            via: 0,
             trust: identity?.state ?? 'unknown',
             verified: identity?.state === 'verified' || identity?.state === 'trusted',
         });
@@ -1419,8 +1443,33 @@ export class MeshNode {
 
     /* ------------------------------ helpers -------------------------- */
 
+    /**
+     * Peers as the router sees them, not as their last beacon happened to land.
+     *
+     * `hops` is taken from the route table rather than from the stored peer,
+     * and the two genuinely disagree. A peer record takes the hop count off
+     * whichever HELLO arrived, while the router keeps the *best* route it has
+     * seen and drops duplicates — so when a relayed copy of a neighbour's
+     * beacon wins the race to the deduplicator, the peer record says two hops
+     * about a phone the router has a direct link to. That inconsistency reached
+     * the topology view as a peer drawn bent through a relay it does not need,
+     * which is the same class of wrong as drawing a line where there is no
+     * link. The router decides how a packet actually travels, so it is the
+     * authority on how the path is drawn.
+     */
     peerList(): PeerState[] {
-        return [...this.peers.values()].sort((a, b) => a.name.localeCompare(b.name));
+        const routes = this.router.getRoutes();
+        return [...this.peers.values()]
+            .map((peer) => {
+                const route = routes.get(peer.nodeId);
+                if (!route) return { ...peer, via: 0 };
+                return {
+                    ...peer,
+                    hops: route.hops,
+                    via: this.nodeIdOfPeer(route.peerId),
+                };
+            })
+            .sort((a, b) => a.name.localeCompare(b.name));
     }
 
     routes(): Map<number, RouteEntry> {

@@ -168,6 +168,16 @@ class BleMeshModule : Module() {
    */
   private fun announce(detail: String) {
     if (!background || detail == notified) return
+    // A phone that has not granted the nearby-devices permission cannot have a
+    // `connectedDevice` service at all — see [MeshService.mayRun] — and asking
+    // for one anyway is what used to take the whole process down on a first
+    // launch. `notified` is deliberately left untouched so this is a deferral
+    // rather than a refusal: the next peer change, or the `setBackground` that
+    // follows a successful start, tries again.
+    if (!MeshService.mayRun(context)) {
+      log("background: waiting on the nearby-devices permission")
+      return
+    }
     val first = notified == null
     notified = detail
     runCatching { MeshService.start(context, detail) }

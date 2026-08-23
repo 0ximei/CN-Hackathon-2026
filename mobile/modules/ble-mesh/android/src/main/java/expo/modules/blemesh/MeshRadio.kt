@@ -1,5 +1,6 @@
 package expo.modules.blemesh
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -23,6 +24,7 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -327,6 +329,12 @@ class MeshRadio(
 
   fun start(): String? {
     if (running) return null
+    // Checked here rather than trusted from JavaScript. Every radio call below
+    // throws SecurityException without these, and they are all made on the
+    // radio thread where [post] swallows the exception — so a missing grant
+    // used to read as a radio that started fine and then heard nothing, which
+    // is the least diagnosable failure this class has.
+    missingPermission()?.let { return "MeshNet has no permission to use the radio ($it)" }
     val a = adapter ?: return "This device has no Bluetooth adapter"
     if (!a.isEnabled) return "Bluetooth is turned off"
     if (a.bluetoothLeAdvertiser == null) {
@@ -346,6 +354,30 @@ class MeshRadio(
       scheduleScanRefresh()
     }
     return null
+  }
+
+  /**
+   * The first radio permission this app is missing, short name, or null.
+   *
+   * All three of the Android 12 permissions are required, unlike the *service*
+   * check in [MeshService.mayRun] which needs only one: this node scans,
+   * advertises and connects, so any one of them missing leaves it half a node.
+   * Before Android 12 the same ground is covered by a location grant, which is
+   * what gates scan results on those releases.
+   */
+  private fun missingPermission(): String? {
+    val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      arrayOf(
+        Manifest.permission.BLUETOOTH_CONNECT,
+        Manifest.permission.BLUETOOTH_SCAN,
+        Manifest.permission.BLUETOOTH_ADVERTISE,
+      )
+    } else {
+      arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+    return needed
+      .firstOrNull { context.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+      ?.substringAfterLast('.')
   }
 
   fun stop() {

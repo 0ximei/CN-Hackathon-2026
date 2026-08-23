@@ -6,6 +6,15 @@ import type { Identity } from '@core/lib/ids';
 import type { ActivityEvent, PeerState } from '../../mesh/MeshNode';
 import { useTheme } from '../ThemeProvider';
 import { typography } from '../theme';
+import {
+    PEER_R,
+    SELF_R,
+    computeLayout,
+    cutPath,
+    pathLength,
+    stopsAlong,
+    type Point,
+} from './graphGeometry';
 
 /**
  * The topology view.
@@ -16,6 +25,15 @@ import { typography } from '../theme';
  * an edge below is a real packet the router actually sent, and every edge is a
  * link the transport actually reports as up.
  *
+ * **Nothing is drawn between two nodes that have no link.** That sounds
+ * obvious and it was not true for a long time: a peer two hops away was drawn
+ * on a line straight to this node, dimmer than a real link but still a line
+ * between two phones that cannot hear each other, and packets to it flew down
+ * that line as though they had gone directly. The relay doing the actual work
+ * was on screen the whole time with nothing joining it to either end. Edges and
+ * packets now both follow the route — self, relay, destination — which is the
+ * one thing this view exists to show.
+ *
  * Drawn with plain Views rather than SVG. `react-native-svg` would be the
  * obvious tool and would also be a new native dependency — a prebuild and a
  * rebuild on every phone in the room — for a diagram that is a dozen circles
@@ -24,26 +42,27 @@ import { typography } from '../theme';
  * driving a translation, which runs on the UI thread with the native driver
  * instead of re-rendering React sixty times a second.
  *
- * The layout is a deterministic ring rather than a force simulation. On stage
- * you want the same node in the same place every run; a force layout re-settles
- * differently on every render and makes the demo hard to narrate.
+ * Where everything goes is [`graphGeometry`](graphGeometry.ts): this node on
+ * top, its neighbours under it, whatever they relay for under them. Deliberate
+ * rather than a force simulation, because on stage you want the same phone in
+ * the same place every run.
+ *
+ * That it is pure arithmetic in its own file is what makes it testable off a
+ * phone, and it earned that twice. Labels clipped off the board because the
+ * ring it used to draw was sized as though a node were a bare disc; then nodes
+ * overlapped each other because two rings of *labelled* nodes need 184px of
+ * horizontal radius and a portrait phone has about 129. Neither is visible to a
+ * type or to a render test, and both are one assertion once the geometry can be
+ * called directly.
  */
 
-const HEIGHT = 300;
 const FLIGHT_MS = 700;
 const MAX_FLIGHTS = 18;
-const SELF_R = 26;
-const PEER_R = 20;
-
-interface Point {
-    x: number;
-    y: number;
-}
 
 interface Flight {
     key: number;
-    from: Point;
-    to: Point;
+    /** The whole route, corner to corner. Two points for a direct link. */
+    points: Point[];
     color: string;
     dropped: boolean;
 }
@@ -97,8 +116,12 @@ export function MeshGraph({
         drawnUpTo.current = activity[activity.length - 1]?.seq ?? drawnUpTo.current;
 
         const added: Flight[] = [];
-        const push = (from: Point, to: Point, color: string, dropped: boolean) => {
-            added.push({ key: flightKey.current++, from, to, color, dropped });
+        const push = (points: Point[], color: string, dropped: boolean) => {
+            // A route with no length is a node drawn on top of this one; there
+            // is nothing to animate and an interpolation over it would throw.
+            if (points.length >= 2 && pathLength(points) > 0) {
+                added.push({ key: flightKey.current++, points, color, dropped });
+            }
         };
 
         for (const ev of fresh) {
@@ -106,21 +129,28 @@ export function MeshGraph({
             const color = ev.kind === 'dropped' ? theme.danger : (theme.wire[ev.type] ?? theme.faint);
 
             if (ev.kind === 'received') {
-                const from = layout.positions.get(ev.srcId);
-                if (from) push(from, layout.self, color, false);
+                // Inbound, so the same route read backwards: a packet from two
+                // hops away arrives *through* the relay, and drawing it flying
+                // straight in from wherever it sits is the same lie the edges
+                // used to tell.
+                const route = layout.routes.get(ev.srcId);
+                if (route) push([...route].reverse(), color, false);
                 continue;
             }
 
             if (ev.peer === 'flood') {
+                // A flood goes out on links, not on routes: one dot per radio
+                // link this node actually holds, and the relaying happens on
+                // the other phone where it will show up in its own map.
                 for (const id of layout.directIds) {
                     const to = layout.positions.get(id);
-                    if (to) push(layout.self, to, color, false);
+                    if (to) push([layout.self, to], color, false);
                 }
                 continue;
             }
 
-            const to = layout.positions.get(ev.peerNodeId);
-            if (to) push(layout.self, to, color, ev.kind === 'dropped');
+            const route = layout.routes.get(ev.peerNodeId);
+            if (route) push(route, color, ev.kind === 'dropped');
         }
 
         if (added.length) setFlights((prev) => [...prev, ...added].slice(-MAX_FLIGHTS));
@@ -130,9 +160,9 @@ export function MeshGraph({
 
     return (
         <View>
-            <View style={[styles.graph, { width: boardWidth, height: HEIGHT }]}>
-                {layout.nodes.map((node) => (
-                    <Edge key={`edge-${node.peer.nodeId}`} from={layout.self} to={node.at} direct={node.peer.hops <= 1} />
+            <View style={[styles.graph, { width: boardWidth, height: layout.height }]}>
+                {layout.segments.map((seg) => (
+                    <Edge key={seg.key} from={seg.from} to={seg.to} known={seg.known} />
                 ))}
 
                 {flights.map((f) => (
@@ -142,6 +172,7 @@ export function MeshGraph({
                 <Node
                     at={layout.self}
                     radius={SELF_R}
+                    boxWidth={layout.nodeW}
                     color={accent}
                     label={identity.name}
                     sub={`${selfStored}/${selfKnown}`}
@@ -152,6 +183,7 @@ export function MeshGraph({
                         key={peer.nodeId}
                         at={at}
                         radius={PEER_R}
+                        boxWidth={layout.nodeW}
                         color={theme.trust[peer.trust] ?? theme.faint}
                         label={peer.name}
                         sub={`${peer.stored}/${peer.known} · ${peer.hops}h`}
@@ -188,13 +220,16 @@ export function MeshGraph({
 }
 
 /**
- * One link, as a rotated 1px View.
+ * One hop, as a rotated 1px View.
  *
- * Two-hop peers get a dashed-looking dimmer line, because the edge between this
- * node and them is not a link — it is a route, and drawing it the same way as a
- * real radio link would claim a connection that does not exist.
+ * Every segment drawn is a link some node actually holds — this node's own, or
+ * a relay's — with one exception. Beyond two hops the route table knows the
+ * next hop and the total distance and nothing in between, so the tail of the
+ * path stands in for an unknown number of links and is drawn faint to say so.
+ * That is a different claim from "no connection" and it should look different
+ * from both a real link and from nothing at all.
  */
-function Edge({ from, to, direct }: { from: Point; to: Point; direct: boolean }) {
+function Edge({ from, to, known }: { from: Point; to: Point; known: boolean }) {
     const { theme } = useTheme();
     const dx = to.x - from.x;
     const dy = to.y - from.y;
@@ -210,8 +245,8 @@ function Edge({ from, to, direct }: { from: Point; to: Point; direct: boolean })
                 top: from.y,
                 width: length,
                 height: 1,
-                backgroundColor: direct ? theme.border : theme.panelAlt,
-                opacity: direct ? 1 : 0.8,
+                backgroundColor: known ? theme.border : theme.panelAlt,
+                opacity: known ? 1 : 0.7,
                 transform: [{ translateY: -0.5 }, { rotateZ: `${angle}rad` }],
                 transformOrigin: 'left center',
             }}
@@ -219,7 +254,14 @@ function Edge({ from, to, direct }: { from: Point; to: Point; direct: boolean })
     );
 }
 
-/** A packet in flight: one Animated value, driven natively, retired on arrival. */
+/**
+ * A packet in flight: one Animated value, driven natively, retired on arrival.
+ *
+ * Interpolated over the whole route rather than one segment, with the stops
+ * placed by distance so the dot does not slow down at a corner — a packet that
+ * dawdled at every relay would read as the relay being the slow part, which is
+ * not what is being measured.
+ */
 function Packet({ flight, onDone }: { flight: Flight; onDone: () => void }) {
     const t = useRef(new Animated.Value(0)).current;
 
@@ -238,16 +280,20 @@ function Packet({ flight, onDone }: { flight: Flight; onDone: () => void }) {
     }, []);
 
     // A dropped packet stops short of its destination rather than arriving,
-    // which is the only honest way to draw "this never got there".
-    const reach = flight.dropped ? 0.55 : 1;
+    // which is the only honest way to draw "this never got there". Cut along
+    // the route, so a packet dropped on a two-hop path dies partway down the
+    // leg it was actually on.
+    const points = flight.dropped ? cutPath(flight.points, 0.55) : flight.points;
+    const stops = stopsAlong(points);
+    const origin = points[0];
 
     return (
         <Animated.View
             pointerEvents="none"
             style={{
                 position: 'absolute',
-                left: flight.from.x - 3,
-                top: flight.from.y - 3,
+                left: origin.x - 3,
+                top: origin.y - 3,
                 width: 6,
                 height: 6,
                 borderRadius: 3,
@@ -256,14 +302,14 @@ function Packet({ flight, onDone }: { flight: Flight; onDone: () => void }) {
                 transform: [
                     {
                         translateX: t.interpolate({
-                            inputRange: [0, 1],
-                            outputRange: [0, (flight.to.x - flight.from.x) * reach],
+                            inputRange: stops,
+                            outputRange: points.map((p) => p.x - origin.x),
                         }),
                     },
                     {
                         translateY: t.interpolate({
-                            inputRange: [0, 1],
-                            outputRange: [0, (flight.to.y - flight.from.y) * reach],
+                            inputRange: stops,
+                            outputRange: points.map((p) => p.y - origin.y),
                         }),
                     },
                 ],
@@ -272,9 +318,15 @@ function Packet({ flight, onDone }: { flight: Flight; onDone: () => void }) {
     );
 }
 
+/**
+ * `boxWidth` comes from the layout rather than the stylesheet, because it is
+ * what stops names colliding when a band is crowded — the layout narrows the
+ * box to the widest band's slot, and the name truncates inside it.
+ */
 function Node({
     at,
     radius,
+    boxWidth,
     color,
     label,
     sub,
@@ -282,6 +334,7 @@ function Node({
 }: {
     at: Point;
     radius: number;
+    boxWidth: number;
     color: string;
     label: string;
     sub: string;
@@ -291,7 +344,10 @@ function Node({
     return (
         <View
             pointerEvents="none"
-            style={[styles.graphNode, { left: at.x - 46, top: at.y - radius, width: 92 }]}
+            style={[
+                styles.graphNode,
+                { left: at.x - boxWidth / 2, top: at.y - radius, width: boxWidth },
+            ]}
         >
             <View
                 style={[
@@ -320,50 +376,9 @@ function Node({
             <Text style={styles.graphLabel} numberOfLines={1}>
                 {label}
             </Text>
-            <Text style={styles.graphSub}>{sub}</Text>
+            <Text style={styles.graphSub} numberOfLines={1}>
+                {sub}
+            </Text>
         </View>
     );
-}
-
-interface Layout {
-    self: Point;
-    nodes: { peer: PeerState; at: Point }[];
-    positions: Map<number, Point>;
-    directIds: number[];
-}
-
-/**
- * Deterministic ring layout.
- *
- * Direct neighbours sit on an inner ring, anything further out on an outer one,
- * so "two hops away" is legible as distance rather than only as a number in a
- * label. Order is by node id so a given phone lands in the same place on every
- * launch of the demo.
- */
-function computeLayout(width: number, peers: PeerState[]): Layout {
-    const self = { x: width / 2, y: HEIGHT / 2 - 8 };
-    const positions = new Map<number, Point>();
-    const rInner = Math.min(width, HEIGHT) * 0.28;
-    const rOuter = Math.min(width, HEIGHT) * 0.44;
-
-    const ordered = [...peers].sort((a, b) => a.nodeId - b.nodeId);
-    const nodes = ordered.map((peer, i) => {
-        // Start at the top and go round. The half-step offset keeps a lone peer
-        // off the vertical axis, where its label would sit on the self node's.
-        const angle = -Math.PI / 2 + ((i + 0.5) * 2 * Math.PI) / Math.max(ordered.length, 1);
-        const radius = peer.hops <= 1 ? rInner : rOuter;
-        const at = {
-            x: self.x + Math.cos(angle) * radius,
-            y: self.y + Math.sin(angle) * radius,
-        };
-        positions.set(peer.nodeId, at);
-        return { peer, at };
-    });
-
-    return {
-        self,
-        nodes,
-        positions,
-        directIds: ordered.filter((p) => p.hops <= 1).map((p) => p.nodeId),
-    };
 }

@@ -31,7 +31,22 @@ export async function ensureBlePermissions(): Promise<PermissionOutcome> {
         ]
       : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
 
-  const results = await PermissionsAndroid.requestMultiple(needed);
+  // Asked for only when something is actually missing. Two reasons, and the
+  // second is not cosmetic: `requestMultiple` needs an Activity, and the
+  // background daemon rebuilds a node with no screen anywhere — from there it
+  // throws rather than returning a refusal, which would take down a restart
+  // that had every permission it needed.
+  const held = await Promise.all(needed.map((p) => PermissionsAndroid.check(p)));
+  if (held.every(Boolean)) return { ok: true, reason: '' };
+
+  let results: Awaited<ReturnType<typeof PermissionsAndroid.requestMultiple>>;
+  try {
+    results = await PermissionsAndroid.requestMultiple(needed);
+  } catch {
+    // No Activity to put a dialog on. Nothing is broken and nothing can be
+    // asked; the next launch with a screen is where this gets resolved.
+    return { ok: false, reason: 'MeshNet needs the nearby-devices permission — open the app to grant it' };
+  }
   const denied = needed.filter((p) => results[p] !== PermissionsAndroid.RESULTS.GRANTED);
 
   // Asked separately, and its refusal is not fatal. From Android 13 a
