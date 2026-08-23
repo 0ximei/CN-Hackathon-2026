@@ -42,13 +42,18 @@ import {
  * driving a translation, which runs on the UI thread with the native driver
  * instead of re-rendering React sixty times a second.
  *
- * Where everything goes is [`graphGeometry`](graphGeometry.ts), which is pure
- * arithmetic and therefore testable off a phone — the ring is deterministic
- * rather than a force simulation, because on stage you want the same node in
- * the same place every run. That split earns its keep: the sizing bug that made
- * this look broken (labels clipped off the bottom and sides, because the ring
- * was sized as though a node were just a disc) is invisible to a type and to a
- * render test, and is one assertion once the geometry can be called directly.
+ * Where everything goes is [`graphGeometry`](graphGeometry.ts): this node on
+ * top, its neighbours under it, whatever they relay for under them. Deliberate
+ * rather than a force simulation, because on stage you want the same phone in
+ * the same place every run.
+ *
+ * That it is pure arithmetic in its own file is what makes it testable off a
+ * phone, and it earned that twice. Labels clipped off the board because the
+ * ring it used to draw was sized as though a node were a bare disc; then nodes
+ * overlapped each other because two rings of *labelled* nodes need 184px of
+ * horizontal radius and a portrait phone has about 129. Neither is visible to a
+ * type or to a render test, and both are one assertion once the geometry can be
+ * called directly.
  */
 
 const FLIGHT_MS = 700;
@@ -126,8 +131,8 @@ export function MeshGraph({
             if (ev.kind === 'received') {
                 // Inbound, so the same route read backwards: a packet from two
                 // hops away arrives *through* the relay, and drawing it flying
-                // in off the outer ring in a straight line is the same lie the
-                // edges used to tell.
+                // straight in from wherever it sits is the same lie the edges
+                // used to tell.
                 const route = layout.routes.get(ev.srcId);
                 if (route) push([...route].reverse(), color, false);
                 continue;
@@ -167,6 +172,7 @@ export function MeshGraph({
                 <Node
                     at={layout.self}
                     radius={SELF_R}
+                    boxWidth={layout.nodeW}
                     color={accent}
                     label={identity.name}
                     sub={`${selfStored}/${selfKnown}`}
@@ -177,6 +183,7 @@ export function MeshGraph({
                         key={peer.nodeId}
                         at={at}
                         radius={PEER_R}
+                        boxWidth={layout.nodeW}
                         color={theme.trust[peer.trust] ?? theme.faint}
                         label={peer.name}
                         sub={`${peer.stored}/${peer.known} · ${peer.hops}h`}
@@ -311,9 +318,15 @@ function Packet({ flight, onDone }: { flight: Flight; onDone: () => void }) {
     );
 }
 
+/**
+ * `boxWidth` comes from the layout rather than the stylesheet, because it is
+ * what stops names colliding when a band is crowded — the layout narrows the
+ * box to the widest band's slot, and the name truncates inside it.
+ */
 function Node({
     at,
     radius,
+    boxWidth,
     color,
     label,
     sub,
@@ -321,6 +334,7 @@ function Node({
 }: {
     at: Point;
     radius: number;
+    boxWidth: number;
     color: string;
     label: string;
     sub: string;
@@ -330,7 +344,10 @@ function Node({
     return (
         <View
             pointerEvents="none"
-            style={[styles.graphNode, { left: at.x - 46, top: at.y - radius, width: 92 }]}
+            style={[
+                styles.graphNode,
+                { left: at.x - boxWidth / 2, top: at.y - radius, width: boxWidth },
+            ]}
         >
             <View
                 style={[
@@ -359,7 +376,9 @@ function Node({
             <Text style={styles.graphLabel} numberOfLines={1}>
                 {label}
             </Text>
-            <Text style={styles.graphSub}>{sub}</Text>
+            <Text style={styles.graphSub} numberOfLines={1}>
+                {sub}
+            </Text>
         </View>
     );
 }

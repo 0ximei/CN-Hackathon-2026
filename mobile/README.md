@@ -205,11 +205,12 @@ pass instead of three, eight seconds between passes instead of six.
    of a corridor with the third in the middle. Results from the far phone come
    back badged `· 2h` — two hops, relayed by the phone in the middle, which is
    the part that makes this a mesh rather than a set of links. Watch the MAP:
-   the far phone is drawn on the outer ring *beside its relay*, with no line
-   between it and this one, and packets to it visibly turn the corner at the
-   middle phone. Nothing on that graph joins two nodes that have no radio link
-   — a peer past two hops gets a faint tail standing in for the hops this node
-   cannot see, which is a different claim from either a link or nothing.
+   it is layered by distance, so the far phone sits a row *below* the relay it
+   is reached through, with no line between it and this one, and packets to it
+   visibly turn the corner at the middle phone. Nothing on that graph joins two
+   nodes that have no radio link — a peer past two hops gets a faint tail
+   standing in for the hops this node cannot see, which is a different claim
+   from either a link or nothing.
 
 8. **Shrink the storage budget** to 16 KB on NODE. The phone goes over budget
    immediately, sheds every body it can, and settles as a metadata-only node —

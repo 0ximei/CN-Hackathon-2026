@@ -14,25 +14,24 @@ import type { PeerState } from '../../mesh/MeshNode';
 /**
  * The board's own dimensions, which have to agree with `styles.graphNode`.
  *
- * A node is not a disc, it is a disc with two lines of type under it, and the
- * ring used to be sized as though it were: radius `min(w, h) * 0.44` against a
- * half-height that only had about 108px of room once the labels were counted.
- * Every node near the bottom of the ring had its name clipped by the edge of
- * the board and every node near the sides lost half its label, which is what
- * made a working graph look broken.
+ * A node is not a disc, it is a disc with two lines of type under it, so it
+ * needs `PEER_R` of room above its point and `PEER_R + LABEL_H` below. Two of
+ * them overlap when their boxes do: closer than a node width apart across, and
+ * closer than a node height apart down.
  */
 /** Disc radii, which set how much room a node needs above and below its point. */
 export const SELF_R = 26;
 export const PEER_R = 20;
-/** `graphNode` is 92 wide and centred on the point. */
-export const HALF_LABEL_W = 46;
 /** marginTop 3 + label lineHeight 14 + sub lineHeight 13, all below the disc. */
 export const LABEL_H = 30;
-const BASE_HEIGHT = 300;
-/** Past a handful of peers the ring needs room rather than tighter packing. */
-const CROWD_FROM = 5;
-const HEIGHT_PER_EXTRA = 24;
-const MAX_HEIGHT = 460;
+/** Widest a node's label box gets. Narrower when the board is crowded. */
+export const NODE_W_MAX = 92;
+/** Narrower than this and a name is not worth printing. Forces another band. */
+export const NODE_W_MIN = 56;
+/** Clear space between one band of nodes and the next. */
+const BAND_PAD = 12;
+/** Short graphs still want some presence on the page. */
+const MIN_HEIGHT = 200;
 
 export interface Point {
     x: number;
@@ -96,8 +95,10 @@ export function cutPath(points: Point[], fraction: number): Point[] {
 }
 
 export interface Layout {
-    /** Grows with the mesh: a crowded ring needs room, not tighter packing. */
+    /** Grows with the mesh: depth costs a band, a crowded level costs another. */
     height: number;
+    /** Label box width, narrowed from `NODE_W_MAX` when a band is crowded. */
+    nodeW: number;
     self: Point;
     nodes: { peer: PeerState; at: Point }[];
     positions: Map<number, Point>;
@@ -109,102 +110,92 @@ export interface Layout {
 }
 
 /**
- * Deterministic ring layout, arranged around the routes rather than the ids.
+ * Layered by hop count: this node on top, its neighbours under it, everything
+ * they relay for under them.
  *
- * Direct neighbours sit on an inner ring in id order, so a given phone lands in
- * the same place on every launch of the demo. Anything further out sits on an
- * outer ring *beside the relay it is reached through*, which is what makes the
- * path readable: a chain of three nodes looks like a chain. Sorting the outer
- * ring by id instead — which is what this did first — regularly put a peer on
- * the far side of the board from the only node that could reach it.
+ * This was a ring for a long time and the ring could not be made to work. A
+ * labelled node needs 92px across and 70px down, so two levels of them need
+ * 184px of horizontal radius either side of centre; a portrait phone gives
+ * about 129px. Every relay overlapped the peer behind it at every bearing, and
+ * the inner ring overlapped the node at the centre — not a tuning problem, an
+ * arithmetic one, and no radius fixes it.
  *
- * The rings are ellipses rather than circles, and they are sized from the space
- * a *labelled* node actually occupies rather than from a fraction of the board.
- * A phone screen is taller than the board is and the board is wider than it is
- * tall; one radius for both axes wasted the width and overran the height at the
- * same time.
+ * Bands fix it because the board can grow downwards and cannot grow sideways.
+ * They also happen to be the right picture: from this node's point of view the
+ * route table *is* a tree — every destination has exactly one next hop — so
+ * depth on the screen is distance through the mesh, which is the thing this
+ * view exists to show.
+ *
+ * A row wider than the board splits into more bands rather than packing tighter,
+ * and the label box narrows to the widest band's slot so names truncate instead
+ * of colliding. Order within a band follows the parent's, so relay legs fan out
+ * locally instead of crossing the board.
  *
  * Shape comes from `via`, never from `hops`. They can disagree — the hop count
  * on a peer record is whatever its last beacon travelled, while `via` is the
- * router's own next hop — and when they did, a neighbour would be drawn bent
- * through a relay it does not need.
+ * router's own next hop — and when they did, a neighbour was drawn hanging off
+ * a relay it does not need.
  */
 export function computeLayout(width: number, peers: PeerState[]): Layout {
-    const height = Math.min(
-        MAX_HEIGHT,
-        BASE_HEIGHT + Math.max(0, peers.length - CROWD_FROM) * HEIGHT_PER_EXTRA,
-    );
-
-    // Centred in the band a node can occupy, not in the board: the label hangs
-    // below the disc, so the usable box is short at the bottom and centring on
-    // the board would give the lower half of the ring less room than the upper.
-    const self = { x: width / 2, y: (height - LABEL_H) / 2 };
-    const rx = Math.max(40, width / 2 - HALF_LABEL_W);
-    const ry = Math.max(30, self.y - PEER_R);
-
-    const positions = new Map<number, Point>();
-    const angles = new Map<number, number>();
-
     const ordered = [...peers].sort((a, b) => a.nodeId - b.nodeId);
-    // All three states of `via`, and they lay out differently: a neighbour, a
-    // peer behind a relay, and a peer the router has no route to at all.
+    // All three states of `via`: a neighbour, a peer behind one, and a peer the
+    // router has no route to at all.
     const direct = ordered.filter((p) => p.via === p.nodeId);
-    const distant = ordered.filter((p) => p.via !== p.nodeId && p.via !== 0);
+    const behind = ordered.filter((p) => p.via !== p.nodeId && p.via !== 0);
     const stranded = ordered.filter((p) => p.via === 0);
 
-    const inner = distant.length || stranded.length ? 0.56 : 0.94;
-    const place = (peer: PeerState, angle: number, scale: number) => {
-        angles.set(peer.nodeId, angle);
-        positions.set(peer.nodeId, {
-            x: self.x + Math.cos(angle) * rx * scale,
-            y: self.y + Math.sin(angle) * ry * scale,
-        });
+    // One level per hop count, so a three-hop peer sits below a two-hop one even
+    // though both hang off a neighbour — the next hop is always a direct link,
+    // so the parent is always on the first level whatever the distance.
+    const levels = new Map<number, PeerState[]>();
+    const at = (level: number) => {
+        const row = levels.get(level);
+        if (row) return row;
+        const made: PeerState[] = [];
+        levels.set(level, made);
+        return made;
     };
+    at(1).push(...direct);
+    for (const peer of behind) at(Math.max(2, peer.hops)).push(peer);
+    // Unreachable peers go under everything, joined to nothing.
+    if (stranded.length) at(Math.max(1, ...levels.keys()) + 1).push(...stranded);
 
-    // Start at the top and go round. The half-step offset keeps a lone peer off
-    // the vertical axis, where its label would sit on the self node's.
-    const slot = (2 * Math.PI) / Math.max(direct.length, 1);
-    direct.forEach((peer, i) => place(peer, -Math.PI / 2 + (i + 0.5) * slot, inner));
-
-    // Grouped by relay so siblings fan out around it instead of stacking, and
-    // walked nearest-first: on a chain of four, the three-hop node hangs off a
-    // two-hop node, so the relay has to be on the board before anything can be
-    // placed beside it. Grouping in id order — which is what this did first —
-    // put that at the mercy of which phone happened to have the lower id.
-    const byRelay = new Map<number, PeerState[]>();
-    for (const peer of [...distant].sort((a, b) => a.hops - b.hops)) {
-        const group = byRelay.get(peer.via);
-        if (group) group.push(peer);
-        else byRelay.set(peer.via, [peer]);
-    }
-
-    // Orphans are peers whose relay is not on the board at all, counted from the
-    // peer list rather than from what has been placed, so the spread does not
-    // depend on where in the walk one turns up. They share the outer ring with
-    // the stranded, which is where anything this node cannot draw a path to
-    // ends up.
-    const onBoard = new Set(ordered.map((p) => p.nodeId));
-    const loose = distant.filter((p) => !onBoard.has(p.via)).length + stranded.length;
-    let orphan = 0;
-    const placeLoose = (peer: PeerState) =>
-        place(peer, -Math.PI / 2 + ((orphan++ + 0.5) * 2 * Math.PI) / Math.max(loose, 1), 1);
-
-    for (const [relay, group] of byRelay) {
-        const base = angles.get(relay);
-        if (base === undefined) {
-            for (const peer of group) placeLoose(peer);
-            continue;
+    // Bands: a level too wide for the board becomes several. `perBand` is how
+    // many nodes fit before a name stops being worth printing.
+    const perBand = Math.max(1, Math.floor(width / NODE_W_MIN));
+    const bands: PeerState[][] = [];
+    const order = new Map<number, number>();
+    for (const level of [...levels.keys()].sort((a, b) => a - b)) {
+        // Children follow their parent's position, so legs stay local.
+        const row = [...levels.get(level)!].sort(
+            (a, b) => (order.get(a.via) ?? 0) - (order.get(b.via) ?? 0) || a.nodeId - b.nodeId,
+        );
+        for (let i = 0; i < row.length; i += perBand) {
+            const band = row.slice(i, i + perBand);
+            band.forEach((peer, j) => order.set(peer.nodeId, bands.length * 1000 + j));
+            bands.push(band);
         }
-        // Siblings fan around the relay's bearing, but never wider than the
-        // slot the relay itself occupies — spilling past it puts a peer nearer
-        // to a relay that cannot reach it than to the one that can.
-        const spread = Math.min(0.42, (slot * 0.8) / Math.max(group.length - 1, 1));
-        group.forEach((peer, i) => place(peer, base + (i - (group.length - 1) / 2) * spread, 1));
     }
-    for (const peer of stranded) placeLoose(peer);
+
+    // The slot the widest band has to live in decides the label width for all of
+    // them, so nodes are one size and no band is tighter than its own boxes.
+    const widest = Math.max(1, ...bands.map((b) => b.length));
+    const nodeW = Math.max(NODE_W_MIN, Math.min(NODE_W_MAX, width / widest));
+
+    const positions = new Map<number, Point>();
+    const self = { x: width / 2, y: SELF_R + 4 };
+    let y = self.y + SELF_R + LABEL_H + BAND_PAD + PEER_R;
+
+    for (const band of bands) {
+        const slot = width / band.length;
+        band.forEach((peer, i) => positions.set(peer.nodeId, { x: slot * (i + 0.5), y }));
+        y += PEER_R + LABEL_H + BAND_PAD + PEER_R;
+    }
+    // `y` has run one band past the last, so take the pad and half-band back.
+    const height = Math.max(MIN_HEIGHT, y - BAND_PAD - PEER_R + 6);
 
     // Routes, then the segments they imply. Keyed by the pair so a relay leg
-    // shared by three distant peers is one line rather than three stacked.
+    // shared by three peers behind it is one line rather than three stacked.
     const routes = new Map<number, Point[]>();
     const segments: Segment[] = [];
     const drawn = new Set<string>();
@@ -216,17 +207,17 @@ export function computeLayout(width: number, peers: PeerState[]): Layout {
     };
 
     for (const peer of ordered) {
-        const at = positions.get(peer.nodeId);
-        if (!at) continue;
+        const point = positions.get(peer.nodeId);
+        if (!point) continue;
 
         // No route: no line. The node stays on the board because this phone has
         // heard it, and nothing joins it to anything because nothing can reach
-        // it — which is a picture the old code could not draw at all.
+        // it — a picture the old code could not draw at all.
         if (peer.via === 0) continue;
 
         if (peer.via === peer.nodeId) {
-            routes.set(peer.nodeId, [self, at]);
-            addSegment(`self-${peer.nodeId}`, self, at, true);
+            routes.set(peer.nodeId, [self, point]);
+            addSegment(`self-${peer.nodeId}`, self, point, true);
             continue;
         }
 
@@ -234,24 +225,25 @@ export function computeLayout(width: number, peers: PeerState[]): Layout {
         if (!relay) {
             // Reachable through someone this node cannot place. Still one line,
             // but a faint one: the route exists, the shape of it is unknown.
-            routes.set(peer.nodeId, [self, at]);
-            addSegment(`self-${peer.nodeId}`, self, at, false);
+            routes.set(peer.nodeId, [self, point]);
+            addSegment(`self-${peer.nodeId}`, self, point, false);
             continue;
         }
 
-        routes.set(peer.nodeId, [self, relay, at]);
+        routes.set(peer.nodeId, [self, relay, point]);
         addSegment(`self-${peer.via}`, self, relay, true);
         // Exactly two hops means the far leg is one real link the relay holds.
         // Further than that and it stands in for hops this node cannot see.
-        addSegment(`${peer.via}-${peer.nodeId}`, relay, at, peer.hops === 2);
+        addSegment(`${peer.via}-${peer.nodeId}`, relay, point, peer.hops === 2);
     }
 
     return {
         height,
+        nodeW,
         self,
         nodes: ordered.flatMap((peer) => {
-            const at = positions.get(peer.nodeId);
-            return at ? [{ peer, at }] : [];
+            const point = positions.get(peer.nodeId);
+            return point ? [{ peer, at: point }] : [];
         }),
         positions,
         segments,

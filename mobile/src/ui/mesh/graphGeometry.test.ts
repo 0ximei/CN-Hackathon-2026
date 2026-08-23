@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import type { PeerState } from '../../mesh/MeshNode';
 
 import {
-    HALF_LABEL_W,
     LABEL_H,
+    NODE_W_MIN,
     PEER_R,
     SELF_R,
     computeLayout,
@@ -34,6 +34,21 @@ function peer(nodeId: number, hops: number, via: number): PeerState {
 
 /** Screen widths the board actually gets, small phone through tablet. */
 const WIDTHS = [240, 327, 351, 387, 736];
+
+/** Shapes worth holding to: a pair, a chain, a hub, and a crowd. */
+const MESHES: PeerState[][] = [
+    [peer(1, 1, 1)],
+    [peer(1, 1, 1), peer(2, 1, 2)],
+    [peer(1, 1, 1), peer(2, 2, 1), peer(3, 2, 1)],
+    // A chain: one direct, one behind it, one further still.
+    [peer(1, 1, 1), peer(2, 2, 1), peer(3, 4, 1)],
+    // A peer nothing can route to, alongside one that can be reached.
+    [peer(1, 1, 1), peer(2, 3, 0)],
+    // More neighbours than a band holds, which is what forces a second one.
+    Array.from({ length: 8 }, (_, i) => peer(i + 1, 1, i + 1)),
+    // A hub relaying for a crowd.
+    [peer(1, 1, 1), ...Array.from({ length: 7 }, (_, i) => peer(i + 2, 2, 1))],
+];
 
 const p = (x: number, y: number): Point => ({ x, y });
 
@@ -121,24 +136,15 @@ describe('graph layout', () => {
      * board.
      */
     it('keeps every node label inside the board', () => {
-        const meshes: PeerState[][] = [
-            [peer(1, 1, 1)],
-            [peer(1, 1, 1), peer(2, 1, 2)],
-            [peer(1, 1, 1), peer(2, 2, 1), peer(3, 2, 1)],
-            // A crowd, which is where the ring runs out of room first.
-            Array.from({ length: 11 }, (_, i) => peer(i + 1, 1, i + 1)),
-            // A chain: 1 direct, 2 behind it, 3 behind that.
-            [peer(1, 1, 1), peer(2, 2, 1), peer(3, 3, 2)],
-        ];
-
         for (const width of WIDTHS) {
-            for (const peers of meshes) {
+            for (const peers of MESHES) {
                 const layout = computeLayout(width, peers);
                 const where = `${peers.length} peers at ${width}px`;
+                const half = layout.nodeW / 2;
 
                 for (const { peer: p, at } of layout.nodes) {
-                    expect(at.x - HALF_LABEL_W, `${p.name} left, ${where}`).toBeGreaterThanOrEqual(0);
-                    expect(at.x + HALF_LABEL_W, `${p.name} right, ${where}`).toBeLessThanOrEqual(width);
+                    expect(at.x - half, `${p.name} left, ${where}`).toBeGreaterThanOrEqual(0);
+                    expect(at.x + half, `${p.name} right, ${where}`).toBeLessThanOrEqual(width);
                     expect(at.y - PEER_R, `${p.name} top, ${where}`).toBeGreaterThanOrEqual(0);
                     expect(
                         at.y + PEER_R + LABEL_H,
@@ -152,6 +158,62 @@ describe('graph layout', () => {
                     layout.self.y + SELF_R + LABEL_H,
                     `self bottom, ${where}`,
                 ).toBeLessThanOrEqual(layout.height);
+            }
+        }
+    });
+
+    /**
+     * The bug that survived the first fix.
+     *
+     * Fitting inside the board is not the same as fitting beside each other. A
+     * two-ring layout put a relay 51px from the peer behind it, against boxes
+     * 70px tall, so every chain overlapped at every bearing — and the ring at
+     * the centre overlapped the node in the middle of it. That is arithmetic,
+     * not tuning: two levels of labelled node need 184px of horizontal radius
+     * and a portrait phone has about 129px. Bands are what make it fit, and
+     * this is the assertion that says so.
+     */
+    it('never overlaps two nodes', () => {
+        for (const width of WIDTHS) {
+            for (const peers of MESHES) {
+                const layout = computeLayout(width, peers);
+                const where = `${peers.length} peers at ${width}px`;
+
+                // The box a node actually paints: the disc, then its two lines
+                // of label under it. Self's disc is the larger one.
+                const box = (name: string, at: { x: number; y: number }, r: number) => ({
+                    name,
+                    left: at.x - layout.nodeW / 2,
+                    right: at.x + layout.nodeW / 2,
+                    top: at.y - r,
+                    bottom: at.y + r + LABEL_H,
+                });
+                const boxes = [
+                    box('self', layout.self, SELF_R),
+                    ...layout.nodes.map((n) => box(n.peer.name, n.at, PEER_R)),
+                ];
+
+                for (let i = 0; i < boxes.length; i++) {
+                    for (let j = i + 1; j < boxes.length; j++) {
+                        const a = boxes[i];
+                        const b = boxes[j];
+                        const hit =
+                            a.left < b.right &&
+                            b.left < a.right &&
+                            a.top < b.bottom &&
+                            b.top < a.bottom;
+                        expect(hit, `${a.name} and ${b.name} collide, ${where}`).toBe(false);
+                    }
+                }
+            }
+        }
+    });
+
+    /** A name needs room to be a name. Another band is better than a sliver. */
+    it('never narrows a label past legibility', () => {
+        for (const width of WIDTHS) {
+            for (const peers of MESHES) {
+                expect(computeLayout(width, peers).nodeW).toBeGreaterThanOrEqual(NODE_W_MIN);
             }
         }
     });
