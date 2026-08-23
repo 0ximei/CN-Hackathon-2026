@@ -4,6 +4,7 @@ import { FlatList, Text, View } from 'react-native';
 import type { Authorship } from '../../identity/authorship';
 
 import { MAX_BODY_REPLICAS } from '@core/replication/policy';
+import { SUPPORTED_FORMATS } from '@core/lib/extract';
 
 import type { useMesh } from '../useMesh';
 import type { DocReplicaInfo } from '../../replication/Replicator';
@@ -42,9 +43,9 @@ export function FilesTab({ mesh, onCompose }: { mesh: Mesh; onCompose: () => voi
       ListHeaderComponent={
         <View style={{ marginBottom: space.xs, gap: space.sm }}>
           <Text style={styles.lede}>
-            Write something down or import a .txt or .md, and it enters the mesh here — then
-            spreads by itself: metadata to everyone that ranks for it, full text to the nodes the
-            policy picks.
+            Write something down or import a document — {SUPPORTED_FORMATS} — and it enters the
+            mesh here, then spreads by itself: metadata to everyone that ranks for it, full text
+            to the nodes the policy picks.
           </Text>
 
           <Button label="Add a document" icon="add" onPress={onCompose} />

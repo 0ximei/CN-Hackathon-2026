@@ -11,8 +11,12 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 
 import { parseDocument } from '@core/lib/chunk';
+import { SUPPORTED_FORMATS, extractDocument } from '@core/lib/extract';
+
+import { fromBase64 } from '../../lib/base64';
 
 import type { useMesh } from '../useMesh';
 import { useTheme } from '../ThemeProvider';
@@ -25,10 +29,14 @@ type Mesh = ReturnType<typeof useMesh>;
  * Where a document is written, whether or not a keyboard produced it.
  *
  * Importing a file lands its text *here* rather than on the mesh, which is the
- * whole reason there is one screen instead of two. Publishing is irreversible
- * in the only sense that matters on a mesh: `forget` clears this node, and every
- * phone that already pulled a body keeps it. So the last thing that happens
- * before text leaves is a person looking at it.
+ * whole reason there is one screen instead of two, and it matters more the
+ * further the source format is from plain text. A PDF's words come out of where
+ * its glyphs sat on the page: usually right, occasionally a table read in the
+ * wrong order. Landing that in an editable body makes the imperfection
+ * something the author can see and fix in the ten seconds before it becomes
+ * permanent — because publishing is irreversible in the only sense that matters
+ * on a mesh. `forget` clears this node; every phone that already pulled a body
+ * keeps it.
  *
  * It is a plain absolutely-positioned view rather than a `Modal` on purpose. A
  * Modal is its own Android window and does not inherit the activity's
@@ -41,6 +49,9 @@ export function Composer({ mesh, onClose }: { mesh: Mesh; onClose: () => void })
   const [body, setBody] = useState('');
   const [focus, setFocus] = useState<'title' | 'body' | null>(null);
   const [error, setError] = useState('');
+  /** What was imported, so the text on screen says where it came from. */
+  const [note, setNote] = useState('');
+  const [importing, setImporting] = useState(false);
 
   const busy = mesh.upload.busy;
   const dirty = !!title.trim() || !!body.trim();
@@ -133,21 +144,36 @@ export function Composer({ mesh, onClose }: { mesh: Mesh; onClose: () => void })
     const result = await DocumentPicker.getDocumentAsync({
       multiple: false,
       copyToCacheDirectory: true,
-      type: ['text/plain', 'text/markdown', 'text/*'],
+      type: PICKER_TYPES,
     });
     if (result.canceled || !result.assets?.length) return;
 
-    const asset = result.assets[0] as { name?: string; uri: string };
+    const asset = result.assets[0] as { name?: string; uri: string; size?: number };
     setError('');
+    if (asset.size !== undefined && asset.size > MAX_IMPORT_BYTES) {
+      setError(
+        `that file is ${Math.round(asset.size / 1024 / 1024)} MB — too large to hold in memory here, and far too large to move over Bluetooth`,
+      );
+      return;
+    }
+
+    setImporting(true);
     try {
-      const text = await readAssetText(asset.uri);
-      setBody(text);
-      // The file's own name only wins where the author has not given one. A
-      // markdown `# ` heading beats the filename, which is what `parseDocument`
-      // already decides — so ask it rather than re-deriving it here and drifting.
-      if (!title.trim()) setTitle(parseDocument(asset.name ?? 'document.txt', text).title);
+      const bytes = await readAssetBytes(asset.uri);
+      const name = asset.name ?? 'document';
+      const document = extractDocument(bytes, name);
+      setBody(document.text);
+      // Whatever the file said about itself wins, then its own headings, then
+      // its name. `parseDocument` already knows that order for text formats, so
+      // it is asked rather than re-derived here and left to drift.
+      if (!title.trim()) {
+        setTitle(document.title ?? parseDocument(name, document.text).title);
+      }
+      setNote(sourceNote(document.format, name));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -214,8 +240,12 @@ export function Composer({ mesh, onClose }: { mesh: Mesh; onClose: () => void })
             text being written, not a field being filled in. */}
         <TextInput
           value={body}
-          onChangeText={setBody}
-          placeholder="What do you know that the mesh does not? Local conditions, a route, a dosage, an address — anything a phone with no signal should be able to answer from."
+          onChangeText={(next) => {
+            setBody(next);
+            // Once it has been edited it is no longer what the file said.
+            if (note) setNote('');
+          }}
+          placeholder={`What do you know that the mesh does not? Local conditions, a route, a dosage, an address — anything a phone with no signal should be able to answer from.\n\nOr import ${SUPPORTED_FORMATS} and the text lands here to check over first.`}
           placeholderTextColor={theme.faint}
           style={styles.composerBody}
           onFocus={() => setFocus('body')}
@@ -258,6 +288,13 @@ export function Composer({ mesh, onClose }: { mesh: Mesh; onClose: () => void })
           </View>
         )}
 
+        {!!note && (
+          <View style={{ flexDirection: 'row', gap: space.sm, alignItems: 'flex-start' }}>
+            <Ionicons name="document-attach-outline" size={14} color={theme.dim} />
+            <Text style={[styles.hint, { marginTop: 0, flex: 1, color: theme.dim }]}>{note}</Text>
+          </View>
+        )}
+
         <Text style={[styles.hint, { marginTop: 0 }]}>
           Publishing spreads this to every phone in range. Forgetting it later only clears this
           one.
@@ -265,10 +302,11 @@ export function Composer({ mesh, onClose }: { mesh: Mesh; onClose: () => void })
 
         <View style={styles.composerActions}>
           <Button
-            label="Import .txt or .md"
+            label={importing ? 'Reading…' : 'Import a file'}
             icon="file-tray-outline"
             variant="ghost"
             compact
+            busy={importing}
             disabled={busy}
             onPress={() => void importFile()}
           />
@@ -303,10 +341,75 @@ function fileNameFor(title: string): string {
   return `${slug || 'note'}.md`;
 }
 
-async function readAssetText(uri: string): Promise<string> {
-  const response = await fetch(uri);
-  if (!response.ok) throw new Error(`could not read document: ${response.status}`);
-  return response.text();
+/**
+ * The file, as bytes.
+ *
+ * Base64 through the bridge rather than `fetch(uri).text()`, which was fine
+ * while everything importable was already text and is wrong the moment a PDF
+ * arrives: decoding one as UTF-8 mangles every byte the extractor needs before
+ * it ever sees them.
+ */
+async function readAssetBytes(uri: string): Promise<Uint8Array> {
+  const base64 = await FileSystem.readAsStringAsync(uri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  return fromBase64(base64);
+}
+
+/**
+ * What the picker will offer.
+ *
+ * Both the MIME types and the extensions, because Android content providers
+ * are inconsistent about which they report — a .docx routinely arrives as
+ * `application/octet-stream`, and a filter of MIME types alone then greys it
+ * out in the picker. The format is decided from the bytes afterwards anyway.
+ */
+const PICKER_TYPES = [
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.oasis.opendocument.text',
+  'application/rtf',
+  'text/rtf',
+  'text/html',
+  'text/markdown',
+  'text/plain',
+  'text/*',
+  'application/octet-stream',
+];
+
+/**
+ * How large a file may be.
+ *
+ * Generous for the phone and absurd for the radio: at BLE's few kilobytes a
+ * second, even a tenth of this is an afternoon of transfer. The cap is here to
+ * stop the extractor running the app out of memory, and the replication policy
+ * is what actually decides how far a large document travels.
+ */
+const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
+
+const FORMAT_NAME: Record<string, string> = {
+  pdf: 'PDF',
+  docx: 'Word document',
+  odt: 'OpenDocument text',
+  rtf: 'RTF',
+  html: 'web page',
+  markdown: 'Markdown',
+  text: 'text file',
+};
+
+/**
+ * Extraction is a reading of a document, not the document.
+ *
+ * A PDF's text comes out of where the glyphs were put on the page, so headings,
+ * columns and tables arrive approximately. Saying which format this came from
+ * is what tells the author how hard to look before they publish it to everyone
+ * in range.
+ */
+function sourceNote(format: string, filename: string): string {
+  const kind = FORMAT_NAME[format] ?? 'document';
+  return format === 'pdf' || format === 'html'
+    ? `Text read out of ${filename} (${kind}). Worth a read before publishing — layout does not always survive.`
+    : `Text read out of ${filename} (${kind}).`;
 }
 
 /** `Alert.alert` as something that can be awaited. */

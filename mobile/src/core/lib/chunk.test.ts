@@ -22,6 +22,14 @@ describe('parseDocument titling', () => {
         expect(parseDocument('snakebite.md', 'Keep the limb still.').title).toBe('snakebite');
     });
 
+    it('strips the extension of every format the importer accepts', () => {
+        // A document that falls back to its filename should not be called
+        // "field-guide.pdf" on every phone that ends up holding it.
+        for (const name of ['guide.pdf', 'guide.docx', 'guide.odt', 'guide.rtf', 'guide.html']) {
+            expect(parseDocument(name, 'Keep the limb still.').title).toBe('guide');
+        }
+    });
+
     it('keeps the stated title even when the body carries a heading', () => {
         expect(parseDocument('note.md', BODY, 'Kali crossing').title).toBe('Kali crossing');
     });
