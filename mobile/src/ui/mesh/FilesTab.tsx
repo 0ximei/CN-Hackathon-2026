@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { FlatList, Text, View } from 'react-native';
-import * as DocumentPicker from 'expo-document-picker';
+import { Ionicons } from '@expo/vector-icons';
 
 import type { Authorship } from '../../identity/authorship';
 
 import { MAX_BODY_REPLICAS } from '@core/replication/policy';
+import { SUPPORTED_FORMATS } from '@core/lib/extract';
 
 import type { useMesh } from '../useMesh';
 import type { DocReplicaInfo } from '../../replication/Replicator';
@@ -12,6 +13,7 @@ import type { Provenance } from '../../storage/types';
 import { useTheme } from '../ThemeProvider';
 import { type Palette, bytes, space } from '../theme';
 import { Button, Empty } from './Controls';
+import { importDocument } from './importDocument';
 
 type Mesh = ReturnType<typeof useMesh>;
 
@@ -20,41 +22,64 @@ const PROVENANCE_LABEL: Record<Provenance, string> = {
   mesh: 'FROM THE MESH',
 };
 
-async function readAssetText(uri: string): Promise<string> {
-  const response = await fetch(uri);
-  if (!response.ok) throw new Error(`could not read document: ${response.status}`);
-  return response.text();
-}
-
-export function FilesTab({ mesh }: { mesh: Mesh }) {
+/**
+ * What this node knows, and how safely it knows it.
+ *
+ * Two ways in, because they are two different acts. Writing is authorship: the
+ * text does not exist until someone types it, so it gets a screen, a draft and
+ * a confirm on the way out (see `Composer.tsx`). Importing is not — the
+ * document already exists, the author already stands behind it, and the only
+ * question is whether it enters the mesh. So a picked file goes straight in.
+ *
+ * They were one path for a while, with an import landing its text in the
+ * composer's body field as a first draft. It reads well and works badly: it
+ * asks somebody to proof fifty pages of recovered PDF text before their file
+ * will move, which made importing the slower of the two rather than the faster.
+ *
+ * A published document arrives at the top of this list a moment later with its
+ * own replica meter, which is a truer account of what happened than a sentence
+ * saying it went well — so success is shown rather than announced. What does get
+ * said is what the list cannot show: which format a file was read as, since
+ * extraction is a reading of a document rather than the document, and anything
+ * that failed, because a file that did not import leaves no trace to notice.
+ */
+export function FilesTab({ mesh, onCompose }: { mesh: Mesh; onCompose: () => void }) {
   const { styles, theme, accent } = useTheme();
-  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState('');
+  /** What the last import was read as. Cleared when the next one starts. */
+  const [note, setNote] = useState('');
 
-  const handleUpload = async () => {
-    const result = await DocumentPicker.getDocumentAsync({
-      multiple: true,
-      copyToCacheDirectory: true,
-      type: ['text/plain', 'text/markdown', 'text/*'],
-    });
-    if (result.canceled || !result.assets?.length) return;
-
-    setNote(null);
+  /**
+   * Pick a file and publish it. No screen in between, by design.
+   *
+   * `mesh.upload` drives the progress meter the composer also uses, so the
+   * embedding pass is visible without this having to report on itself.
+   */
+  const onImport = async () => {
+    setError('');
+    setNote('');
+    setImporting(true);
     try {
-      const files = await Promise.all(
-        result.assets.map(async (asset: { name?: string; uri: string }, i: number) => ({
-          name: asset.name ?? `uploaded-${i}.txt`,
-          text: await readAssetText(asset.uri),
-        })),
-      );
-      await mesh.addFiles(files);
-      setNote({
-        ok: true,
-        text: `Added ${files.length} file${files.length === 1 ? '' : 's'}. Metadata is on its way to the mesh; bodies follow where the policy places them.`,
-      });
+      const result = await importDocument();
+      if (result.status === 'cancelled') return;
+      if (result.status === 'error') {
+        setError(result.message);
+        return;
+      }
+      const { name, title, text, note: read } = result.document;
+      await mesh.addFiles([{ name, text, title }]);
+      // After the upload, not before: said about a document that is now on the
+      // mesh, rather than about one that might still fail to get there.
+      setNote(read);
     } catch (e) {
-      setNote({ ok: false, text: e instanceof Error ? e.message : String(e) });
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setImporting(false);
     }
   };
+
+  const busy = importing || mesh.upload.busy;
 
   return (
     <FlatList
@@ -64,20 +89,32 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
       ListHeaderComponent={
         <View style={{ marginBottom: space.xs, gap: space.sm }}>
           <Text style={styles.lede}>
-            Upload a document and it enters the mesh here, then spreads by itself — metadata to
-            everyone that ranks for it, full text to the nodes the policy picks.
+            Anything that enters the mesh here spreads by itself: metadata to everyone that ranks
+            for it, full text to the nodes the policy picks.
           </Text>
 
           <Button
-            label="Upload .txt or .md"
-            icon="cloud-upload-outline"
-            busy={mesh.upload.busy}
-            onPress={() => void handleUpload()}
+            label={importing ? 'Reading…' : 'Import a document'}
+            icon="file-tray-outline"
+            busy={importing}
+            disabled={busy}
+            onPress={() => void onImport()}
+          />
+          <Text style={[styles.hint, { marginTop: 0 }]}>
+            {SUPPORTED_FORMATS} — read and published straight to the mesh.
+          </Text>
+
+          <Button
+            label="Write a document"
+            icon="create-outline"
+            variant="ghost"
+            disabled={busy}
+            onPress={onCompose}
           />
 
           {mesh.upload.busy && (
             <View>
-              <View style={styles.progress}>
+              <View style={[styles.progress, { marginTop: 0 }]}>
                 <View
                   style={[
                     styles.progressFill,
@@ -99,16 +136,22 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
             </View>
           )}
 
-          {note && (
-            <Text
-              style={[
-                styles.summary,
-                { paddingHorizontal: 0 },
-                !note.ok && { color: theme.warn },
-              ]}
-            >
-              {note.text}
-            </Text>
+          {!!error && (
+            <View style={{ flexDirection: 'row', gap: space.sm, alignItems: 'flex-start' }}>
+              <Ionicons name="alert-circle-outline" size={14} color={theme.warn} />
+              <Text style={[styles.hint, { marginTop: 0, flex: 1, color: theme.warn }]}>
+                {error}
+              </Text>
+            </View>
+          )}
+
+          {!!note && (
+            <View style={{ flexDirection: 'row', gap: space.sm, alignItems: 'flex-start' }}>
+              <Ionicons name="document-attach-outline" size={14} color={theme.dim} />
+              <Text style={[styles.hint, { marginTop: 0, flex: 1, color: theme.dim }]}>
+                {note}
+              </Text>
+            </View>
           )}
         </View>
       }
@@ -121,7 +164,10 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
         />
       )}
       ListEmptyComponent={
-        <Empty icon="document-outline">No documents yet. Upload one above.</Empty>
+        <Empty icon="document-outline">
+          Nothing here yet. Everything this phone can answer offline starts as a document on this
+          screen.
+        </Empty>
       }
     />
   );

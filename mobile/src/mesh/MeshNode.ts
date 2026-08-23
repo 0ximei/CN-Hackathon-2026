@@ -582,8 +582,15 @@ export class MeshNode {
         filename: string,
         raw: string,
         onProgress?: (done: number, total: number) => void,
+        title?: string,
     ): Promise<void> {
-        const { doc } = await this.catalog.upload(filename, raw, this.identity.id, onProgress);
+        const { doc } = await this.catalog.upload(
+            filename,
+            raw,
+            this.identity.id,
+            onProgress,
+            title,
+        );
         await this.sign(doc);
         this.emit('catalog', this.catalog.stats());
         await this.replicator.announceDocument(doc.docKey);

@@ -12,6 +12,7 @@ import { acquire, release, setKeepAlive } from '../mesh/liveNode';
 // same row with no screen running. Two spellings of this key would be a mesh
 // that stops when the app does on exactly the phones that asked it not to.
 import { BACKGROUND_KEY, backgroundWanted } from '../mesh/daemon';
+import { requestMeshPermissions } from '../mesh/permissions';
 import { LocalCatalog, type CatalogStats } from '../storage/store';
 import {
     createIdentity,
@@ -111,6 +112,14 @@ export function useMesh() {
     const [documents, setDocuments] = useState<DocReplicaInfo[]>([]);
     const [replication, setReplication] = useState<ReplicationStats | null>(null);
     const [capabilities, setCapabilities] = useState<BleCapabilities | null>(null);
+    /**
+     * Whether the user granted the Bluetooth permissions.
+     *
+     * Separate from `capabilities`, which describes the hardware. A phone can
+     * be perfectly capable of advertising and still be refused, and the two
+     * failures read very differently on the Node tab.
+     */
+    const [permitted, setPermitted] = useState(true);
     const [query, setQuery] = useState<QueryState | null>(null);
     const [searching, setSearching] = useState(false);
     const [llmStatus, setLlmStatus] = useState<LlmStatus>(llm.status);
@@ -438,15 +447,27 @@ export function useMesh() {
         [query],
     );
 
+    /**
+     * Puts documents into the mesh, whoever wrote them.
+     *
+     * `title` is present when the author typed the document here rather than
+     * importing a file, and it is what the progress line names: a typed note's
+     * synthesised filename is an implementation detail nobody should watch
+     * scroll past.
+     */
     const addFiles = useCallback(
-        async (files: Array<{ name: string; text: string }>) => {
+        async (files: Array<{ name: string; text: string; title?: string }>) => {
             const node = nodeRef.current;
             if (!node) return;
             for (const file of files) {
-                setUpload({ busy: true, label: file.name, done: 0, total: 0 });
+                const label = file.title ?? file.name;
+                setUpload({ busy: true, label, done: 0, total: 0 });
                 try {
-                    await node.upload(file.name, file.text, (done, total) =>
-                        setUpload({ busy: true, label: file.name, done, total }),
+                    await node.upload(
+                        file.name,
+                        file.text,
+                        (done, total) => setUpload({ busy: true, label, done, total }),
+                        file.title,
                     );
                 } finally {
                     setUpload(IDLE_UPLOAD);

@@ -19,6 +19,7 @@ import { Header } from './mesh/Header';
 import { SearchTab } from './mesh/SearchTab';
 import { MapTab } from './mesh/MapTab';
 import { FilesTab } from './mesh/FilesTab';
+import { Composer } from './mesh/Composer';
 import { NodeTab } from './mesh/NodeTab';
 import { LogTab } from './mesh/LogTab';
 
@@ -45,14 +46,14 @@ const TABS: { id: TabId; icon: React.ComponentProps<typeof Ionicons>['name'] }[]
 /** How wide the moving indicator is, as a share of one tab's width. */
 const INDICATOR_SHARE = 0.42;
 
-function renderTab(t: TabId, mesh: Mesh) {
+function renderTab(t: TabId, mesh: Mesh, onCompose: () => void) {
   switch (t) {
     case 'ask':
       return <SearchTab mesh={mesh} />;
     case 'map':
       return <MapTab mesh={mesh} />;
     case 'files':
-      return <FilesTab mesh={mesh} />;
+      return <FilesTab mesh={mesh} onCompose={onCompose} />;
     case 'node':
       return <NodeTab mesh={mesh} />;
     case 'log':
@@ -67,6 +68,12 @@ export function MeshScreen({ mesh }: { mesh: Mesh }) {
   const scrollRef = useRef<ScrollView>(null);
   const scrollX = useRef(new Animated.Value(0)).current;
   const [keyboardUp, setKeyboardUp] = useState(false);
+  /**
+   * The composer lives here rather than inside the Files tab, because it is not
+   * a thing on a page — it covers the pager, locks the swipe and takes the back
+   * button. All three are this component's to give.
+   */
+  const [composing, setComposing] = useState(false);
 
   // `Did` rather than `Will`: the Will* events are iOS-only, and this is an
   // Android app — on Android they never fire and the bar would never hide.
@@ -128,6 +135,11 @@ export function MeshScreen({ mesh }: { mesh: Mesh }) {
         showsHorizontalScrollIndicator={false}
         onMomentumScrollEnd={onMomentumScrollEnd}
         scrollEventThrottle={16}
+        // A swipe under an open composer would page the tab out from beneath it,
+        // and TalkBack would otherwise walk straight off the sheet into a tab
+        // the sighted user cannot see.
+        scrollEnabled={!composing}
+        importantForAccessibility={composing ? 'no-hide-descendants' : 'auto'}
         onScroll={Animated.event([{ nativeEvent: { contentOffset: { x: scrollX } } }], {
           useNativeDriver: true,
         })}
@@ -149,7 +161,7 @@ export function MeshScreen({ mesh }: { mesh: Mesh }) {
                 keeping every tab alive behind a swipeable pager costs frames
                 on the phones this has to run on. A blank placeholder still
                 holds the page's width so paging math stays correct. */}
-            {Math.abs(i - index) <= 1 ? renderTab(t.id, mesh) : null}
+            {Math.abs(i - index) <= 1 ? renderTab(t.id, mesh, () => setComposing(true)) : null}
           </View>
         ))}
       </Animated.ScrollView>
@@ -162,7 +174,7 @@ export function MeshScreen({ mesh }: { mesh: Mesh }) {
         is the usual way a bottom tab bar ends up worse than a top one. It is
         unmounted instead: nothing to reach for while typing anyway.
       */}
-      {!keyboardUp && (
+      {!keyboardUp && !composing && (
         <View style={styles.tabBar}>
           <View style={styles.tabIndicatorTrack}>
             <Animated.View
@@ -203,6 +215,11 @@ export function MeshScreen({ mesh }: { mesh: Mesh }) {
           </View>
         </View>
       )}
+
+      {/* Last in the tree so it covers the masthead too: writing a document is
+          not a thing you do *inside* the Files tab, it is the only thing on
+          screen while it is happening. */}
+      {composing && <Composer mesh={mesh} onClose={() => setComposing(false)} />}
     </View>
   );
 }

@@ -72,6 +72,52 @@ export function makeStyles(theme: Palette) {
             ...typography.body,
         },
 
+        /* composer — a full-bleed sheet over the pager, not a page inside it.
+           Rendered at the screen's root so `adjustResize` shrinks it with the
+           keyboard the same way it shrinks everything else; a Modal is its own
+           Android window and does not inherit that. */
+        composer: { backgroundColor: theme.bg },
+        composerBar: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: space.md,
+            paddingHorizontal: space.md,
+            paddingVertical: space.sm,
+            borderBottomWidth: StyleSheet.hairlineWidth,
+            borderBottomColor: theme.hairline,
+        },
+        composerBarTitle: { ...typography.label, color: theme.faint, letterSpacing: 1.2 },
+        /** The name, as a field: bordered, because it is a thing to fill in. */
+        composerTitle: {
+            backgroundColor: theme.panel,
+            borderWidth: 1,
+            borderColor: theme.hairline,
+            borderRadius: radius.control,
+            paddingHorizontal: space.md,
+            paddingVertical: space.md,
+            color: theme.text,
+            ...typography.heading,
+        },
+        /** The body, as a page: no box. Text being written, not a form field. */
+        composerBody: {
+            flex: 1,
+            marginTop: space.md,
+            paddingBottom: space.md,
+            color: theme.text,
+            textAlignVertical: 'top',
+            ...typography.body,
+        },
+        composerFoot: {
+            paddingHorizontal: space.lg,
+            paddingTop: space.md,
+            paddingBottom: space.md,
+            gap: space.sm,
+            borderTopWidth: StyleSheet.hairlineWidth,
+            borderTopColor: theme.hairline,
+        },
+        composerCount: { ...typography.monoSm, color: theme.faint },
+
         summary: {
             ...typography.micro,
             color: theme.dim,

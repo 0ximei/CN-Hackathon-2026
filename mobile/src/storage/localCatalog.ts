@@ -352,10 +352,11 @@ export class LocalCatalog {
         raw: string,
         originId: number,
         onProgress?: (done: number, total: number) => void,
+        title?: string,
     ): Promise<{ doc: DocRow; metas: MetaRow[] }> {
         const text = normalizeUploadedText(raw);
         if (!text) throw new Error(`${filename} has no readable text`);
-        const parsed = parseDocument(filename, text);
+        const parsed = parseDocument(filename, text, title);
         if (!parsed.chunks.length) throw new Error(`${filename} has no readable text`);
         return this.ingestParsed(parsed, originId, 'local', undefined, onProgress);
     }
