@@ -1446,29 +1446,38 @@ export class MeshNode {
     /**
      * Peers as the router sees them, not as their last beacon happened to land.
      *
-     * `hops` is taken from the route table rather than from the stored peer,
-     * and the two genuinely disagree. A peer record takes the hop count off
-     * whichever HELLO arrived, while the router keeps the *best* route it has
-     * seen and drops duplicates — so when a relayed copy of a neighbour's
-     * beacon wins the race to the deduplicator, the peer record says two hops
-     * about a phone the router has a direct link to. That inconsistency reached
-     * the topology view as a peer drawn bent through a relay it does not need,
-     * which is the same class of wrong as drawing a line where there is no
-     * link. The router decides how a packet actually travels, so it is the
-     * authority on how the path is drawn.
+     * `hops` comes from the route table rather than from the beacon that
+     * created the peer, and the two genuinely disagree. A peer record takes its
+     * hop count off whichever HELLO arrived, while the router keeps the *best*
+     * route it has seen and drops duplicates — so when a relayed copy of a
+     * neighbour's beacon wins the race to the deduplicator, the peer record
+     * says two hops about a phone the router has a direct link to. The router
+     * decides how a packet actually travels, so it is the authority on the path.
+     *
+     * But only while it *has* an answer. The route table is deleted the instant
+     * a link goes away, because its job is "how do I reach this node right
+     * now"; the peer table deliberately keeps a neighbour for PEER_TIMEOUT_MS so
+     * a phone that is merely busy is not evicted and every route through it
+     * rebuilt. Reading the display straight off the router put those two in
+     * disagreement, and BLE links blip constantly — a dropped notification, a
+     * reconnect, a retune. Nodes flickered between connected and stranded
+     * several times a minute with nothing actually leaving.
+     *
+     * So the last known path is remembered on the peer and only replaced, never
+     * cleared. The peer table's cushion governs how long a node is believed in,
+     * which is the one clock that should decide it; when that expires the peer
+     * is reaped and takes its stale path with it.
      */
     peerList(): PeerState[] {
         const routes = this.router.getRoutes();
+        for (const peer of this.peers.values()) {
+            const route = routes.get(peer.nodeId);
+            if (!route) continue;
+            peer.hops = route.hops;
+            peer.via = this.nodeIdOfPeer(route.peerId);
+        }
         return [...this.peers.values()]
-            .map((peer) => {
-                const route = routes.get(peer.nodeId);
-                if (!route) return { ...peer, via: 0 };
-                return {
-                    ...peer,
-                    hops: route.hops,
-                    via: this.nodeIdOfPeer(route.peerId),
-                };
-            })
+            .map((peer) => ({ ...peer }))
             .sort((a, b) => a.name.localeCompare(b.name));
     }
 

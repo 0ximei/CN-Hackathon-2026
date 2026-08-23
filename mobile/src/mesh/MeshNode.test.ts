@@ -130,6 +130,41 @@ describe('MeshNode over a simulated mesh', () => {
         expect(charlie!.via).toBe(0x0b);
     });
 
+    /**
+     * A link that blips must not make a peer look like it left.
+     *
+     * BLE links drop and come back constantly — a dropped notification, a
+     * reconnect, a radio retune — and the peer table has a deliberate cushion
+     * for exactly that: a neighbour is kept for PEER_TIMEOUT_MS so a phone that
+     * is merely busy is not evicted and every route through it rebuilt.
+     *
+     * The route table has no such cushion, and should not: it answers "how do I
+     * reach this node *right now*", so a link that is gone means a route that is
+     * gone. Reading the display straight off it put the two in disagreement —
+     * the peer stayed in the list while its path vanished and came back with
+     * every blip, so nodes flickered between connected and stranded several
+     * times a minute without anything actually leaving.
+     */
+    it('keeps a peer reachable across a link blip', async () => {
+        const a = build(0x0a, 'Alpha');
+        const b = build(0x0b, 'Bravo');
+
+        a.transport.link(b.transport);
+        await startAll(a.node, b.node);
+        await a.node.search('anything at all');
+
+        expect(a.node.peerList().find((p) => p.nodeId === 0x0b)?.via).toBe(0x0b);
+
+        // The radio drops the link and brings it back, well inside the peer
+        // timeout — no beacon missed, nothing actually gone.
+        a.transport.unlink(b.transport);
+
+        const during = a.node.peerList().find((p) => p.nodeId === 0x0b);
+        expect(during, 'still a known peer').toBeDefined();
+        expect(during!.hops, 'still one hop away').toBe(1);
+        expect(during!.via, 'still reached directly, not stranded').toBe(0x0b);
+    });
+
     it('answers from local storage with no radio involved', async () => {
         const solo = build(0x11, 'Solo');
         solo.catalog.add(303, 'Water', BOILING);
