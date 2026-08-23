@@ -1,7 +1,5 @@
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 
-import { Pressable } from 'react-native';
-
 import type { useMesh } from '../useMesh';
 import { useTheme } from '../ThemeProvider';
 import { type SchemePreference, bytes, space } from '../theme';
@@ -152,14 +150,12 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
           the system kills it. The cost is a permanent notification, which is also the only place
           to stop it without opening the app again, and a phone that does not sleep as deeply.
         </Text>
-        <Pressable
+        <Button
+          label={mesh.background ? 'STOP WHEN I CLOSE THE APP' : 'KEEP THE MESH RUNNING'}
+          variant="ghost"
           onPress={() => void mesh.setBackgroundMode(!mesh.background)}
-          style={[styles.buttonGhost, { marginTop: 10 }]}
-        >
-          <Text style={styles.buttonGhostText}>
-            {mesh.background ? 'STOP WHEN I CLOSE THE APP' : 'KEEP THE MESH RUNNING'}
-          </Text>
-        </Pressable>
+          style={{ marginTop: 10 }}
+        />
       </View>
 
       <Text style={styles.sectionTitle}>SEARCH AND ANSWERS</Text>

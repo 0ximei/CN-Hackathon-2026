@@ -89,6 +89,46 @@ describe('MeshNode over a simulated mesh', () => {
         expect(hit!.hops).toBe(2);
     });
 
+    /**
+     * What the topology view draws a two-hop peer's line *through*.
+     *
+     * The map used to draw every peer on a line straight to this node, which
+     * for anything past one hop claims a radio link between two phones that
+     * cannot hear each other — with the relay sitting on the same screen,
+     * joined to nothing. Fixing the picture needs the next hop as a node id,
+     * and only this layer can supply it: the router names the next hop by
+     * transport peer id, and mapping one back to a node means reading the route
+     * table. Note the mock transport names links `link-<decimal>`, so a view
+     * trying to parse the id itself would get nothing here — which is exactly
+     * why it is resolved here instead.
+     */
+    it('names the relay a two-hop peer is reached through', async () => {
+        const a = build(0x0a, 'Alpha');
+        const b = build(0x0b, 'Bravo');
+        const c = build(0x0c, 'Charlie');
+
+        a.transport.link(b.transport);
+        b.transport.link(c.transport);
+
+        await startAll(a.node, b.node, c.node);
+        // A round of beacons, so Alpha has heard Charlie through Bravo.
+        await a.node.search('anything at all');
+
+        const peers = a.node.peerList();
+        const bravo = peers.find((p) => p.nodeId === 0x0b);
+        const charlie = peers.find((p) => p.nodeId === 0x0c);
+
+        expect(bravo, 'the direct neighbour').toBeDefined();
+        expect(bravo!.hops).toBe(1);
+        // Zero, not its own id: a direct peer has no relay, and a view drawing
+        // "self -> via -> peer" would otherwise put a corner on a straight link.
+        expect(bravo!.via).toBe(0);
+
+        expect(charlie, 'the peer two hops out').toBeDefined();
+        expect(charlie!.hops).toBe(2);
+        expect(charlie!.via).toBe(0x0b);
+    });
+
     it('answers from local storage with no radio involved', async () => {
         const solo = build(0x11, 'Solo');
         solo.catalog.add(303, 'Water', BOILING);
