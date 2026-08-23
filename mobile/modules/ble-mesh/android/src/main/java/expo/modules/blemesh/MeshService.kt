@@ -7,9 +7,12 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.SystemClock
+
+import androidx.core.content.ContextCompat
 
 import com.facebook.react.HeadlessJsTaskService
 import com.facebook.react.bridge.Arguments
@@ -70,6 +73,24 @@ class MeshService : HeadlessJsTaskService() {
     // Before anything that can block: from Android 8 the system gives a service
     // started with `startForegroundService` a few seconds to post a
     // notification and kills the process if it does not.
+    // Refuse rather than crash when the radio permissions are not granted.
+    //
+    // From Android 14 `startForeground` with a `connectedDevice` type throws
+    // `SecurityException` unless one of the BLUETOOTH_* permissions is held
+    // right now, and it throws *here* — on the service's own main thread,
+    // inside `handleServiceArgs` — where the module's `runCatching` around
+    // `startForegroundService` is a different call stack entirely and catches
+    // nothing. Unguarded that is a fatal exception on a START_STICKY service,
+    // so the system restarts it and it dies again on the same line.
+    //
+    // Reachable with no user in front of it: a sticky restart calls back in
+    // with no Activity and no React tree, and a permission the user revoked
+    // from Settings looks exactly like one they never granted.
+    if (!hasRadioPermission()) {
+      stopSelf()
+      return START_NOT_STICKY
+    }
+
     val detail = intent?.getStringExtra(EXTRA_DETAIL) ?: "starting"
     val notification = build(detail)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -93,6 +114,27 @@ class MeshService : HeadlessJsTaskService() {
     // it was not when the node id lived only in JavaScript. The restart arrives
     // with a null intent, which is why `detail` has a fallback.
     return START_STICKY
+  }
+
+  /**
+   * Whether the process currently holds a permission that satisfies the
+   * `connectedDevice` foreground service type.
+   *
+   * Any one of the three is enough for the platform check. They are asked for
+   * together and a partial grant is not something the UI offers, but the test
+   * matches what `validateForegroundServiceType` actually enforces rather than
+   * what this app happens to request — the point is to never be stricter than
+   * the thing that throws, and never looser.
+   */
+  private fun hasRadioPermission(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+    return listOf(
+      android.Manifest.permission.BLUETOOTH_CONNECT,
+      android.Manifest.permission.BLUETOOTH_SCAN,
+      android.Manifest.permission.BLUETOOTH_ADVERTISE,
+    ).any {
+      ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+    }
   }
 
   /**

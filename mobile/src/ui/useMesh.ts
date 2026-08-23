@@ -12,6 +12,7 @@ import { acquire, release, setKeepAlive } from '../mesh/liveNode';
 // same row with no screen running. Two spellings of this key would be a mesh
 // that stops when the app does on exactly the phones that asked it not to.
 import { BACKGROUND_KEY, backgroundWanted } from '../mesh/daemon';
+import { requestMeshPermissions } from '../mesh/permissions';
 import { LocalCatalog, type CatalogStats } from '../storage/store';
 import {
     createIdentity,
@@ -111,6 +112,14 @@ export function useMesh() {
     const [documents, setDocuments] = useState<DocReplicaInfo[]>([]);
     const [replication, setReplication] = useState<ReplicationStats | null>(null);
     const [capabilities, setCapabilities] = useState<BleCapabilities | null>(null);
+    /**
+     * Whether the user granted the Bluetooth permissions.
+     *
+     * Separate from `capabilities`, which describes the hardware. A phone can
+     * be perfectly capable of advertising and still be refused, and the two
+     * failures read very differently on the Node tab.
+     */
+    const [permitted, setPermitted] = useState(true);
     const [query, setQuery] = useState<QueryState | null>(null);
     const [searching, setSearching] = useState(false);
     const [llmStatus, setLlmStatus] = useState<LlmStatus>(llm.status);
@@ -292,10 +301,23 @@ export function useMesh() {
                 // finds them.
                 setCapabilities(BleTransport.capabilities());
 
+                // Ask for the radio before anything reaches for it. Both the
+                // scan and the foreground service need these granted, and the
+                // service does not fail politely without them — it throws on
+                // its own thread, where nothing here can catch it.
+                const granted = await requestMeshPermissions();
+                if (cancelled) return;
+                setPermitted(granted);
+
                 // Restore the background preference before the radio comes up,
                 // so a phone that was carrying the mesh yesterday is carrying
                 // it again without anyone opening a settings screen.
-                const wanted = await backgroundWanted(catalog);
+                //
+                // Gated on the grant: background mode is what raises the
+                // foreground service, and raising it unpermitted is the crash.
+                // The preference is left on disk untouched, so granting later
+                // restores it without the user having to ask twice.
+                const wanted = (await backgroundWanted(catalog)) && granted;
                 if (cancelled) return;
                 setKeepAlive(wanted);
                 setBackgroundState(wanted);

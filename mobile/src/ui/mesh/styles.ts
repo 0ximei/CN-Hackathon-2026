@@ -116,12 +116,6 @@ export function makeStyles(theme: Palette) {
             borderTopWidth: StyleSheet.hairlineWidth,
             borderTopColor: theme.hairline,
         },
-        composerActions: {
-            flexDirection: 'row',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: space.sm,
-        },
         composerCount: { ...typography.monoSm, color: theme.faint },
 
         summary: {
