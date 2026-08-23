@@ -1,5 +1,6 @@
 import React from 'react';
 import { Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 
 import type { useMesh } from '../useMesh';
 import { useTheme } from '../ThemeProvider';
@@ -19,10 +20,11 @@ type Mesh = ReturnType<typeof useMesh>;
  * is a fact about the device, and it must not change colour because someone
  * swiped to a different tab.
  *
- * The second row keeps the knows/stores pair the old header crammed against the
- * fingerprint emoji. It is still there because it is the one number pair that
- * says what kind of node this is right now — it just no longer competes with
- * the node's name for the same line.
+ * The second row pairs this node's fingerprint icons with its knows/stores
+ * count. The icons are the same five the identity card shows, at the size the
+ * surrounding text runs at — enough to recognise your own node at a glance,
+ * never enough to verify anyone else's. That is the identity card's job, and
+ * the icons here are a reminder that it exists.
  */
 export function Header({ mesh }: { mesh: Mesh }) {
   const { styles, theme } = useTheme();
@@ -47,11 +49,16 @@ export function Header({ mesh }: { mesh: Mesh }) {
       </View>
 
       <View style={styles.headerRow}>
-        <Text style={styles.nodeId} numberOfLines={1}>
-          {mesh.fingerprint?.emoji.replace(/ /g, '') ?? ''}
-          {'  '}
-          knows {mesh.catalogStats.known} · stores {mesh.catalogStats.stored}
-        </Text>
+        <View style={styles.headerIdent}>
+          <View style={styles.iconRowTight}>
+            {mesh.fingerprint?.icons.map((name, i) => (
+              <Ionicons key={i} name={name} size={12} color={theme.faint} />
+            ))}
+          </View>
+          <Text style={styles.nodeId} numberOfLines={1}>
+            knows {mesh.catalogStats.known} · stores {mesh.catalogStats.stored}
+          </Text>
+        </View>
         <Text style={[styles.radioDetail, trouble && { color: theme.danger }]} numberOfLines={1}>
           {mesh.radio.detail || mesh.radio.state}
         </Text>

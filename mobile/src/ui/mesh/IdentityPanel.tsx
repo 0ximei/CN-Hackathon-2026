@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Text, TextInput, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 
 import type { PeerIdentity } from '../../identity/trust';
 import type { useMesh } from '../useMesh';
@@ -83,7 +84,11 @@ export function IdentityPanel({ mesh }: { mesh: Mesh }) {
           node #{(identity.id >>> 0).toString(16).padStart(8, '0')} · Ed25519
         </Text>
         <Text style={styles.fingerprint}>{mesh.fingerprint?.hex}</Text>
-        <Text style={styles.emojiRow}>{mesh.fingerprint?.emoji}</Text>
+        <View style={styles.iconRow}>
+          {mesh.fingerprint?.icons.map((name, i) => (
+            <Ionicons key={i} name={name} size={22} color={theme.text} />
+          ))}
+        </View>
         <Text style={styles.hint}>
           The node id is a hash of the public key, so it is not a claim this device could make
           about someone else's key. Renaming keeps both.
@@ -158,7 +163,11 @@ function PeerIdentityRow({ peer, mesh }: { peer: PeerIdentity; mesh: Mesh }) {
             Both phones should show exactly this. Read it aloud, or hold the screens together.
           </Text>
           <Text style={styles.safety}>{safety.digits}</Text>
-          <Text style={styles.emojiRow}>{safety.emoji}</Text>
+          <View style={styles.iconRow}>
+            {safety.icons.map((name, i) => (
+              <Ionicons key={i} name={name} size={24} color={theme.text} />
+            ))}
+          </View>
         </View>
       )}
 

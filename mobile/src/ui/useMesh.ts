@@ -21,7 +21,7 @@ import {
     suggestName,
     type IdentitySession,
 } from '../identity/identity';
-import { safetyEmoji, safetyNumber } from '../identity/fingerprint';
+import { safetyIcons, safetyNumber, type FingerprintIcon } from '../identity/fingerprint';
 import { peerPublicKey, type PeerIdentity } from '../identity/trust';
 import type { SchemePreference } from './theme';
 
@@ -546,14 +546,14 @@ export function useMesh() {
      * peer would be a comparison of something nobody has established.
      */
     const safetyFor = useCallback(
-        (nodeId: number): { digits: string; emoji: string } | null => {
+        (nodeId: number): { digits: string; icons: FingerprintIcon[] } | null => {
             const current = sessionRef.current;
             const peer = identities.find((p) => p.nodeId === nodeId);
             if (!current || !peer?.publicKeyHex) return null;
             const theirs = peerPublicKey(peer);
             return {
                 digits: safetyNumber(current.keys.publicKey, theirs),
-                emoji: safetyEmoji(current.keys.publicKey, theirs),
+                icons: safetyIcons(current.keys.publicKey, theirs),
             };
         },
         [identities],

@@ -117,9 +117,11 @@ air cannot be replayed.
 
 The second cannot be automated, because an attacker in the room generates a
 perfectly valid key of their own. So the NODE tab shows a **safety number** —
-thirty digits and six emoji derived from *both* public keys, sorted, so both
-phones display exactly the same thing without either side going first. Comparing
-it out loud and tapping *it matches* is the only way a node reaches `verified in
+thirty digits and six icons derived from *both* public keys, sorted, so both
+phones display exactly the same thing without either side going first. The
+icons are drawn from a bundled vector font rather than from emoji, so two
+phones cannot disagree about the picture they are showing. Comparing it out
+loud and tapping *it matches* is the only way a node reaches `verified in
 person`, and software never awards that state to itself.
 
 Trust is on first use, with the second use actually checked: if an id starts
