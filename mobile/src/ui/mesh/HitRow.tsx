@@ -3,8 +3,8 @@ import { Pressable, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import type { MeshHit } from '../../mesh/MeshNode';
-import { styles } from './styles';
-import { theme } from '../theme';
+import { useTheme } from '../ThemeProvider';
+import { space } from '../theme';
 
 /**
  * One retrieved passage.
@@ -16,6 +16,7 @@ import { theme } from '../theme';
  * the thing the two-tier design exists to separate.
  */
 export function HitRow({ hit, onOpen }: { hit: MeshHit; onOpen: () => void }) {
+  const { styles, theme, accent } = useTheme();
   const [open, setOpen] = useState(false);
   const [fetching, setFetching] = useState(false);
 
@@ -30,7 +31,15 @@ export function HitRow({ hit, onOpen }: { hit: MeshHit; onOpen: () => void }) {
 
   return (
     <Pressable
-      style={styles.hit}
+      accessibilityRole="button"
+      accessibilityState={{ expanded: open, busy: fetching }}
+      accessibilityLabel={hit.section || hit.title || 'Untitled'}
+      android_ripple={{ color: `${accent}18`, borderless: false }}
+      style={({ pressed }) => [
+        styles.hit,
+        open && { borderColor: accent },
+        pressed && { opacity: 0.75 },
+      ]}
       onPress={async () => {
         if (!open && !hit.text) {
           setFetching(true);
@@ -47,9 +56,9 @@ export function HitRow({ hit, onOpen }: { hit: MeshHit; onOpen: () => void }) {
         <Text style={styles.hitTitle} numberOfLines={1}>
           {hit.section || hit.title || 'Untitled'}
         </Text>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3 }}>
-          <Ionicons name="stats-chart-outline" size={11} color={theme.accent} />
-          <Text style={styles.hitScore}>{hit.score.toFixed(2)}</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.xs }}>
+          <Ionicons name="stats-chart-outline" size={11} color={accent} />
+          <Text style={[styles.hitScore, { color: accent }]}>{hit.score.toFixed(2)}</Text>
         </View>
       </View>
       <Text style={styles.hitBadge}>
@@ -62,6 +71,13 @@ export function HitRow({ hit, onOpen }: { hit: MeshHit; onOpen: () => void }) {
       {hit.section && hit.title !== hit.section ? (
         <Text style={styles.hitBadge}>{hit.title}</Text>
       ) : null}
+
+      {/* Says the row does something, and which way. Nothing else on this card
+          distinguishes a snippet that can be expanded from one already at full
+          length — on a touch screen there is no hover to reveal it. */}
+      <View style={{ alignItems: 'center', marginTop: space.sm }}>
+        <Ionicons name={open ? 'chevron-up' : 'chevron-down'} size={13} color={theme.faint} />
+      </View>
     </Pressable>
   );
 }

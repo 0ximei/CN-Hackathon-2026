@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ActivityIndicator, FlatList, Pressable, Text, View } from 'react-native';
+import { FlatList, Text, View } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 
 import type { Authorship } from '../../identity/authorship';
@@ -9,8 +9,9 @@ import { MAX_BODY_REPLICAS } from '@core/replication/policy';
 import type { useMesh } from '../useMesh';
 import type { DocReplicaInfo } from '../../replication/Replicator';
 import type { Provenance } from '../../storage/types';
-import { styles } from './styles';
-import { bytes, theme } from '../theme';
+import { useTheme } from '../ThemeProvider';
+import { type Palette, bytes, space } from '../theme';
+import { Button, Empty } from './Controls';
 
 type Mesh = ReturnType<typeof useMesh>;
 
@@ -26,6 +27,7 @@ async function readAssetText(uri: string): Promise<string> {
 }
 
 export function FilesTab({ mesh }: { mesh: Mesh }) {
+  const { styles, theme, accent } = useTheme();
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
 
   const handleUpload = async () => {
@@ -60,23 +62,18 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
       keyExtractor={(d) => String(d.docKey)}
       contentContainerStyle={styles.listPad}
       ListHeaderComponent={
-        <View style={{ marginBottom: 4, gap: 8 }}>
+        <View style={{ marginBottom: space.xs, gap: space.sm }}>
           <Text style={styles.lede}>
             Upload a document and it enters the mesh here, then spreads by itself — metadata to
             everyone that ranks for it, full text to the nodes the policy picks.
           </Text>
 
-          <Pressable
+          <Button
+            label="Upload .txt or .md"
+            icon="cloud-upload-outline"
+            busy={mesh.upload.busy}
             onPress={() => void handleUpload()}
-            disabled={mesh.upload.busy}
-            style={[styles.button, mesh.upload.busy && styles.buttonBusy]}
-          >
-            {mesh.upload.busy ? (
-              <ActivityIndicator color={theme.bg} size="small" />
-            ) : (
-              <Text style={styles.buttonText}>UPLOAD .TXT OR .MD</Text>
-            )}
-          </Pressable>
+          />
 
           {mesh.upload.busy && (
             <View>
@@ -88,6 +85,7 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
                       width: `${
                         mesh.upload.total ? (mesh.upload.done / mesh.upload.total) * 100 : 0
                       }%`,
+                      backgroundColor: accent,
                     },
                   ]}
                 />
@@ -102,7 +100,15 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
           )}
 
           {note && (
-            <Text style={[styles.summary, !note.ok && { color: theme.warn }]}>{note.text}</Text>
+            <Text
+              style={[
+                styles.summary,
+                { paddingHorizontal: 0 },
+                !note.ok && { color: theme.warn },
+              ]}
+            >
+              {note.text}
+            </Text>
           )}
         </View>
       }
@@ -114,7 +120,9 @@ export function FilesTab({ mesh }: { mesh: Mesh }) {
           onForget={() => mesh.forget(item.docKey)}
         />
       )}
-      ListEmptyComponent={<Text style={styles.empty}>No documents yet. Upload one above.</Text>}
+      ListEmptyComponent={
+        <Empty icon="document-outline">No documents yet. Upload one above.</Empty>
+      }
     />
   );
 }
@@ -138,10 +146,15 @@ function DocRow({
   author: string;
   onForget: () => void;
 }) {
+  const { styles, theme } = useTheme();
+
   const replicas = doc.meanReplicas;
   const short = replicas + 0.001 < doc.desired;
   const atRisk = replicas <= 1;
-  const colour = atRisk ? theme.warn : short ? theme.link : theme.accent;
+  // Availability, not branding — so this reads off the fixed semantic colours
+  // rather than the tab hue. "One live copy left" has to look like a warning on
+  // every screen it can appear on.
+  const colour = atRisk ? theme.warn : short ? theme.info : theme.positive;
 
   return (
     <View style={styles.card}>
@@ -161,9 +174,9 @@ function DocRow({
             style={[
               styles.pip,
               i < Math.round(replicas)
-                ? [styles.pipHeld, { backgroundColor: colour }]
+                ? { backgroundColor: colour }
                 : i < doc.desired
-                  ? styles.pipWanted
+                  ? { backgroundColor: `${colour}44` }
                   : null,
             ]}
           />
@@ -178,33 +191,39 @@ function DocRow({
 
       <Attestation doc={doc} author={author} selfId={selfId} />
 
-      <View style={[styles.hitTop, { marginTop: 8 }]}>
-        <Text style={styles.hitBadge}>
+      <View style={[styles.hitTop, { marginTop: space.sm }]}>
+        <Text style={[styles.hitBadge, { marginTop: 0, flex: 1 }]}>
           {PROVENANCE_LABEL[doc.provenance]}
           {doc.originId === selfId ? ' · uploaded here' : ''}
         </Text>
-        <Pressable onPress={onForget} style={styles.buttonGhost}>
-          <Text style={styles.buttonGhostText}>FORGET</Text>
-        </Pressable>
+        <Button label="Forget" variant="ghost" compact onPress={onForget} />
       </View>
     </View>
   );
 }
 
-const AUTHORSHIP: Record<Authorship, { label: string; colour: string; blurb: string }> = {
+/**
+ * Authorship is a security claim, so its colours are fixed by the palette
+ * rather than taken from the tab — a FORGED badge that shaded towards whichever
+ * section you happened to be on would be reporting the navigation.
+ */
+const AUTHORSHIP: Record<
+  Authorship,
+  { label: string; colour: (t: Palette) => string; blurb: string }
+> = {
   verified: {
     label: 'SIGNED',
-    colour: theme.accent,
+    colour: (t) => t.positive,
     blurb: 'The signature checks out against a key that really does hash to this author id.',
   },
   unsigned: {
     label: 'UNSIGNED',
-    colour: theme.dim,
+    colour: (t) => t.dim,
     blurb: 'Nothing was signed — it came from a node with no keys. Not an accusation.',
   },
   forged: {
     label: 'FORGED',
-    colour: theme.danger,
+    colour: (t) => t.danger,
     blurb: 'A signature came with this and did not verify. The author shown cannot be trusted.',
   },
 };
@@ -242,16 +261,19 @@ function Attestation({
   author: string;
   selfId: number;
 }) {
+  const { styles, theme } = useTheme();
   const state = AUTHORSHIP[doc.authorship];
+  const badge = state.colour(theme);
+
   return (
-    <View style={{ marginTop: 10 }}>
+    <View style={{ marginTop: space.md }}>
       <View style={styles.hitTop}>
         <Text style={styles.statLabel}>AUTHOR</Text>
-        <View style={[styles.badge, { borderColor: state.colour }]}>
-          <Text style={[styles.badgeText, { color: state.colour }]}>{state.label}</Text>
+        <View style={[styles.badge, { borderColor: badge }]}>
+          <Text style={[styles.badgeText, { color: badge }]}>{state.label}</Text>
         </View>
       </View>
-      <Text style={[styles.fingerprint, { fontSize: 13, letterSpacing: 0 }]} numberOfLines={1}>
+      <Text style={styles.authorLine} numberOfLines={1}>
         {doc.authorship === 'forged' ? `claims ${author}` : author}
         <Text style={styles.hitBadge}>
           {'  '}
@@ -260,13 +282,13 @@ function Attestation({
         </Text>
       </Text>
 
-      <View style={[styles.statRow, { marginTop: 6 }]}>
+      <View style={[styles.statRow, { marginTop: space.sm }]}>
         <Text style={styles.statLabel}>SHA-256</Text>
-        <Text style={[styles.statValue, { fontFamily: theme.mono }]}>{shortHex(doc.docHash)}</Text>
+        <Text style={styles.statValue}>{shortHex(doc.docHash)}</Text>
       </View>
       <View style={styles.statRow}>
         <Text style={styles.statLabel}>SIGNATURE</Text>
-        <Text style={[styles.statValue, { fontFamily: theme.mono }]}>{shortHex(doc.sig)}</Text>
+        <Text style={styles.statValue}>{shortHex(doc.sig)}</Text>
       </View>
       <View style={styles.statRow}>
         <Text style={styles.statLabel}>CONTENT</Text>
@@ -278,7 +300,7 @@ function Attestation({
                 doc.contentIntact === false
                   ? theme.danger
                   : doc.contentIntact
-                    ? theme.accent
+                    ? theme.positive
                     : theme.dim,
             },
           ]}

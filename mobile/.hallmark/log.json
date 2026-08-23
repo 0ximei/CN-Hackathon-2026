@@ -1,0 +1,21 @@
+[
+  {
+    "date": "2026-08-23",
+    "macrostructure": "n/a — native app, IA fixed (masthead + 5-tab pager), preserved",
+    "genre": "playful colour logic (Headspace school) on utilitarian structure",
+    "theme": "custom",
+    "theme_axes": "dual light+dark / sans-system / five-hue semantic index",
+    "vibe": "colour as navigation, not decoration",
+    "enrichment": "none — typography only",
+    "brief": "MeshNet Android · light mode + five-hue per-tab colour system"
+  },
+  {
+    "date": "2026-08-23",
+    "macrostructure": "n/a — native app, IA fixed (masthead + 5-tab pager), preserved",
+    "genre": "atmospheric (dark) — blooms and glow-shadows rejected for legibility",
+    "theme": "existing violet, preserved; extended with a hairline + two-weight edge",
+    "theme_axes": "dark / sans-system / cool-violet 270°",
+    "enrichment": "none — typography only",
+    "brief": "MeshNet Android · offline BLE mesh first-aid search · visual-layer redesign"
+  }
+]
