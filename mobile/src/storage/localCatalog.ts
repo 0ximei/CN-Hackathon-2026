@@ -562,14 +562,6 @@ export class LocalCatalog {
         await this.reload();
     }
 
-    /** Wipes only the seed corpus, so re-slicing never touches real content. */
-    async clearSeed(): Promise<void> {
-        const seedKeys = this.docRows()
-            .filter((d) => d.provenance === 'seed')
-            .map((d) => d.docKey);
-        for (const docKey of seedKeys) await this.forget(docKey);
-    }
-
     /* ---------------------------- accounting -------------------------- */
 
     async usage(): Promise<{

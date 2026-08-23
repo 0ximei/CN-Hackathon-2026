@@ -10,7 +10,11 @@ import type { Scored } from '@core/search/vector';
  * from the mesh", which are three different answers to "why is this on my
  * phone".
  */
-export type Provenance = 'seed' | 'local' | 'mesh';
+/**
+ * Where a document came from. Nothing ships one any more, so a node holds only
+ * what a person put there and what the mesh carried to it.
+ */
+export type Provenance = 'local' | 'mesh';
 
 /** A document as somebody uploaded it. Chunks point back at this. */
 export interface DocRow {

@@ -72,26 +72,26 @@ describe('LocalCatalog on real SQLite', () => {
     });
 });
 
-describe('a mesh that is already carrying the built-in corpus', () => {
+describe('a mesh whose nodes are already carrying documents', () => {
     /**
-     * Every other test starts from an empty catalog. A real device never does:
-     * it launches, seeds thirty-odd documents against a 1 MiB budget, and only
-     * then meets a peer. Whether an upload survives *that* is the question the
-     * empty-catalog tests cannot answer.
+     * Every other test starts from an empty catalog. A device in use does not:
+     * it accumulates uploads and whatever the mesh has handed it, against a
+     * 1 MiB budget, and only then meets another peer. Whether a new upload
+     * survives *that* is the question an empty catalog cannot answer.
      */
-    it('still replicates an upload between two seeded nodes', async () => {
+    it('still replicates an upload between two loaded nodes', async () => {
         const { MeshNode } = await import('../mesh/MeshNode');
         const { MockTransport } = await import('@core/protocol/testHarness');
-        const { seedCorpus } = await import('../mesh/bootstrap');
+        const { loadFixtures } = await import('../testing/documents');
 
         const aCatalog = await open();
         const bCatalog = await open();
-        await seedCorpus(aCatalog as never, 0x71);
-        await seedCorpus(bCatalog as never, 0x72);
+        await loadFixtures(aCatalog, 0x71);
+        await loadFixtures(bCatalog, 0x72);
 
-        const seededKnown = bCatalog.knownCount;
-        const seededUsage = await bCatalog.usage();
-        expect(seededKnown, 'B starts out knowing the corpus').toBeGreaterThan(0);
+        const loadedKnown = bCatalog.knownCount;
+        const loadedUsage = await bCatalog.usage();
+        expect(loadedKnown, 'B starts out with documents of its own').toBeGreaterThan(0);
 
         const aLink = new MockTransport('link-a');
         const bLink = new MockTransport('link-b');
@@ -111,7 +111,7 @@ describe('a mesh that is already carrying the built-in corpus', () => {
             const listed = bCatalog.documents().find((d) => d.title === 'Snake Bite');
             expect(
                 listed,
-                `B lists the upload (knew ${seededKnown}, ${seededUsage.freeBytes}B free)`,
+                `B lists the upload (knew ${loadedKnown}, ${loadedUsage.freeBytes}B free)`,
             ).toBeDefined();
         } finally {
             vi.useRealTimers();

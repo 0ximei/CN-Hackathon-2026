@@ -634,13 +634,12 @@ export class Replicator {
     /**
      * Answers a joining node's anti-entropy request.
      *
-     * Skips the built-in corpus, and the reason is bandwidth rather than
-     * policy: the sample documents are bundled into the app, so both ends
-     * seeded identical metadata for all of them on first launch and sending it
-     * again would spend a slow radio's whole budget telling a peer things it
-     * already knows. Which *bodies* each node holds is a separate question, and
-     * it is answered by the reconcile loop's re-announcements, which do include
-     * the seed corpus.
+     * Everything is offered now. This used to skip the built-in corpus, on the
+     * grounds that both ends had seeded identical metadata for it on first
+     * launch and re-sending it would spend a slow radio's budget telling a peer
+     * what it already knew. With nothing shipped, every document a node holds
+     * is one somebody actually put there, and a peer has no way to already have
+     * it.
      *
      * `sinceSec` is accepted for wire compatibility and honoured, though a
      * requester currently always sends 0 — it only ever asks once per peer.
@@ -650,7 +649,6 @@ export class Replicator {
         let sent = 0;
         for (const doc of this.deps.catalog.docRows().sort((a, b) => a.createdAt - b.createdAt)) {
             if (sent >= max) break;
-            if (doc.provenance === 'seed') continue;
             if (doc.createdAt < since) continue;
             sent += await this.announceDocument(doc.docKey, dstId);
         }

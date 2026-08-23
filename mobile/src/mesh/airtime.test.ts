@@ -6,7 +6,7 @@ import type { Identity } from '@core/lib/ids';
 
 import { MeshNode } from './MeshNode';
 import { MemoryCatalog } from '../storage/MemoryCatalog';
-import { SEED_DOCS } from '../corpus/seed';
+import { LIBRARY_DOCS } from '../testing/documents';
 
 /**
  * How much of the radio the mesh may spend on itself.
@@ -69,12 +69,13 @@ describe('airtime', () => {
         const a = new MeshNode(identity(0xa1, 'Alpha'), aTransport, aCatalog);
         const b = new MeshNode(identity(0xb1, 'Bravo'), bTransport, bCatalog);
 
-        // The full bundled corpus on both nodes — the state a phone is in the
-        // moment it finishes seeding, and the one the regression showed up in.
-        for (const doc of SEED_DOCS) {
+        // A real library on both nodes. The budget is only meaningful against
+        // one: a node holding three documents gossips almost nothing, and the
+        // regression this guards showed up at scale.
+        for (const doc of LIBRARY_DOCS) {
             const parsed = parseDocument(doc.file, doc.markdown);
-            await aCatalog.ingestParsed(parsed, 0xa1, 'seed');
-            await bCatalog.ingestParsed(parsed, 0xb1, 'seed');
+            await aCatalog.ingestParsed(parsed, 0xa1, 'local');
+            await bCatalog.ingestParsed(parsed, 0xb1, 'local');
         }
         expect(aCatalog.knownCount).toBeGreaterThan(30);
 
@@ -121,8 +122,8 @@ describe('airtime', () => {
         const a = new MeshNode(identity(0xa2, 'Alpha'), aTransport, aCatalog);
         const b = new MeshNode(identity(0xb2, 'Bravo'), bTransport, new MemoryCatalog());
 
-        for (const doc of SEED_DOCS) {
-            await aCatalog.ingestParsed(parseDocument(doc.file, doc.markdown), 0xa2, 'seed');
+        for (const doc of LIBRARY_DOCS) {
+            await aCatalog.ingestParsed(parseDocument(doc.file, doc.markdown), 0xa2, 'local');
         }
 
         for (const node of [a, b]) {

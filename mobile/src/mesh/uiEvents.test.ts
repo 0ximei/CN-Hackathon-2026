@@ -6,7 +6,7 @@ import type { Identity } from '@core/lib/ids';
 
 import { MeshNode } from './MeshNode';
 import { MemoryCatalog } from '../storage/MemoryCatalog';
-import { SEED_DOCS } from '../corpus/seed';
+import { LIBRARY_DOCS } from '../testing/documents';
 
 /**
  * How often the node may ask React to re-render.
@@ -48,10 +48,10 @@ describe('ui events', () => {
             (i) => new MeshNode(identity(0xa0 + i, `Node${i}`), transports[i], catalogs[i]),
         );
 
-        for (const doc of SEED_DOCS) {
+        for (const doc of LIBRARY_DOCS) {
             const parsed = parseDocument(doc.file, doc.markdown);
             for (let i = 0; i < 3; i++) {
-                await catalogs[i].ingestParsed(parsed, 0xa0 + i, 'seed');
+                await catalogs[i].ingestParsed(parsed, 0xa0 + i, 'local');
             }
         }
 
@@ -109,8 +109,8 @@ describe('ui events', () => {
         const catalogA = new MemoryCatalog();
         const catalogB = new MemoryCatalog();
 
-        for (const doc of SEED_DOCS) {
-            await catalogB.ingestParsed(parseDocument(doc.file, doc.markdown), 0xb1, 'seed');
+        for (const doc of LIBRARY_DOCS) {
+            await catalogB.ingestParsed(parseDocument(doc.file, doc.markdown), 0xb1, 'local');
         }
 
         const asker = new MeshNode(identity(0xa1, 'Asker'), a, catalogA);

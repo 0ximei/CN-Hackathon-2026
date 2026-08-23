@@ -80,7 +80,7 @@ export class MemoryCatalog implements MeshCatalog {
                 chunkCount: 1,
                 originId: 0,
                 createdAt: Date.now(),
-                provenance: 'seed',
+                provenance: 'local',
                 docHash: hashDocument(title, [text]),
                 authorship: 'unsigned',
             });

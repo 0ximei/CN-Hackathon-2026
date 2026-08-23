@@ -18,7 +18,6 @@ import {
 } from '../identity/identity';
 import { safetyEmoji, safetyNumber } from '../identity/fingerprint';
 import { peerPublicKey, type PeerIdentity } from '../identity/trust';
-import { coverageOf, hasSeeded, reseed, seedCorpus, type SeedReport } from '../mesh/bootstrap';
 import {
     MeshNode,
     type ActivityEvent,
@@ -103,8 +102,6 @@ export function useMesh() {
     const [documents, setDocuments] = useState<DocReplicaInfo[]>([]);
     const [replication, setReplication] = useState<ReplicationStats | null>(null);
     const [capabilities, setCapabilities] = useState<BleCapabilities | null>(null);
-    const [coverage, setCoverage] = useState(0.6);
-    const [seedReport, setSeedReport] = useState<SeedReport | null>(null);
     const [query, setQuery] = useState<QueryState | null>(null);
     const [searching, setSearching] = useState(false);
     const [llmStatus, setLlmStatus] = useState<LlmStatus>(llm.status);
@@ -242,12 +239,6 @@ export function useMesh() {
 
         (async () => {
             try {
-                if (!(await hasSeeded(catalog))) {
-                    setSeedReport(await seedCorpus(catalog, session.identity.id));
-                }
-                if (cancelled) return;
-                setCoverage(await coverageOf(catalog));
-                if (cancelled) return;
                 setCatalogStats(catalog.stats());
 
                 // Read capabilities before starting: a device that cannot
@@ -370,19 +361,6 @@ export function useMesh() {
             await node.fetchFullText(hit);
         },
         [query],
-    );
-
-    const changeCoverage = useCallback(
-        async (next: number) => {
-            const catalog = catalogRef.current;
-            const current = sessionRef.current;
-            if (!catalog || !current) return;
-            setSeedReport(await reseed(catalog, current.identity.id, next));
-            setCoverage(next);
-            setCatalogStats(catalog.stats());
-            void nodeRef.current?.replicator.reconcile();
-        },
-        [],
     );
 
     const addFiles = useCallback(
@@ -525,8 +503,6 @@ export function useMesh() {
         documents,
         replication,
         capabilities,
-        coverage,
-        seedReport,
         query,
         searching,
         llmStatus,
@@ -540,7 +516,6 @@ export function useMesh() {
         rename,
         search,
         openHit,
-        changeCoverage,
         addFiles,
         forget,
         setBudget,

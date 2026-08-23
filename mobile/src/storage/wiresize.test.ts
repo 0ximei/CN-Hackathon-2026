@@ -30,11 +30,11 @@ const MAX_SEGMENTS = 4;
 
 it('keeps one metadata packet inside its segment budget', async () => {
     const { LocalCatalog } = await import('./localCatalog');
-    const { seedCorpus } = await import('../mesh/bootstrap');
+    const { loadFixtures } = await import('../testing/documents');
     const { encodeAnnounce, HEADER_BYTES } = await import('@core/protocol/packet');
 
     const catalog = await LocalCatalog.open();
-    await seedCorpus(catalog as never, 0x72);
+    await loadFixtures(catalog, 0x72);
 
     const byDoc = new Map<number, ReturnType<typeof catalog.metas>>();
     for (const m of catalog.metas()) byDoc.set(m.docKey, [...(byDoc.get(m.docKey) ?? []), m]);

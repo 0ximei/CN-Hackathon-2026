@@ -4,10 +4,9 @@
   "private": true,
   "main": "index.js",
   "scripts": {
-    "android": "npm run bundle:corpus && expo run:android",
-    "prebuild": "npm run bundle:corpus && expo prebuild --platform android --clean",
+    "android": "expo run:android",
+    "prebuild": "expo prebuild --platform android --clean",
     "start": "expo start --dev-client",
-    "bundle:corpus": "node scripts/bundle-corpus.mjs",
     "typecheck": "tsc --noEmit",
     "fix-deps": "expo install --fix",
     "ios": "expo run:ios",

@@ -17,7 +17,6 @@ type Mesh = ReturnType<typeof useMesh>;
 const PROVENANCE_LABEL: Record<Provenance, string> = {
   local: 'UPLOADED HERE',
   mesh: 'FROM THE MESH',
-  seed: 'BUILT IN',
 };
 
 async function readAssetText(uri: string): Promise<string> {
@@ -182,7 +181,7 @@ function DocRow({
       <View style={[styles.hitTop, { marginTop: 8 }]}>
         <Text style={styles.hitBadge}>
           {PROVENANCE_LABEL[doc.provenance]}
-          {doc.originId === selfId && doc.provenance !== 'seed' ? ' · uploaded here' : ''}
+          {doc.originId === selfId ? ' · uploaded here' : ''}
         </Text>
         <Pressable onPress={onForget} style={styles.buttonGhost}>
           <Text style={styles.buttonGhostText}>FORGET</Text>
@@ -201,7 +200,7 @@ const AUTHORSHIP: Record<Authorship, { label: string; colour: string; blurb: str
   unsigned: {
     label: 'UNSIGNED',
     colour: theme.dim,
-    blurb: 'Nothing was signed — the built-in corpus, or a node with no keys. Not an accusation.',
+    blurb: 'Nothing was signed — it came from a node with no keys. Not an accusation.',
   },
   forged: {
     label: 'FORGED',

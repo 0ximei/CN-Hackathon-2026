@@ -1,11 +1,9 @@
 import * as SQLite from 'expo-sqlite';
 
-import { docKeyOf, parseDocument } from '@core/lib/chunk';
 import { quantize } from '@core/search/vector';
 
 import { embedder } from '../search/embedder';
 import { toBase64 } from '../lib/base64';
-import { SEED_DOCS } from '../corpus/seed';
 
 export const DATABASE = 'meshnet.db';
 
@@ -137,7 +135,44 @@ export async function openDatabase(): Promise<SQLite.SQLiteDatabase> {
   await db.execAsync(DDL);
   await migrateFlatChunks(db);
   await migrateColumns(db);
+  await dropBundledCorpus(db);
   return db;
+}
+
+/**
+ * Removes the sample corpus from devices that were seeded with it.
+ *
+ * The app used to ship six first-aid documents and plant them on first launch,
+ * which made a fresh install look populated and made the mesh demonstrable
+ * before anyone had uploaded anything. It also meant most of what a node held
+ * was not the user's, and every peer held an identical copy, so nothing about
+ * discovery or replication was being exercised by it.
+ *
+ * Deleting is the honest end of that rather than leaving the rows orphaned:
+ * `provenance` no longer has a 'seed' value, so those rows would decode as an
+ * unknown origin and sit in the Files tab as documents nobody could account
+ * for. Only rows the app planted are touched — anything uploaded here or
+ * learned from a peer is left exactly where it is.
+ */
+async function dropBundledCorpus(db: SQLite.SQLiteDatabase): Promise<void> {
+  const seeded = await db.getAllAsync<{ docKey: number }>(
+    `SELECT docKey FROM docs WHERE provenance = 'seed'`,
+  );
+  if (!seeded.length) return;
+  await db.withTransactionAsync(async () => {
+    const ids = await db.getAllAsync<{ docId: number }>(
+      `SELECT docId FROM meta WHERE docKey IN (SELECT docKey FROM docs WHERE provenance = 'seed')`,
+    );
+    const list = ids.map((r) => r.docId);
+    if (list.length) {
+      const holes = list.map(() => '?').join(',');
+      await db.runAsync(`DELETE FROM bodies WHERE docId IN (${holes})`, list);
+      await db.runAsync(`DELETE FROM holders WHERE docId IN (${holes})`, list);
+      await db.runAsync(`DELETE FROM pop WHERE docId IN (${holes})`, list);
+      await db.runAsync(`DELETE FROM meta WHERE docId IN (${holes})`, list);
+    }
+    await db.runAsync(`DELETE FROM docs WHERE provenance = 'seed'`);
+  });
 }
 
 /**
@@ -215,16 +250,6 @@ async function migrateFlatChunks(db: SQLite.SQLiteDatabase): Promise<void> {
       `SELECT docId, docKey, seq, title, section, source, text, addedAt, provenance FROM chunks`,
     );
 
-    // Seed docKeys are content-addressed, so which of the old rows came from
-    // the built-in corpus can be recomputed instead of trusted — the old
-    // provenance column went through a buggy migration of its own.
-    const seedKeys = new Set(
-      SEED_DOCS.map((doc) => {
-        const parsed = parseDocument(doc.file, doc.markdown);
-        return docKeyOf(parsed.title, parsed.chunks.map((c) => c.text).join('\n'));
-      }),
-    );
-
     const byDoc = new Map<number, OldChunk[]>();
     for (const row of rows) {
       const list = byDoc.get(row.docKey);
@@ -237,11 +262,9 @@ async function migrateFlatChunks(db: SQLite.SQLiteDatabase): Promise<void> {
         chunks.sort((a, b) => a.seq - b.seq);
         const bytes = chunks.reduce((n, c) => n + c.text.length, 0);
         const createdAt = Math.min(...chunks.map((c) => c.addedAt || Date.now()));
-        const provenance = seedKeys.has(docKey)
-          ? 'seed'
-          : chunks[0].provenance === 'mesh'
-            ? 'mesh'
-            : 'local';
+        // Only two origins remain. A row that came off the radio stays 'mesh';
+        // anything else was put here by a person, whatever the old column said.
+        const provenance = chunks[0].provenance === 'mesh' ? 'mesh' : 'local';
 
         await db.runAsync(
           `INSERT OR IGNORE INTO docs (docKey, title, source, bytes, chunkCount, originId, createdAt, provenance)

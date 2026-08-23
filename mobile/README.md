@@ -153,9 +153,12 @@ available is not — so a node can hold metadata for the whole mesh while storin
 only the passages the policy assigns it, and still answer *"I know something
 relevant, and here is who has it."*
 
-This is visible from the first launch: the built-in corpus seeds **metadata for
-every passage and bodies for about 60% of them**, so a phone that has never met
-another node already reads `knows 43 · stores 26`.
+A fresh install holds nothing. The app used to ship six first-aid documents and
+plant them on first launch, which made an empty phone look populated and gave a
+demo something to search — but it also meant most of what a node held was not
+the user's, every peer held a byte-identical copy, and neither discovery nor
+replication was being exercised by any of it. The gap between `knows` and
+`stores` now opens because the policy put it there.
 
 **Replication** runs the same loop the browser does, against the same pure
 functions in [`policy.ts`](src/core/replication/policy.ts): weighted rendezvous
@@ -369,9 +372,9 @@ else's document.
 
 The Files tab shows the author, the hash and the signature, with the document
 marked `SIGNED`, `UNSIGNED` or `FORGED`. Those are three states, not two.
-`UNSIGNED` is an honest absence — the built-in corpus, or a node with no keys —
-where `FORGED` is an accusation, and conflating them would either slander the
-seed corpus or hide a real attack. A forged document is still ingested, because
+`UNSIGNED` is an honest absence — a node with no keys — where `FORGED` is an
+accusation, and conflating them would either slander an honest node or hide a
+real attack. A forged document is still ingested, because
 refusing data on suspicion is how a mesh loses the ability to route; it is shown
 as claiming an author rather than having one, and the key it arrived with is
 discarded rather than stored.
@@ -401,8 +404,8 @@ tokens from the front, and the front is where the system prompt lives.
 
 **It is optional at every level.** No model present, a model that will not load,
 a generation that fails or comes back too short — every one of those falls
-through to the extractive answer, which is the corpus sentences that best match
-the question. Those cannot invent a dosage, and for procedural first aid they
+through to the extractive answer, which is the retrieved sentences that best
+match the question. Those cannot invent a dosage, and for procedural first aid they
 are often better than a paraphrase. Every answer says which mode produced it, and
 `hasLlm` is beaconed in the HELLO capability bits so the mesh knows which nodes
 can generate.
@@ -436,7 +439,7 @@ the best at runtime.
 | Pairing | QR / copy-paste | none needed — BLE discovers |
 
 **The embedder is the significant one**, and it is a different problem from the
-generator below. Retrieval runs on every passage at seed time and on every
+generator below. Retrieval runs on every passage as it is ingested and on every
 keystroke-length query, so it has to be present, instant and free. React Native
 has no Web Workers and no threaded WASM runtime, so `Xenova/all-MiniLM-L6-v2`
 does not port, and every native alternative wants a model download — the one
@@ -468,7 +471,7 @@ because these scores travel inside `RESULT` packets and are merged at the asking
 node. BM25 keeps its job as a local tie-break *below* the gate, where a score
 normalised against one node's index cannot distort another's.
 
-Measured over the sample corpus: genuine top hits score 0.45–0.92, the best an
+Measured over a sample library: genuine top hits score 0.45–0.92, the best an
 out-of-corpus question manages is 0.36, and a node holding a single passage
 scores 0.63 for a question about it against 0.05 for one about sourdough. The
 floor is 0.40.
@@ -591,10 +594,9 @@ works* above.
   take visible time to move.
 - **A small mesh converges to holding everything.** The replica target is at
   least two and rises with unreliability, so on two or three phones every node
-  ends up ranking for every chunk and the initial 60% slice evens out. That is
-  the policy working, not failing — a three-node mesh genuinely cannot afford to
-  hold fewer copies. The storage budget is the control that recreates the
-  asymmetry on demand.
+  ends up ranking for every chunk. That is the policy working, not failing — a
+  three-node mesh genuinely cannot afford to hold fewer copies. The storage
+  budget is the control that recreates the asymmetry on demand.
 - **The web build does not answer identity challenges.** It has no keypair, so a
   browser node on a mixed mesh stays `unverified` to every phone. It routes and
   replicates normally; it just cannot prove which node it is.

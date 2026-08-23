@@ -17,8 +17,6 @@ const BUDGETS = [
   { label: '8 MB', bytes: 8 * 1024 * 1024 },
 ];
 
-const COVERAGES = [0.35, 0.6, 1];
-
 export function NodeTab({ mesh }: { mesh: Mesh }) {
   const r = mesh.replication;
   const used = mesh.catalogStats.metaBytes + mesh.catalogStats.bodyBytes;
@@ -130,33 +128,6 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
         )}
       </View>
 
-      <Text style={styles.sectionTitle}>BUILT-IN CORPUS SLICE</Text>
-      <View style={styles.card}>
-        <Text style={styles.cardBody}>
-          Every node gets metadata for the whole sample corpus and the bodies for part of it, so a
-          search has something to go looking for instead of always answering locally.
-          {mesh.seedReport
-            ? ` This node kept ${mesh.seedReport.bodiesKept} of ${mesh.seedReport.chunksTotal} passages.`
-            : ''}
-        </Text>
-        <View style={styles.chipRow}>
-          {COVERAGES.map((value) => {
-            const on = Math.abs(mesh.coverage - value) < 0.01;
-            return (
-              <Pressable
-                key={value}
-                onPress={() => void mesh.changeCoverage(value)}
-                style={[styles.chip, on && styles.chipOn]}
-              >
-                <Text style={[styles.chipText, on && styles.chipTextOn]}>
-                  {value === 1 ? 'everything' : `${Math.round(value * 100)}%`}
-                </Text>
-              </Pressable>
-            );
-          })}
-        </View>
-      </View>
-
       <Text style={styles.sectionTitle}>SEARCH AND ANSWERS</Text>
       <View style={styles.card}>
         <Stat label="embedder" value={0} render="hashing · 384d · no download" />
@@ -169,7 +140,7 @@ export function NodeTab({ mesh }: { mesh: Mesh }) {
         {!!mesh.llmStatus.detail && <Text style={styles.hint}>{mesh.llmStatus.detail}</Text>}
         <Text style={styles.hint}>
           Answers are generated on this phone from the passages the mesh returned — the model is
-          never the source. Without one, answers are the corpus sentences that best match the
+          never the source. Without one, answers are the retrieved sentences that best match the
           question, which cannot invent a dosage. Every hit says which mode produced it.
         </Text>
 
