@@ -227,8 +227,11 @@ export function makeStyles(theme: Palette) {
         },
         /** The same key, quoted inline beside an author's name rather than displayed. */
         authorLine: { ...typography.mono, color: theme.text },
-        /** Glyph sizing, not a type role — these are pictures that happen to be text. */
-        emojiRow: { fontSize: 22, lineHeight: 30, letterSpacing: 4, marginTop: space.sm },
+        /** Layout only — the icons are sized at the call site, next to their type. */
+        iconRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, marginTop: space.sm },
+        /** The header's copy, shrunk to sit on one line beside the node's counts. */
+        iconRowTight: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
+        headerIdent: { flexDirection: 'row', alignItems: 'center', gap: space.sm, flexShrink: 1 },
         safety: {
             ...typography.readAloudLg,
             color: theme.text,

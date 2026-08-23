@@ -11,28 +11,47 @@ import { toHex } from './keys';
  * perfectly valid key of their own. Closing that gap needs a channel the radio
  * does not control: two people looking at their screens and comparing. So the
  * key has to be rendered in a form a human can actually compare under a time
- * limit, which hex is not.
+ * limit, which a raw key in hex is not.
  */
 
 /**
- * Emoji alphabet for the at-a-glance check.
+ * Icon alphabet for the at-a-glance check.
  *
- * 32 entries, so each emoji carries exactly 5 bits and the mapping is a plain
- * bit-slice. Chosen to be visually distinct at a glance and to avoid pairs that
- * render near-identically on one platform and differently on another.
+ * 32 entries, so each icon carries exactly 5 bits and the mapping is a plain
+ * bit-slice with no modulo bias. Chosen for distinct *silhouettes* rather than
+ * distinct subjects: the comparison happens at arm's length in bad light, where
+ * interior detail is the first thing to go and only the outline survives.
+ *
+ * These are Ionicons glyph names, deliberately the filled variants for the same
+ * reason. Emoji are the obvious pick here and are the wrong one — the same
+ * codepoint is drawn differently by every vendor, so two phones comparing a
+ * fingerprint can legitimately disagree about what they are showing, which is
+ * precisely the failure this check exists to rule out. A bundled vector font
+ * renders identically on every device.
+ *
+ * A typo here is caught by `tsc`, not by a blank square on someone's phone:
+ * `FingerprintIcon` flows into the `name` prop of `Ionicons`, whose type is
+ * generated from the real glyph map.
  */
-const EMOJI = [
-  '🍎', '🌙', '⚓', '🔥', '🌵', '🐙', '🎈', '🔑',
-  '🍀', '🐝', '🎩', '🚀', '🌊', '🦊', '🍄', '⚡',
-  '🐘', '🎸', '🧊', '🌻', '🦉', '🍋', '🏔', '🐳',
-  '🎲', '🧭', '🪐', '🐍', '🌶', '🛠', '🥁', '🦋',
-];
+const ICONS = [
+  'rocket', 'flame', 'leaf', 'key',
+  'moon', 'flash', 'fish', 'cube',
+  'star', 'planet', 'snow', 'umbrella',
+  'bulb', 'magnet', 'heart', 'skull',
+  'paw', 'bug', 'boat', 'airplane',
+  'bicycle', 'train', 'basketball', 'diamond',
+  'hammer', 'wine', 'pizza', 'flag',
+  'balloon', 'gift', 'trophy', 'shield',
+] as const;
+
+/** One of the 32. Assignable to `Ionicons`' `name`, which is what checks it. */
+export type FingerprintIcon = (typeof ICONS)[number];
 
 export interface Fingerprint {
   /** Four groups of four hex digits — precise, for a careful comparison. */
   hex: string;
-  /** Five emoji — imprecise, for a two-second one. */
-  emoji: string;
+  /** Five icons — imprecise, for a two-second one. */
+  icons: FingerprintIcon[];
 }
 
 /**
@@ -48,7 +67,7 @@ export function fingerprintOf(publicKey: Uint8Array): Fingerprint {
   const hex = toHex(digest.subarray(0, 8));
   return {
     hex: (hex.match(/.{4}/g) ?? []).join(' ').toUpperCase(),
-    emoji: emojiFrom(digest, 5),
+    icons: iconsFrom(digest, 5),
   };
 }
 
@@ -78,19 +97,19 @@ export function safetyNumber(a: Uint8Array, b: Uint8Array): string {
   return groups.join(' ');
 }
 
-/** The same pair rendered as emoji, for people who compare pictures faster. */
-export function safetyEmoji(a: Uint8Array, b: Uint8Array): string {
+/** The same pair rendered as icons, for people who compare pictures faster. */
+export function safetyIcons(a: Uint8Array, b: Uint8Array): FingerprintIcon[] {
   const [lo, hi] = compare(a, b) <= 0 ? [a, b] : [b, a];
   const joined = new Uint8Array(lo.length + hi.length);
   joined.set(lo);
   joined.set(hi, lo.length);
-  return emojiFrom(sha256(joined), 6);
+  return iconsFrom(sha256(joined), 6);
 }
 
-function emojiFrom(digest: Uint8Array, count: number): string {
-  const out: string[] = [];
-  for (let i = 0; i < count; i++) out.push(EMOJI[digest[i] & 0x1f]);
-  return out.join(' ');
+function iconsFrom(digest: Uint8Array, count: number): FingerprintIcon[] {
+  const out: FingerprintIcon[] = [];
+  for (let i = 0; i < count; i++) out.push(ICONS[digest[i] & 0x1f]);
+  return out;
 }
 
 function compare(a: Uint8Array, b: Uint8Array): number {
