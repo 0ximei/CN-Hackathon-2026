@@ -102,7 +102,11 @@ class BleMeshModule : Module() {
       if (!on) {
         notified = null
         MeshService.stop(context)
-      } else if (radio != null) {
+      } else {
+        // Unconditionally, radio or not. Raising the service is what starts the
+        // headless task that keeps JavaScript's timers being delivered, and the
+        // preference is restored during startup — before the radio comes up, and
+        // possibly moments before the app is closed.
         announce(peerLine(radio?.peers()?.size ?: 0))
       }
     }
@@ -149,12 +153,32 @@ class BleMeshModule : Module() {
     "rssi" to rssi,
   )
 
-  /** Keeps the notification honest about what the radio is currently doing. */
+  /**
+   * Keeps the notification honest about what the radio is currently doing, and
+   * says so out loud the first time the service comes up or refuses to.
+   *
+   * The refusal is the part worth reporting. From Android 12 a foreground
+   * service cannot be started from the background, and `startForegroundService`
+   * throws rather than failing quietly; some vendor builds refuse for their own
+   * reasons besides. Swallowed — which is what this used to do — the result is
+   * an app that believes background mode is on, a Node tab that says so, and no
+   * service anywhere, which is indistinguishable from the mesh simply not
+   * working and is why a `remove task` kill at cached priority was so hard to
+   * read. `notified` is cleared on failure so the next peer change tries again.
+   */
   private fun announce(detail: String) {
     if (!background || detail == notified) return
+    val first = notified == null
     notified = detail
     runCatching { MeshService.start(context, detail) }
+      .onSuccess { if (first) log("background: foreground service up") }
+      .onFailure {
+        notified = null
+        log("background: foreground service refused (${it.message})")
+      }
   }
+
+  private fun log(message: String) = sendEvent("onLog", mapOf("message" to message))
 
   private fun peerLine(n: Int) = when (n) {
     0 -> "no peers in range"

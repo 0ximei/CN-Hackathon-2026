@@ -78,7 +78,30 @@ export class LocalCatalog {
 
     private constructor(private readonly db: SQLite.SQLiteDatabase) { }
 
+    /**
+     * The one open catalog in this process, or the attempt to open it.
+     *
+     * Opening twice used to be impossible: the screen was the only caller. It
+     * is not any more — the background daemon opens the catalog with no UI
+     * running, and the UI opens it again when someone finally launches the app.
+     * Two instances is not a slow path but a wrong one: each holds its own
+     * in-memory vector matrix, lexical index and holder map over the same
+     * SQLite file, so an upload through one is invisible to the other until
+     * something reloads, and the node is holding whichever it was built with.
+     */
+    private static opening: Promise<LocalCatalog> | null = null;
+
     static async open(): Promise<LocalCatalog> {
+        LocalCatalog.opening ??= LocalCatalog.build().catch((e: unknown) => {
+            // A failed open must not be cached, or a transient error at boot
+            // becomes a permanently broken catalog for the life of the process.
+            LocalCatalog.opening = null;
+            throw e;
+        });
+        return LocalCatalog.opening;
+    }
+
+    private static async build(): Promise<LocalCatalog> {
         const catalog = new LocalCatalog(await openDatabase());
         const stored = await catalog.kvGet(BUDGET_KEY);
         const parsed = stored === null ? NaN : Number(stored);

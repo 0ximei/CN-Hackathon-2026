@@ -39,11 +39,25 @@
     saying in the UI rather than silently accepting.
   -->
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <!--
+    Held by React Native's HeadlessJsTaskService for the life of the background
+    task, and not optional: `acquireWakeLockNow` throws a SecurityException
+    without it, which would take background mode down the first time it was
+    switched on. It is also the right behaviour — a phone in Doze stops
+    delivering the timers the mesh is made of, so a daemon that let the CPU
+    sleep would be a daemon in name only.
+  -->
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
 
   <application>
+    <!--
+      `stopWithTask=false` is the default, and it is stated because it is the
+      point: swiping the app out of recents must not take the service with it.
+    -->
     <service
       android:name=".MeshService"
       android:exported="false"
+      android:stopWithTask="false"
       android:foregroundServiceType="connectedDevice" />
   </application>
 </manifest>
