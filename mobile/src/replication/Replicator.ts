@@ -1,3 +1,4 @@
+import { contentMatches, verifyAuthorship, type Authorship } from '../identity/authorship';
 /**
  * The replication control loop, on a phone.
  *
@@ -31,7 +32,7 @@ import {
 } from '@core/replication/policy';
 
 import type { MeshCatalog } from '../storage/MeshCatalog';
-import type { MetaRow, PeerStatRow, Provenance } from '../storage/types';
+import type { DocRow, MetaRow, PeerStatRow, Provenance } from '../storage/types';
 
 /**
  * How often to reconcile.
@@ -43,7 +44,23 @@ const RECONCILE_MS = 8_000;
 /** Bodies pulled per pass, so a node joining an established mesh trickles in. */
 const MAX_PULLS_PER_PASS = 2;
 /** Chunks per ANNOUNCE packet. Each entry is ~660 bytes — two BLE frames. */
-const ENTRIES_PER_ANNOUNCE = 4;
+/**
+ * Passages per ANNOUNCE, chosen against the radio rather than the packet.
+ *
+ * The transport reports a 4 KB MTU, which is true of the interface and not of
+ * the link: underneath, every packet is cut into 514-byte GATT segments that
+ * must all arrive, in order, or the reassembler resets and the whole message is
+ * gone. There is no retransmission anywhere — a link that drops mid-message
+ * clears its queue and nothing above the radio is told.
+ *
+ * So the number that matters is segments per packet, and at four entries the
+ * worst case measured against the built-in corpus is 2731 B: six segments that
+ * all have to survive. Two entries is 1433 B, three segments. Metadata gossip
+ * is not latency-sensitive — one more packet costs nothing that matters, and
+ * halving the window in which a flap can destroy the whole thing costs nothing
+ * at all. `wiresize.test.ts` holds the budget.
+ */
+const ENTRIES_PER_ANNOUNCE = 2;
 
 /**
  * Chunks per HOLDERS packet.
@@ -106,6 +123,20 @@ export interface DocReplicaInfo {
     storedHere: number;
     desired: number;
     hits: number;
+    /** The verdict reached when this document arrived. See `identity/authorship.ts`. */
+    authorship: Authorship;
+    /** SHA-256 of the content, as signed. Absent for the built-in corpus. */
+    docHash?: Uint8Array;
+    /** The signature itself, so the UI can show the thing it is asserting. */
+    sig?: Uint8Array;
+    /**
+     * Whether the bytes held here hash to what was signed.
+     *
+     * `null` when it cannot be checked — the content hash covers the whole
+     * document and this node holds only part of it, which is the normal state
+     * of the metadata tier rather than a problem.
+     */
+    contentIntact: boolean | null;
 }
 
 export interface ReplicationStats {
@@ -423,6 +454,26 @@ export class Replicator {
         if (!keep.length) return 0;
         const kept = new Set(keep.map((m) => m.docId));
 
+        // Judged here, once, on arrival, and stored with the row. Verifying on
+        // read instead would mean every render of the Files tab running
+        // Ed25519 over every document, and would leave the verdict dependent on
+        // code that could be changed after the fact — the point of recording it
+        // is that it is a statement about what actually came off the radio.
+        const authorship = verifyAuthorship(
+            {
+                docKey: payload.docKey,
+                docHash: payload.docHash ?? new Uint8Array(0),
+                title: payload.title,
+                source: payload.source,
+                chunkCount: payload.chunkCount,
+                bytes: payload.docBytes,
+                createdAtSec: payload.createdAtSec,
+                authorId: payload.docOriginId,
+            },
+            payload.sig,
+            payload.authorKey,
+        );
+
         const added = await catalog.ingestMeta(keep, {
             docKey: payload.docKey,
             title: payload.title,
@@ -432,6 +483,10 @@ export class Replicator {
             originId: payload.docOriginId,
             createdAt: payload.createdAtSec * 1000,
             provenance: payload.docOriginId === this.deps.selfId ? 'local' : 'mesh',
+            docHash: payload.docHash,
+            authorKey: authorship === 'verified' ? payload.authorKey : undefined,
+            sig: authorship === 'verified' ? payload.sig : undefined,
+            authorship,
         });
 
         // Holder claims and popularity shares are recorded whether or not the
@@ -561,6 +616,12 @@ export class Replicator {
                     docBytes: doc.bytes,
                     chunkCount: doc.chunkCount,
                     docOriginId: doc.originId,
+                    docHash: doc.docHash,
+                    // Relayed verbatim, never re-signed. This node cannot vouch
+                    // for a document it did not write, and a re-signature would
+                    // be exactly the claim the attestation exists to refuse.
+                    authorKey: doc.authorKey,
+                    sig: doc.sig,
                     createdAtSec: Math.floor(doc.createdAt / 1000),
                     entries,
                 },
@@ -573,13 +634,12 @@ export class Replicator {
     /**
      * Answers a joining node's anti-entropy request.
      *
-     * Skips the built-in corpus, and the reason is bandwidth rather than
-     * policy: the sample documents are bundled into the app, so both ends
-     * seeded identical metadata for all of them on first launch and sending it
-     * again would spend a slow radio's whole budget telling a peer things it
-     * already knows. Which *bodies* each node holds is a separate question, and
-     * it is answered by the reconcile loop's re-announcements, which do include
-     * the seed corpus.
+     * Everything is offered now. This used to skip the built-in corpus, on the
+     * grounds that both ends had seeded identical metadata for it on first
+     * launch and re-sending it would spend a slow radio's budget telling a peer
+     * what it already knew. With nothing shipped, every document a node holds
+     * is one somebody actually put there, and a peer has no way to already have
+     * it.
      *
      * `sinceSec` is accepted for wire compatibility and honoured, though a
      * requester currently always sends 0 — it only ever asks once per peer.
@@ -589,7 +649,6 @@ export class Replicator {
         let sent = 0;
         for (const doc of this.deps.catalog.docRows().sort((a, b) => a.createdAt - b.createdAt)) {
             if (sent >= max) break;
-            if (doc.provenance === 'seed') continue;
             if (doc.createdAt < since) continue;
             sent += await this.announceDocument(doc.docKey, dstId);
         }
@@ -803,6 +862,28 @@ export class Replicator {
 
     /* ---------------------------- reporting ------------------------ */
 
+    /**
+     * Whether the text held here is the text that was signed.
+     *
+     * Only answerable with the whole document: the hash covers every chunk in
+     * order, so a node holding four passages out of six cannot recompute it and
+     * says so, rather than reporting a failure it did not observe. That is the
+     * honest limit of a two-tier design — authorship is provable from a single
+     * packet, content is provable only once you hold the content.
+     */
+    private contentIntact(doc: DocRow, metas: MetaRow[]): boolean | null {
+        if (!doc.docHash?.length) return null;
+        const ordered = [...metas].sort((a, b) => a.seq - b.seq);
+        if (ordered.length !== doc.chunkCount) return null;
+        const texts: string[] = [];
+        for (const m of ordered) {
+            const body = this.deps.catalog.bodyOf(m.docId);
+            if (body === undefined) return null;
+            texts.push(body);
+        }
+        return contentMatches(doc.docHash, doc.title, texts);
+    }
+
     /** Per-document replication view for the Library. */
     async documentReport(): Promise<DocReplicaInfo[]> {
         const catalog = this.deps.catalog;
@@ -839,6 +920,10 @@ export class Replicator {
             }
 
             return {
+                authorship: doc.authorship,
+                docHash: doc.docHash,
+                sig: doc.sig,
+                contentIntact: this.contentIntact(doc, metas),
                 docKey: doc.docKey,
                 title: doc.title,
                 source: doc.source,

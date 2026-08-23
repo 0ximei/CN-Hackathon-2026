@@ -83,6 +83,17 @@ class MeshRadio(
 
   private enum class Role { CENTRAL, PERIPHERAL }
 
+  /**
+   * What the stack did with a segment, and only [BUSY] is worth waiting out.
+   *
+   * Collapsing these into a boolean is how a permanent, deterministic refusal —
+   * a value the stack will never accept at any moment — spent six seconds being
+   * retried and was then reported as a congested link. The link was fine. Every
+   * retry failed for the same reason as the first, and the diagnosis pointed at
+   * the radio instead of at the caller.
+   */
+  private enum class Sent { OK, BUSY, REJECTED }
+
   private inner class Link(val device: BluetoothDevice, val role: Role) {
     var gatt: BluetoothGatt? = null
     var remoteRx: BluetoothGattCharacteristic? = null
@@ -1107,19 +1118,27 @@ class MeshRadio(
     val segment = link.outbox.removeFirstOrNull() ?: return
     link.busy = true
 
-    val accepted = when (link.role) {
+    val result = when (link.role) {
       Role.CENTRAL -> writeSegment(link, segment)
       Role.PERIPHERAL -> notifySegment(link, segment)
     }
 
-    if (accepted) {
+    if (result == Sent.OK) {
       link.retries = 0
       link.lastProgressAt = System.currentTimeMillis()
       return
     }
 
-    // Stack refused it. Put it back and try again shortly rather than dropping.
     link.busy = false
+
+    if (result == Sent.REJECTED) {
+      // Refused on its merits, not its timing. Waiting changes nothing, and
+      // pretending otherwise buries the cause under a congestion timeout.
+      teardown(link, "stack rejected a ${segment.size}B segment outright")
+      return
+    }
+
+    // Congested. Put it back and try again shortly rather than dropping.
     link.outbox.addFirst(segment)
     if (++link.retries > MAX_DRAIN_RETRIES) {
       teardown(link, "congested for ${MAX_DRAIN_RETRIES * DRAIN_RETRY_MS / 1000}s")
@@ -1129,11 +1148,11 @@ class MeshRadio(
   }
 
   @Suppress("DEPRECATION")
-  private fun writeSegment(link: Link, segment: ByteArray): Boolean {
-    val gatt = link.gatt ?: return false
-    val characteristic = link.remoteRx ?: return false
+  private fun writeSegment(link: Link, segment: ByteArray): Sent {
+    val gatt = link.gatt ?: return Sent.REJECTED
+    val characteristic = link.remoteRx ?: return Sent.REJECTED
     return try {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         gatt.writeCharacteristic(
           characteristic,
           segment,
@@ -1146,18 +1165,24 @@ class MeshRadio(
         characteristic.setValue(segment)
         gatt.writeCharacteristic(characteristic)
       }
+      if (accepted) Sent.OK else Sent.BUSY
+    } catch (e: IllegalArgumentException) {
+      // The stack found the value itself unacceptable — over the attribute
+      // ceiling, in practice. Deterministic, so retrying is pure delay.
+      log("write rejected: ${e.message}")
+      Sent.REJECTED
     } catch (e: Exception) {
       log("write threw: ${e.message}")
-      false
+      Sent.BUSY
     }
   }
 
   @Suppress("DEPRECATION")
-  private fun notifySegment(link: Link, segment: ByteArray): Boolean {
-    val server = gattServer ?: return false
-    val characteristic = txCharacteristic ?: return false
+  private fun notifySegment(link: Link, segment: ByteArray): Sent {
+    val server = gattServer ?: return Sent.REJECTED
+    val characteristic = txCharacteristic ?: return Sent.REJECTED
     return try {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         server.notifyCharacteristicChanged(link.device, characteristic, false, segment) ==
           BluetoothStatusCodes.SUCCESS
       } else {
@@ -1167,9 +1192,13 @@ class MeshRadio(
         characteristic.setValue(segment)
         server.notifyCharacteristicChanged(link.device, characteristic, false)
       }
+      if (accepted) Sent.OK else Sent.BUSY
+    } catch (e: IllegalArgumentException) {
+      log("notify rejected: ${e.message}")
+      Sent.REJECTED
     } catch (e: Exception) {
       log("notify threw: ${e.message}")
-      false
+      Sent.BUSY
     }
   }
 

@@ -1,3 +1,5 @@
+import type { Authorship } from '../identity/authorship';
+
 import type { Scored } from '@core/search/vector';
 
 /**
@@ -8,7 +10,11 @@ import type { Scored } from '@core/search/vector';
  * from the mesh", which are three different answers to "why is this on my
  * phone".
  */
-export type Provenance = 'seed' | 'local' | 'mesh';
+/**
+ * Where a document came from. Nothing ships one any more, so a node holds only
+ * what a person put there and what the mesh carried to it.
+ */
+export type Provenance = 'local' | 'mesh';
 
 /** A document as somebody uploaded it. Chunks point back at this. */
 export interface DocRow {
@@ -20,10 +26,20 @@ export interface DocRow {
     /** Total body bytes across every chunk, as the origin counted them. */
     bytes: number;
     chunkCount: number;
-    /** Node that first uploaded it. */
+    /** Node that first uploaded it, and the one the signature names. */
     originId: number;
     createdAt: number;
     provenance: Provenance;
+    /**
+     * SHA-256 of the content. Empty for the built-in corpus and for anything
+     * that arrived from a build predating the attestation.
+     */
+    docHash?: Uint8Array;
+    /** The author's Ed25519 key and its signature over the manifest. */
+    authorKey?: Uint8Array;
+    sig?: Uint8Array;
+    /** The verdict reached when this row was written. Never re-derived on read. */
+    authorship: Authorship;
 }
 
 /**

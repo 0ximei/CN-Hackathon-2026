@@ -39,3 +39,11 @@ android {
     abortOnError false
   }
 }
+
+// `MeshWire.kt` is pure Kotlin — no Android, no radio — so the segment
+// arithmetic can be asserted on the JVM. It is worth asserting: sizing a
+// segment two bytes over the attribute ceiling is invisible to every check
+// short of two phones in a room.
+dependencies {
+  testImplementation 'junit:junit:4.13.2'
+}

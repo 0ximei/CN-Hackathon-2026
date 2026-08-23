@@ -153,9 +153,12 @@ available is not — so a node can hold metadata for the whole mesh while storin
 only the passages the policy assigns it, and still answer *"I know something
 relevant, and here is who has it."*
 
-This is visible from the first launch: the built-in corpus seeds **metadata for
-every passage and bodies for about 60% of them**, so a phone that has never met
-another node already reads `knows 43 · stores 26`.
+A fresh install holds nothing. The app used to ship six first-aid documents and
+plant them on first launch, which made an empty phone look populated and gave a
+demo something to search — but it also meant most of what a node held was not
+the user's, every peer held a byte-identical copy, and neither discovery nor
+replication was being exercised by any of it. The gap between `knows` and
+`stores` now opens because the policy put it there.
 
 **Replication** runs the same loop the browser does, against the same pure
 functions in [`policy.ts`](src/core/replication/policy.ts): weighted rendezvous
@@ -304,11 +307,24 @@ works in a room, and each is commented at the code:
   you watch two nodes trade catalogues five seconds after meeting — tens of
   kilobytes into one link in a single tick, both directions at once, while both
   radios are still advertising and scanning.
-- **Segmentation against the negotiated MTU**, not a guess. Each link asks for
-  517 bytes, gets what the peer allows, and frames are cut to fit with a
-  one-byte header carrying a sequence number — not for ordering, which GATT
+- **Segmentation against the negotiated MTU and the attribute ceiling**, not a
+  guess and not the MTU alone. Bluetooth caps a single attribute value at 512
+  octets however large the ATT MTU grows, and Android enforces it by *throwing*
+  rather than returning a status — so sizing segments from a 517-byte MTU gives
+  514-byte values and every write and every notify of every multi-segment
+  message fails, while a one-segment beacon sails through. Peers find each
+  other, link, identify and beacon perfectly, and not one byte of content ever
+  crosses. `MeshWireTest` asserts the arithmetic at every MTU, because nothing
+  short of two phones in a room could see it otherwise. Frames are cut to fit
+  with a one-byte header carrying a sequence number — not for ordering, which GATT
   already guarantees, but so a truncated message is *detected* rather than
-  silently concatenated into the next one.
+  silently concatenated into the next one. Detected, and then dropped: a
+  message is all-or-nothing across its segments, nothing retransmits, and a
+  link that dies mid-message clears its queue without telling anyone. Beacons
+  are one segment and re-sent every three seconds, so they always heal; a
+  metadata packet is several and is sent once, so what has to heal it is the
+  layer above asking again. That asymmetry is why a mesh can show its peers
+  perfectly while no file ever crosses it.
 - **One serialised thread.** The Android BLE stack is not re-entrant and
   misbehaves when driven from several threads, so every mutation runs on a
   single `HandlerThread`.
@@ -327,6 +343,86 @@ above the link, by the identity exchange, not by whether it managed to bond.
 
 ---
 
+## Who wrote this
+
+Node identity was already provable: a peer answers a challenge with a signature
+and its id is the hash of its key, so claiming an id and proving it are the same
+act. That says nothing about a *document*. A file crosses several hops, is
+re-announced by nodes that did not write it, and lands on phones that have never
+met its author — so the proof has to travel with the document, not with the link
+it arrived on.
+
+An upload is signed before its first announcement leaves. What travels is the
+author's Ed25519 public key, a signature over the document's manifest, and a
+SHA-256 of the content. A receiver checks three things, and they answer
+different questions:
+
+1. **The signature verifies** under the key that came with it — somebody holding
+   that private key attested to this exact manifest.
+2. **The key hashes to the claimed author id.** Without this, step 1 proves only
+   that *someone* signed it; a forger can always sign their own forgery with
+   their own key and staple it to a stolen author id.
+3. **The content hashes to what was signed** — the part that covers the bytes
+   rather than the description of them.
+
+Every field in the manifest is length-prefixed, because without that a manifest
+with title `ab` and source `c` encodes identically to one with title `a` and
+source `bc`, and one signature would verify both — a free way to relabel someone
+else's document.
+
+The Files tab shows the author, the hash and the signature, with the document
+marked `SIGNED`, `UNSIGNED` or `FORGED`. Those are three states, not two.
+`UNSIGNED` is an honest absence — a node with no keys — where `FORGED` is an
+accusation, and conflating them would either slander an honest node or hide a
+real attack. A forged document is still ingested, because
+refusing data on suspicion is how a mesh loses the ability to route; it is shown
+as claiming an author rather than having one, and the key it arrived with is
+discarded rather than stored.
+
+**Two honest limits.** The content check needs the whole document: the hash
+covers every passage in order, so a node holding four of six says "not held in
+full here" rather than reporting a failure it did not observe. And this binds a
+document to a *keypair*, not to a person — binding a keypair to a human is what
+the safety-number comparison in the Node tab is for.
+
+Attestation costs 128 bytes on an announcement: 32 for the hash, 96 for the key
+and signature, and the 96 are omitted entirely when a document is unsigned,
+which is most of what a fresh node gossips.
+
+## Answers
+
+Retrieval finds passages; the generator turns them into an answer. On this build
+that is llama.cpp, through `llama.rn`, running a quantised GGUF on the CPU.
+
+**The model is never the source.** It is handed the retrieved passages, numbered,
+and told to restate them with citations — a 0.5B model asked a first-aid
+question from its own weights produces fluent, confident, wrong dosages, which
+on this corpus is the worst failure available. `src/core/llm/prompt.ts` holds
+that prompt, and `src/llm/context.ts` cuts the passages to fit the window before
+they reach it: llama.cpp does not politely shorten an over-long prompt, it drops
+tokens from the front, and the front is where the system prompt lives.
+
+**It is optional at every level.** No model present, a model that will not load,
+a generation that fails or comes back too short — every one of those falls
+through to the extractive answer, which is the retrieved sentences that best
+match the question. Those cannot invent a dosage, and for procedural first aid they
+are often better than a paraphrase. Every answer says which mode produced it, and
+`hasLlm` is beaconed in the HELLO capability bits so the mesh knows which nodes
+can generate.
+
+**Getting a model onto a phone** has two routes, and only one of them is the
+interesting one. Downloading needs a network once — the Node tab lists three
+(360M / 0.5B / 1B, 258 MB to 770 MB) with real sizes and a resumable progress
+bar. Opening a `.gguf` already on the device needs no network at all, which is
+the route that works where this app is meant to be used: a model can arrive over
+USB, on a card, or from another phone's file manager. CPU only, deliberately —
+Android GPU backends vary by vendor and fail in ways that look like bad answers
+rather than errors.
+
+Adding `llama.rn` costs about 74 MB of native libraries in the APK: llama.cpp is
+shipped as one `.so` per ARM feature level (v8, v8.2, dotprod, i8mm) and picks
+the best at runtime.
+
 ## What differs from the web build
 
 | | Web | Android |
@@ -335,16 +431,19 @@ above the link, by the identity exchange, not by whether it managed to bond.
 | Storage | Dexie / IndexedDB | expo-sqlite, same two tiers |
 | Replication | shared `policy.ts` | **shared `policy.ts`** |
 | Identity | random per tab, unauthenticated | **Ed25519, challenge/response** |
+| Document authorship | none | **signed on upload, verified on receipt** |
 | Embeddings | MiniLM via transformers.js | hashing embedder + BM25 (below) |
 | Relevance floor | cosine ≥ 0.42 | blended ≥ 0.40 (below) |
-| Answer generation | WebLLM | not ported — extractive answers |
+| Answer generation | WebLLM (WebGPU) | **llama.cpp via `llama.rn`, GGUF, CPU** |
 | Topology view | SVG | plain Views + `Animated` |
 | Pairing | QR / copy-paste | none needed — BLE discovers |
 
-**The embedder is the significant one.** React Native has no Web Workers and no
-WASM runtime with threads, so `Xenova/all-MiniLM-L6-v2` does not port. Running a
-real transformer on Android means ExecuTorch or a TFLite delegate plus a ~23 MB
-model download — the one thing a disaster-response tool cannot assume. So
+**The embedder is the significant one**, and it is a different problem from the
+generator below. Retrieval runs on every passage as it is ingested and on every
+keystroke-length query, so it has to be present, instant and free. React Native
+has no Web Workers and no threaded WASM runtime, so `Xenova/all-MiniLM-L6-v2`
+does not port, and every native alternative wants a model download — the one
+thing a disaster-response tool cannot assume. So
 `src/search/embedder.ts` is a hashing embedder over unigrams, bigrams and
 character 4-grams: instant, deterministic, no download, and **not semantic**. It
 matches "burns" to "burned" through shared character n-grams but will not match
@@ -372,7 +471,7 @@ because these scores travel inside `RESULT` packets and are merged at the asking
 node. BM25 keeps its job as a local tie-break *below* the gate, where a score
 normalised against one node's index cannot distort another's.
 
-Measured over the sample corpus: genuine top hits score 0.45–0.92, the best an
+Measured over a sample library: genuine top hits score 0.45–0.92, the best an
 out-of-corpus question manages is 0.36, and a node holding a single passage
 scores 0.63 for a question about it against 0.05 for one about sourdough. The
 floor is 0.40.
@@ -384,6 +483,22 @@ embedders will route packets happily and return nonsense.
 
 ---
 
+## Testing the radio
+
+The Kotlin in `modules/ble-mesh` is mostly untestable off-device — a GATT stack
+is the thing being driven — with one exception that earns its keep. `MeshWire.kt`
+is pure: segment arithmetic, splitting, reassembly, no Android in it. That runs
+on the JVM:
+
+```bash
+cd android && ./gradlew :ble-mesh:testDebugUnitTest
+```
+
+Everything else about the radio is verified by two phones and a log, and the
+teardown reasons are written to name the layer at fault — `congested for 6s`,
+`silent for Ns`, `stack rejected a NNNB segment outright`, or a raw `status N`
+straight from the stack.
+
 ## Testing
 
 Everything that does not need a radio or a real SQLite runs under this
@@ -394,7 +509,7 @@ identity layer and the storage helpers:
 npm test
 ```
 
-133 tests. Alongside the packet round-trips, framing, routing invariants and
+156 tests. Alongside the packet round-trips, framing, routing invariants and
 replication policy in `src/core`, this build covers:
 
 - a three-node simulated mesh where a passage held only two hops away comes back
@@ -410,6 +525,25 @@ replication policy in `src/core`, this build covers:
   existing coverage stopped at "the peer learned the passage exists";
 - a catalog sync whose request is lost on the radio, recovering without waiting
   for the once-a-minute re-announcement walk to come round;
+- authorship: a signature stapled to somebody else's author id, a relay that
+  edits the title, the filename or the content hash, a character moved across a
+  field boundary, and half an attestation — each rejected, and an absent
+  signature called unsigned rather than forged;
+- a hostile peer on the wire re-announcing a real signature over an edited
+  document, and the receiving node storing it as forged with the key discarded;
+- a `docs` table created before the authorship columns existed, upgraded and
+  still readable — the upgrade path a fresh test database cannot exercise;
+- the context window: passages dropped from the back rather than cut in half,
+  one over-long passage kept rather than sending none, and the assembled prompt
+  measured against the window it claims to respect — because overflowing it
+  drops the system prompt, which is the only thing keeping a small model on the
+  passages;
+- a budget on how many GATT segments one metadata packet may need. The transport
+  reports a 4 KB MTU, which is true of the interface and not of the link: the
+  radio cuts every packet into 514-byte segments that must all arrive or the
+  message is discarded whole, and nothing retransmits. Segments per packet is
+  therefore a reliability number, and it is invisible from every layer anyone
+  would think to review;
 - the real SQLite catalog on both ends of a replication. Every other test here
   runs the protocol against `MemoryCatalog`, so `LocalCatalog` — the storage
   layer that actually ships — had never been on either side of one. It runs
@@ -460,10 +594,9 @@ works* above.
   take visible time to move.
 - **A small mesh converges to holding everything.** The replica target is at
   least two and rises with unreliability, so on two or three phones every node
-  ends up ranking for every chunk and the initial 60% slice evens out. That is
-  the policy working, not failing — a three-node mesh genuinely cannot afford to
-  hold fewer copies. The storage budget is the control that recreates the
-  asymmetry on demand.
+  ends up ranking for every chunk. That is the policy working, not failing — a
+  three-node mesh genuinely cannot afford to hold fewer copies. The storage
+  budget is the control that recreates the asymmetry on demand.
 - **The web build does not answer identity challenges.** It has no keypair, so a
   browser node on a mixed mesh stays `unverified` to every phone. It routes and
   replicates normally; it just cannot prove which node it is.

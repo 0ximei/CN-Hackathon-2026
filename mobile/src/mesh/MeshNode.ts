@@ -39,6 +39,7 @@ import { nextMsgId } from '@core/lib/ids';
 
 import type { Transport } from '@core/transport/Transport';
 
+import { manifestBytes } from '../identity/authorship';
 import { randomBytes } from '../identity/keys';
 import {
     blankPeerIdentity,
@@ -50,7 +51,7 @@ import {
 } from '../identity/trust';
 import { Replicator, type ReplicationStats } from '../replication/Replicator';
 import type { MeshCatalog } from '../storage/MeshCatalog';
-import type { CatalogStats } from '../storage/types';
+import type { CatalogStats, DocRow } from '../storage/types';
 import { embedder } from '../search/embedder';
 import { fromBase64, toBase64 } from '../lib/base64';
 
@@ -563,9 +564,35 @@ export class MeshNode {
         onProgress?: (done: number, total: number) => void,
     ): Promise<void> {
         const { doc } = await this.catalog.upload(filename, raw, this.identity.id, onProgress);
+        await this.sign(doc);
         this.emit('catalog', this.catalog.stats());
         await this.replicator.announceDocument(doc.docKey);
         void this.replicator.reconcile();
+    }
+
+    /**
+     * Attests to a document this node wrote, before anyone else sees it.
+     *
+     * Signed before the announce rather than after, so the first packet to
+     * leave already carries the proof. A node with no credentials skips it and
+     * the document travels unsigned, which is honest — an unsigned document
+     * shows as unsigned rather than as somebody's word for it.
+     */
+    private async sign(doc: DocRow): Promise<void> {
+        if (!this.credentials || !doc.docHash) return;
+        const sig = this.credentials.sign(
+            manifestBytes({
+                docKey: doc.docKey,
+                docHash: doc.docHash,
+                title: doc.title,
+                source: doc.source,
+                chunkCount: doc.chunkCount,
+                bytes: doc.bytes,
+                createdAtSec: Math.floor(doc.createdAt / 1000),
+                authorId: this.identity.id,
+            }),
+        );
+        await this.catalog.attest(doc.docKey, this.credentials.publicKey, sig);
     }
 
     /**
@@ -897,10 +924,7 @@ export class MeshNode {
                 this.onDocRes(pkt);
                 break;
             case PacketType.CATALOG_RES:
-                // The reply, so the question has landed and been answered.
-                this.syncedPeers.add(pkt.srcId);
-                this.catalogSync.delete(pkt.srcId);
-                await this.onAnnounce(pkt);
+                this.noteCatalogReply(pkt.srcId, await this.onAnnounce(pkt));
                 break;
             case PacketType.ANNOUNCE:
                 await this.onAnnounce(pkt);
@@ -1104,7 +1128,31 @@ export class MeshNode {
      * pass against how many live copies exist, how popular the chunk is, how
      * reliable the alternatives are, and whether there is room.
      */
-    private async onAnnounce(pkt: Packet): Promise<void> {
+    /**
+     * Judge a catalog reply by what it taught us, not by its arrival.
+     *
+     * A peer answers a catalog request with one packet per few passages, and on
+     * this radio each of those is several segments that either all arrive or
+     * all vanish. Treating the first reply as "synced" leaves a node that got
+     * slice one and lost slice two permanently half-informed about a document,
+     * with nothing anywhere aware of it. A reply that adds nothing is the only
+     * evidence that there is nothing left to add.
+     */
+    private noteCatalogReply(nodeId: number, added: number): void {
+        const state = this.catalogSync.get(nodeId);
+        if (!state) return;
+        if (added > 0) {
+            // Still learning. There may be more, and a slice lost on the way is
+            // invisible from this end, so ask again rather than assume.
+            state.attempts = 0;
+            state.asked = Date.now();
+            return;
+        }
+        this.syncedPeers.add(nodeId);
+        this.catalogSync.delete(nodeId);
+    }
+
+    private async onAnnounce(pkt: Packet): Promise<number> {
         const payload = decodeAnnounce(pkt.payload);
 
         // Project the holder claims into the synchronous lookup the query path
@@ -1130,6 +1178,7 @@ export class MeshNode {
                 detail: `learned ${added} passage(s) of "${payload.title}"`,
             });
         }
+        return added;
     }
 
     /**

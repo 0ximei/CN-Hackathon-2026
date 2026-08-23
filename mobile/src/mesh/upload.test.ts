@@ -66,6 +66,13 @@ describe('uploading a file', () => {
         expect(b.catalog.holdsBody(hit!.docId), 'B has metadata only').toBe(false);
         const text = await b.node.fetchFullText(hit!);
         expect(text, 'B pulled the passage body from A').toContain('antivenom');
+
+        // And it is a document on B, not just loose passages: the Files tab
+        // reads exactly this, and labels it by provenance.
+        const listed = b.catalog.documents().find((d) => d.title === 'Snake Bite');
+        expect(listed, "B lists it among its own documents").toBeDefined();
+        expect(listed!.provenance, 'shown as FROM THE MESH, not uploaded here').toBe('mesh');
+        expect(listed!.originId, 'and still credited to the node that uploaded it').toBe(0x71);
     });
 
     it('reaches a node that is already storing all it can hold', async () => {

@@ -16,7 +16,8 @@
  * forwarded via the router's backward-learned next-hop table.
  */
 
-export const PROTO_VERSION = 2;
+/** 3 adds the authorship attestation to ANNOUNCE. */
+export const PROTO_VERSION = 3;
 export const HEADER_BYTES = 16;
 export const BROADCAST = 0;
 export const DEFAULT_TTL = 4;
@@ -415,11 +416,32 @@ export interface AnnouncePayload {
   docOriginId: number;
   /** Seconds since epoch — milliseconds do not fit in u32. */
   createdAtSec: number;
+  /**
+   * SHA-256 of the document's content, or 32 zero bytes if the announcer has
+   * none. `docKey` is a 32-bit content hash and is a fine *identifier*; this is
+   * the one that is expensive to collide, and it is what the author signs.
+   */
+  docHash?: Uint8Array;
+  /**
+   * The author's Ed25519 public key and its signature over the manifest.
+   *
+   * They travel with the document rather than being looked up per peer,
+   * because a document outlives the link it arrived on: by the time it reaches
+   * a phone three hops away, the node that announced it is not its author and
+   * the author may not be reachable at all. Absent for the built-in corpus,
+   * which nobody signed.
+   */
+  authorKey?: Uint8Array;
+  sig?: Uint8Array;
   entries: MetaEntry[];
 }
 
 /** Holders listed per chunk. Bounded so one entry cannot inflate a packet. */
 const MAX_HOLDERS = 8;
+export const DOC_HASH_BYTES = 32;
+export const PUBLIC_KEY_BYTES = 32;
+export const SIGNATURE_BYTES = 64;
+const EMPTY_HASH = new Uint8Array(DOC_HASH_BYTES);
 
 export function encodeAnnounce(a: AnnouncePayload): Uint8Array {
   const w = new Writer()
@@ -430,7 +452,15 @@ export function encodeAnnounce(a: AnnouncePayload): Uint8Array {
     .u16(a.chunkCount)
     .u32(a.docOriginId)
     .u32(a.createdAtSec)
-    .u8(a.entries.length);
+    .bytes(pad(a.docHash ?? EMPTY_HASH, DOC_HASH_BYTES))
+    // A flag rather than always reserving the space: the seed corpus is
+    // unsigned and is most of what a fresh node announces, and 96 bytes is
+    // real money on a link that ships 514 of them at a time.
+    .u8(a.authorKey && a.sig ? 1 : 0);
+  if (a.authorKey && a.sig) {
+    w.bytes(pad(a.authorKey, PUBLIC_KEY_BYTES)).bytes(pad(a.sig, SIGNATURE_BYTES));
+  }
+  w.u8(a.entries.length);
 
   for (const e of a.entries) {
     const holders = e.holders.slice(0, MAX_HOLDERS);
@@ -460,6 +490,10 @@ export function decodeAnnounce(b: Uint8Array): AnnouncePayload {
   const chunkCount = r.u16();
   const docOriginId = r.u32();
   const createdAtSec = r.u32();
+  const docHash = r.bytes(DOC_HASH_BYTES);
+  const attested = r.u8() === 1;
+  const authorKey = attested ? r.bytes(PUBLIC_KEY_BYTES) : undefined;
+  const sig = attested ? r.bytes(SIGNATURE_BYTES) : undefined;
   const n = r.u8();
 
   const entries: MetaEntry[] = [];
@@ -492,7 +526,19 @@ export function decodeAnnounce(b: Uint8Array): AnnouncePayload {
       hits,
     });
   }
-  return { docKey, title, source, docBytes, chunkCount, docOriginId, createdAtSec, entries };
+  return {
+    docKey,
+    title,
+    source,
+    docBytes,
+    chunkCount,
+    docOriginId,
+    createdAtSec,
+    docHash,
+    authorKey,
+    sig,
+    entries,
+  };
 }
 
 /* ---- CATALOG_REQ: anti-entropy for a node that just joined ---- */

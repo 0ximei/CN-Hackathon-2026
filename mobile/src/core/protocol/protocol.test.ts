@@ -166,6 +166,38 @@ describe('metadata gossip', () => {
     expect([...first.vec]).toEqual([...entry(1001).vec]);
   });
 
+  it('carries the authorship attestation, and omits its cost when unsigned', () => {
+    const base = {
+      docKey: 0xabcd1234,
+      title: 'Burns and Poisoning',
+      source: 'burns.md',
+      docBytes: 40_000,
+      chunkCount: 24,
+      docOriginId: 0xdeadbeef,
+      createdAtSec: 1_780_000_000,
+      entries: [entry(1001)],
+    };
+    const docHash = new Uint8Array(32).map((_, i) => i + 1);
+    const authorKey = new Uint8Array(32).fill(0xa1);
+    const sig = new Uint8Array(64).fill(0x5c);
+
+    const signed = decodeAnnounce(encodeAnnounce({ ...base, docHash, authorKey, sig }));
+    expect(signed.docHash).toEqual(docHash);
+    expect(signed.authorKey).toEqual(authorKey);
+    expect(signed.sig).toEqual(sig);
+    expect(signed.entries).toHaveLength(1);
+
+    // The seed corpus is unsigned and is most of what a fresh node announces,
+    // so the 96 bytes of key and signature are not reserved when absent.
+    const bare = decodeAnnounce(encodeAnnounce({ ...base, docHash }));
+    expect(bare.authorKey).toBeUndefined();
+    expect(bare.sig).toBeUndefined();
+    expect(bare.docHash).toEqual(docHash);
+    expect(encodeAnnounce({ ...base, docHash }).length).toBe(
+      encodeAnnounce({ ...base, docHash, authorKey, sig }).length - 96,
+    );
+  });
+
   it('survives a docId above 2^31 and a node id above 2^31', () => {
     // Both are unsigned 32-bit hashes in practice.
     const big = entry(4_140_640_039);

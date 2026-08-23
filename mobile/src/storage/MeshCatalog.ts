@@ -25,6 +25,16 @@ import type {
  * decides) has nothing to do with which database is underneath.
  */
 export interface MeshCatalog {
+    /**
+     * Records an author's signature over a document this node just wrote.
+     *
+     * Separate from `upload` because signing needs a secret key and the catalog
+     * has never held one. `MeshNode` owns credentials; handing storage a
+     * signing key to save a step would put it in the layer with the widest
+     * surface and the least reason to have it.
+     */
+    attest(docKey: number, authorKey: Uint8Array, sig: Uint8Array): Promise<void>;
+
     /* index */
     readonly knownCount: number;
     readonly storedCount: number;
